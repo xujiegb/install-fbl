@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+、#!/usr/bin/env bash
 # reinstall-freebsd-linux.sh
 # Reinstall system on Linux / FreeBSD using DD + cloud-init (NoCloud) with:
 #   - freebsd
@@ -565,9 +565,361 @@ EOF
     } >"$user_path"
 }
 
+# ----------------- environment + plan handling -----------------
+
+ENV_MODE="host"
+EFI_MOUNT_POINT="/boot/efi"
+PLAN_DIR_REL="REINSTALL"
+PLAN_FILE_NAME="plan.env"
+
+detect_env_mode() {
+    local os
+    os=$(uname -s)
+    case "$os" in
+        FreeBSD)
+            if [[ -f /etc/mfsbsd.conf ]] || grep -qi 'mfsbsd' /etc/motd 2>/dev/null; then
+                ENV_MODE="mfsbsd"
+            else
+                ENV_MODE="host"
+            fi
+            ;;
+        Linux)
+            if grep -qw 'rd.reinstall=1' /proc/cmdline 2>/dev/null || { [[ -d /run/initramfs ]] && [[ ! -f /etc/os-release ]]; }; then
+                ENV_MODE="initramfs"
+            else
+                ENV_MODE="host"
+            fi
+            ;;
+        *)
+            ENV_MODE="host"
+            ;;
+    esac
+}
+
+find_efi_for_plan() {
+    local os
+    os=$(uname -s)
+    if [[ "$os" == "Linux" ]]; then
+        if command -v lsblk >/dev/null 2>&1; then
+            local line NAME TYPE PARTTYPE PARTLABEL PARTFLAGS FSTYPE
+            while read -r line; do
+                eval "$line"
+                [[ "$TYPE" == "part" ]] || continue
+                if [[ "$PARTTYPE" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] ||
+                   echo "${PARTLABEL:-}" | grep -qiE 'efi|esp' ||
+                   { [[ "$FSTYPE" == "vfat" ]] && echo "${PARTFLAGS:-}" | grep -qi 'boot,esp'; }; then
+                    echo "/dev/$NAME"
+                    return 0
+                fi
+            done < <(lsblk -P -o NAME,TYPE,PARTTYPE,FSTYPE,PARTLABEL,PARTFLAGS 2>/dev/null || true)
+        fi
+    elif [[ "$os" == "FreeBSD" ]]; then
+        if command -v sysctl >/dev/null 2>&1 && command -v gpart >/dev/null 2>&1; then
+            local d p
+            for d in $(sysctl -n kern.disks 2>/dev/null || true); do
+                p=$(gpart show -p "$d" 2>/dev/null | awk '$4 == "efi" {print $3; exit}')
+                if [[ -n "$p" ]]; then
+                    echo "/dev/$p"
+                    return 0
+                fi
+            done
+        fi
+    fi
+    return 1
+}
+
+mount_efi_for_plan() {
+    if [[ -d "$EFI_MOUNT_POINT" ]] && mountpoint -q "$EFI_MOUNT_POINT" 2>/dev/null; then
+        return 0
+    fi
+    mkdir -p "$EFI_MOUNT_POINT"
+    local efi_part
+    efi_part=$(find_efi_for_plan 2>/dev/null || true)
+    [[ -n "$efi_part" ]] || error "Could not find EFI partition for plan storage"
+    if ! mount "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
+        if ! mount -t vfat "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
+           ! mount -t msdos "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
+           ! mount -t msdosfs "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
+            error "Failed to mount EFI partition $efi_part on $EFI_MOUNT_POINT"
+        fi
+    fi
+}
+
+save_plan_to_efi() {
+    mount_efi_for_plan
+    local plan_dir="$EFI_MOUNT_POINT/$PLAN_DIR_REL"
+    local plan_file="$plan_dir/$PLAN_FILE_NAME"
+    mkdir -p "$plan_dir"
+
+    {
+        printf 'TARGET_OS=%q\n' "$TARGET_OS"
+        printf 'TARGET_VER=%q\n' "$TARGET_VER"
+        printf 'DISK=%q\n' "$DISK"
+        printf 'IMG_URL=%q\n' "$IMG_URL"
+        printf 'PASSWORD=%q\n' "$PASSWORD"
+        printf 'SSH_KEYS_ALL=%q\n' "$SSH_KEYS_ALL"
+        printf 'SSH_PORT=%q\n' "$SSH_PORT"
+        printf 'WEB_PORT=%q\n' "$WEB_PORT"
+        printf 'FRPC_TOML=%q\n' "$FRPC_TOML"
+        printf 'AUTO_PASSWORD=%q\n' "$AUTO_PASSWORD"
+    } >"$plan_file"
+
+    sync
+    info "Saved reinstall plan to $plan_file"
+}
+
+load_plan_from_efi() {
+    mount_efi_for_plan
+    local plan_dir="$EFI_MOUNT_POINT/$PLAN_DIR_REL"
+    local plan_file="$plan_dir/$PLAN_FILE_NAME"
+    [[ -f "$plan_file" ]] || error "Plan file not found on EFI: $plan_file"
+    # shellcheck disable=SC1090
+    . "$plan_file"
+    info "Loaded reinstall plan from $plan_file"
+}
+
+# ----------------- installer execution (download + dd + NoCloud) -----------------
+
+do_install() {
+    info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
+    info "Target: $TARGET_OS ${TARGET_VER:-"(no version)"}"
+    info "Disk: $DISK"
+    info "Image URL: $IMG_URL"
+
+    if [[ "$HOLD" == "1" ]]; then
+        info "--hold 1 is set: only parameter check and summary, no download or disk write."
+        return 0
+    fi
+
+    TMPDIR=$(mktemp -d /tmp/reinstall-cloudinit.XXXXXX)
+    trap 'rm -rf "$TMPDIR"' EXIT
+
+    IMG_QCOW="$TMPDIR/image.qcow2"
+    IMG_RAW="$TMPDIR/image.raw"
+
+    info "Downloading image..."
+    http_download "$IMG_URL" "$IMG_QCOW"
+
+    if file "$IMG_QCOW" | grep -qi 'xz compressed'; then
+        info "Detected xz compressed image, decompressing (progress may be shown)..."
+        mv "$IMG_QCOW" "$IMG_QCOW.xz"
+        if command -v pv >/dev/null 2>&1; then
+            xz -dc "$IMG_QCOW.xz" | pv >"$IMG_QCOW"
+        else
+            xz -dc "$IMG_QCOW.xz" >"$IMG_QCOW"
+        fi
+    fi
+
+    info "Converting qcow2 to raw with qemu-img (with progress)..."
+    qemu-img convert -p -O raw "$IMG_QCOW" "$IMG_RAW"
+
+    echo
+    echo "WARNING: dd will be run on $DISK. ALL DATA ON THIS DISK WILL BE LOST!"
+    read -r -p "Type 'yes' or 'y' to continue: " ans
+
+    case "$ans" in
+        y|Y|yes|YES|Yes)
+            ;;
+        *)
+            error "Operation cancelled by user."
+            ;;
+    esac
+
+    info "Writing image to disk with dd, this may take a while..."
+    if [[ "$OS" == "FreeBSD" ]]; then
+        if command -v pv >/dev/null 2>&1; then
+            pv "$IMG_RAW" | dd of="$DISK" bs=4M conv=fsync
+        else
+            echo "TIP: Press Ctrl+T to see dd progress on FreeBSD."
+            dd if="$IMG_RAW" of="$DISK" bs=4M conv=fsync
+        fi
+    else
+        # Linux: keep original behavior, use GNU dd status=progress
+        dd if="$IMG_RAW" of="$DISK" bs=4M conv=fsync status=progress
+    fi
+    sync
+    info "dd finished."
+
+    if command -v partprobe >/dev/null 2>&1; then
+        partprobe "$DISK" || true
+    elif command -v blockdev >/dev/null 2>&1; then
+        blockdev --rereadpt "$DISK" || true
+    fi
+
+    sleep 2
+
+    EFI_PART=$(find_efi_partition "$DISK")
+    info "Trying EFI partition: $EFI_PART"
+
+    MNT_EFI="$TMPDIR/efi"
+    mkdir -p "$MNT_EFI"
+
+    if [[ "$OS" == "FreeBSD" ]]; then
+        if ! mount -t msdosfs "$EFI_PART" "$MNT_EFI" 2>/dev/null; then
+            warn "Failed to mount EFI partition $EFI_PART, skipping cloud-init NoCloud injection."
+            EFI_PART=""
+        fi
+    else
+        if ! mount "$EFI_PART" "$MNT_EFI" 2>/dev/null; then
+            if ! mount -t vfat "$EFI_PART" "$MNT_EFI" 2>/dev/null && ! mount -t msdos "$EFI_PART" "$MNT_EFI" 2>/dev/null; then
+                warn "Failed to mount EFI partition $EFI_PART, skipping cloud-init NoCloud injection."
+                EFI_PART=""
+            fi
+        fi
+    fi
+
+    if [[ -n "$EFI_PART" ]]; then
+        NOCLOUD_DIR="$MNT_EFI/nocloud"
+        mkdir -p "$NOCLOUD_DIR"
+
+        if [[ -n "$FRPC_TOML" ]]; then
+            FRPC_PRESENT=1
+            if [[ "$FRPC_TOML" =~ ^https?:// ]]; then
+                info "Downloading FRPC config: $FRPC_TOML"
+                if ! http_download "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"; then
+                    warn "Failed to download FRPC config, ignoring"
+                    FRPC_PRESENT=""
+                fi
+            elif [[ -f "$FRPC_TOML" ]]; then
+                info "Copying FRPC config from: $FRPC_TOML"
+                cp "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"
+            else
+                warn "Invalid FRPC config path: $FRPC_TOML, ignoring"
+                FRPC_PRESENT=""
+            fi
+        fi
+
+        info "Writing NoCloud seed to EFI:/nocloud/ ..."
+        write_nocloud_seed "$TARGET_OS" "$NOCLOUD_DIR/meta-data" "$NOCLOUD_DIR/user-data"
+
+        sync
+        umount "$MNT_EFI" || true
+    else
+        warn "EFI could not be mounted; target system can still boot, but cloud-init configuration may not be applied."
+    fi
+
+    info "Image write and cloud-init NoCloud injection completed."
+
+    run_rhel_freebsd_hook
+    show_partition_info
+
+    FINAL_SSH_PORT="${SSH_PORT:-22}"
+
+    echo
+    echo "==================== Installation summary ===================="
+    echo "Disk device:  $DISK"
+    echo "Target OS:    $TARGET_OS ${TARGET_VER:-"(no version)"}"
+    echo "Username:     root"
+    echo "SSH port:     $FINAL_SSH_PORT"
+
+    if [[ -n "$PASSWORD" ]]; then
+        echo "Root password:"
+        echo "  $PASSWORD"
+    else
+        echo "Root password: (not set; SSH key login only)"
+    fi
+
+    echo "SSH authorized keys:"
+    if [[ -n "$SSH_KEYS_ALL" ]]; then
+        while IFS= read -r k; do
+            [[ -n "$k" ]] && echo "  $k"
+        done <<<"$SSH_KEYS_ALL"
+    else
+        echo "  (none)"
+    fi
+
+    if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
+        echo
+        echo "NOTE: The above root password was auto-generated."
+    fi
+    echo "=============================================================="
+
+    if [[ "$HOLD" == "2" ]]; then
+        info "--hold 2 is set: will NOT reboot automatically. You can inspect or chroot into the new system manually."
+        return 0
+    fi
+
+    echo
+    echo "You can now reboot into the new system, for example:"
+    if [[ "$OS" == "FreeBSD" ]]; then
+        echo "  shutdown -r now"
+    else
+        echo "  reboot"
+    fi
+}
+
 # ----------------- main -----------------
 
-[[ $# -lt 1 ]] && usage
+detect_env_mode
+
+PHASE="auto"
+if [[ "$1" == "--phase" ]]; then
+    shift
+    [[ -n "$1" ]] || error "Need value for --phase"
+    PHASE="$1"
+    shift || true
+fi
+
+if [[ "$PHASE" == "host" ]]; then
+    ENV_MODE="host"
+elif [[ "$PHASE" == "installer" ]]; then
+    ENV_MODE="initramfs"
+fi
+
+# Installer phase: mfsBSD / initramfs / explicit --phase installer
+if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" ]]; then
+    TARGET_OS=""
+    TARGET_VER=""
+    DISK=""
+    PASSWORD=""
+    SSH_KEYS_ALL=""
+    SSH_PORT=""
+    WEB_PORT=""
+    FRPC_TOML=""
+    FRPC_PRESENT=""
+    HOLD="0"
+    AUTO_PASSWORD=0
+
+    # Only allow adjusting --hold in installer mode; other args are ignored.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hold)
+                shift
+                [[ -n "$1" ]] || error "Need value for --hold"
+                [[ "$1" == "1" || "$1" == "2" ]] || error "Invalid --hold: $1 (must be 1 or 2)"
+                HOLD="$1"
+                ;;
+            *)
+                warn "Ignoring argument in installer mode: $1"
+                ;;
+        esac
+        shift || true
+    done
+
+    detect_os_arch
+    ensure_dependencies
+
+    load_plan_from_efi
+
+    if [[ -n "$DISK" && "$DISK" != /dev/* ]]; then
+        DISK="/dev/$DISK"
+    fi
+    if [[ -z "$DISK" ]]; then
+        auto_detect_disk
+    fi
+
+    if [[ ! -b "$DISK" && ! -c "$DISK" ]]; then
+        error "Target disk $DISK does not exist or is not a block/char device"
+    fi
+
+    do_install
+    exit 0
+fi
+
+# Host phase: collect config and save plan, do not dd here
+if [[ $# -lt 1 ]]; then
+    usage
+fi
 
 TARGET_OS=$(echo "$1" | to_lower)
 shift || true
@@ -723,11 +1075,11 @@ if [[ -z "$TARGET_VER" ]]; then
     esac
 fi
 
-if [[ -z "$IMG_URL" ]]; then
+if [[ -z "$IMG_URL" ]] && [[ "$TARGET_OS" != "redhat" ]]; then
     IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
-    if [[ -z "$IMG_URL" ]] && [[ "$TARGET_OS" == "redhat" ]]; then
-        error "For redhat you must specify image URL with --img"
-    fi
+fi
+if [[ -z "$IMG_URL" ]] && [[ "$TARGET_OS" == "redhat" ]]; then
+    error "For redhat you must specify image URL with --img"
 fi
 
 info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
@@ -740,160 +1092,11 @@ if [[ "$HOLD" == "1" ]]; then
     exit 0
 fi
 
-TMPDIR=$(mktemp -d /tmp/reinstall-cloudinit.XXXXXX)
-trap 'rm -rf "$TMPDIR"' EXIT
-
-IMG_QCOW="$TMPDIR/image.qcow2"
-IMG_RAW="$TMPDIR/image.raw"
-
-info "Downloading image..."
-http_download "$IMG_URL" "$IMG_QCOW"
-
-if file "$IMG_QCOW" | grep -qi 'xz compressed'; then
-    info "Detected xz compressed image, decompressing (progress may be shown)..."
-    mv "$IMG_QCOW" "$IMG_QCOW.xz"
-    if command -v pv >/dev/null 2>&1; then
-        xz -dc "$IMG_QCOW.xz" | pv >"$IMG_QCOW"
-    else
-        xz -dc "$IMG_QCOW.xz" >"$IMG_QCOW"
-    fi
-fi
-
-info "Converting qcow2 to raw with qemu-img (with progress)..."
-qemu-img convert -p -O raw "$IMG_QCOW" "$IMG_RAW"
+save_plan_to_efi
 
 echo
-echo "WARNING: dd will be run on $DISK. ALL DATA ON THIS DISK WILL BE LOST!"
-read -r -p "Type 'yes' or 'y' to continue: " ans
-
-case "$ans" in
-    y|Y|yes|YES|Yes)
-        ;;
-    *)
-        error "Operation cancelled by user."
-        ;;
-esac
-
-info "Writing image to disk with dd, this may take a while..."
-if [[ "$OS" == "FreeBSD" ]]; then
-    if command -v pv >/dev/null 2>&1; then
-        pv "$IMG_RAW" | dd of="$DISK" bs=4M conv=fsync
-    else
-        echo "TIP: Press Ctrl+T to see dd progress on FreeBSD."
-        dd if="$IMG_RAW" of="$DISK" bs=4M conv=fsync
-    fi
-else
-    # Linux: keep original behavior, use GNU dd status=progress
-    dd if="$IMG_RAW" of="$DISK" bs=4M conv=fsync status=progress
-fi
-sync
-info "dd finished."
-
-if command -v partprobe >/dev/null 2>&1; then
-    partprobe "$DISK" || true
-elif command -v blockdev >/dev/null 2>&1; then
-    blockdev --rereadpt "$DISK" || true
-fi
-
-sleep 2
-
-EFI_PART=$(find_efi_partition "$DISK")
-info "Trying EFI partition: $EFI_PART"
-
-MNT_EFI="$TMPDIR/efi"
-mkdir -p "$MNT_EFI"
-
-if [[ "$OS" == "FreeBSD" ]]; then
-    if ! mount -t msdosfs "$EFI_PART" "$MNT_EFI" 2>/dev/null; then
-        warn "Failed to mount EFI partition $EFI_PART, skipping cloud-init NoCloud injection."
-        EFI_PART=""
-    fi
-else
-    if ! mount "$EFI_PART" "$MNT_EFI" 2>/dev/null; then
-        if ! mount -t vfat "$EFI_PART" "$MNT_EFI" 2>/dev/null && ! mount -t msdos "$EFI_PART" "$MNT_EFI" 2>/dev/null; then
-            warn "Failed to mount EFI partition $EFI_PART, skipping cloud-init NoCloud injection."
-            EFI_PART=""
-        fi
-    fi
-fi
-
-if [[ -n "$EFI_PART" ]]; then
-    NOCLOUD_DIR="$MNT_EFI/nocloud"
-    mkdir -p "$NOCLOUD_DIR"
-
-    if [[ -n "$FRPC_TOML" ]]; then
-        FRPC_PRESENT=1
-        if [[ "$FRPC_TOML" =~ ^https?:// ]]; then
-            info "Downloading FRPC config: $FRPC_TOML"
-            if ! http_download "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"; then
-                warn "Failed to download FRPC config, ignoring"
-                FRPC_PRESENT=""
-            fi
-        elif [[ -f "$FRPC_TOML" ]]; then
-            info "Copying FRPC config from: $FRPC_TOML"
-            cp "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"
-        else
-            warn "Invalid FRPC config path: $FRPC_TOML, ignoring"
-            FRPC_PRESENT=""
-        fi
-    fi
-
-    info "Writing NoCloud seed to EFI:/nocloud/ ..."
-    write_nocloud_seed "$TARGET_OS" "$NOCLOUD_DIR/meta-data" "$NOCLOUD_DIR/user-data"
-
-    sync
-    umount "$MNT_EFI" || true
-else
-    warn "EFI could not be mounted; target system can still boot, but cloud-init configuration may not be applied."
-fi
-
-info "Image write and cloud-init NoCloud injection completed."
-
-run_rhel_freebsd_hook
-show_partition_info
-
-FINAL_SSH_PORT="${SSH_PORT:-22}"
-
-echo
-echo "==================== Installation summary ===================="
-echo "Disk device:  $DISK"
-echo "Target OS:    $TARGET_OS ${TARGET_VER:-"(no version)"}"
-echo "Username:     root"
-echo "SSH port:     $FINAL_SSH_PORT"
-
-if [[ -n "$PASSWORD" ]]; then
-    echo "Root password:"
-    echo "  $PASSWORD"
-else
-    echo "Root password: (not set; SSH key login only)"
-fi
-
-echo "SSH authorized keys:"
-if [[ -n "$SSH_KEYS_ALL" ]]; then
-    while IFS= read -r k; do
-        [[ -n "$k" ]] && echo "  $k"
-    done <<<"$SSH_KEYS_ALL"
-else
-    echo "  (none)"
-fi
-
-if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
-    echo
-    echo "NOTE: The above root password was auto-generated."
-fi
-echo "=============================================================="
-
-if [[ "$HOLD" == "2" ]]; then
-    info "--hold 2 is set: will NOT reboot automatically. You can inspect or chroot into the new system manually."
-    exit 0
-fi
-
-echo
-echo "You can now reboot into the new system, for example:"
-if [[ "$OS" == "FreeBSD" ]]; then
-    echo "  shutdown -r now"
-else
-    echo "  reboot"
-fi
-
+echo "Reinstall plan has been saved to EFI."
+echo "Now configure your system to boot into the installer environment (mfsBSD or initramfs)"
+echo "and reboot manually. When the installer environment starts, this script will"
+echo "automatically load the saved plan and perform the DD + cloud-init NoCloud installation."
 exit 0
