@@ -1,4 +1,4 @@
-、#!/usr/bin/env bash
+#!/usr/bin/env bash
 # reinstall-freebsd-linux.sh
 # Reinstall system on Linux / FreeBSD using DD + cloud-init (NoCloud) with:
 #   - freebsd
@@ -17,6 +17,10 @@
 #   - Run with bash:  bash reinstall-freebsd-linux.sh ...
 #   - Needs dd, xz, qemu-img, mount, and curl or wget or fetch
 #   - Designed to be executed from a dracut initramfs (via rd.reinstall=1 wrapper).
+#
+# Added:
+#   - On Linux+GRUB+EFI host, automatically prepare Alpine RAM installer,
+#     add a one-time GRUB entry, reboot into Alpine RAM, and auto-continue.
 
 set -eE
 export LC_ALL=C
@@ -210,7 +214,7 @@ auto_detect_disk() {
         error "Unable to auto-detect target disk on Linux. Please specify --disk explicitly."
     else
         if command -v sysctl >/dev/null 2>&1; then
-            local disks best_name="" best_size=0
+            local disks best_name="" best_size=0 size
             disks=$(sysctl -n kern.disks 2>/dev/null || true)
             for d in $disks; do
                 case "$d" in
@@ -444,19 +448,19 @@ find_efi_partition() {
                     "$base"*) ;;
                     *) continue ;;
                 esac
-                # 1️⃣ GPT EFI GUID
+                # 1 GPT EFI GUID
                 if [[ "$PARTTYPE" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]]; then
                     part="/dev/$NAME"
                     echo "$part"
                     return 0
                 fi
-                # 2️⃣ Partition label containing EFI / ESP
+                # 2 Partition label containing EFI / ESP
                 if echo "$PARTLABEL" | grep -qiE 'efi|esp'; then
                     part="/dev/$NAME"
                     echo "$part"
                     return 0
                 fi
-                # 3️⃣ vfat with boot,esp flags
+                # 3 vfat with boot,esp flags
                 if [[ "$FSTYPE" == "vfat" ]] && echo "$PARTFLAGS" | grep -qi 'boot,esp'; then
                     part="/dev/$NAME"
                     echo "$part"
@@ -571,6 +575,32 @@ ENV_MODE="host"
 EFI_MOUNT_POINT="/boot/efi"
 PLAN_DIR_REL="REINSTALL"
 PLAN_FILE_NAME="plan.env"
+PLAN_EFI_PART=""
+PLAN_EFI_UUID=""
+PLAN_EFI_FS_TYPE=""
+PLAN_EFI_MOUNTED_BY_SCRIPT=0
+
+# Alpine RAM preparation
+ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
+ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/latest-stable"
+ALPINE_BOOT_SUBDIR="alpine"
+ALPINE_BOOT_DIR_REL=""
+ALPINE_BOOT_DIR_ABS=""
+ALPINE_VMLINUZ_REL=""
+ALPINE_INITRAMFS_REL=""
+ALPINE_MODLOOP_REL=""
+ALPINE_APKOVL_REL=""
+ALPINE_VMLINUZ_ABS=""
+ALPINE_INITRAMFS_ABS=""
+ALPINE_MODLOOP_ABS=""
+ALPINE_APKOVL_ABS=""
+ALPINE_SCRIPT_COPY_ABS=""
+GRUB_SCRIPT_PATH=""
+GRUB_CFG_PATH=""
+GRUB_MKCONFIG_CMD=""
+GRUB_REBOOT_CMD=""
+GRUB_DEFAULT_CMD=""
+CURRENT_CONSOLE_ARGS=""
 
 detect_env_mode() {
     local os
@@ -584,7 +614,9 @@ detect_env_mode() {
             fi
             ;;
         Linux)
-            if grep -qw 'rd.reinstall=1' /proc/cmdline 2>/dev/null || { [[ -d /run/initramfs ]] && [[ ! -f /etc/os-release ]]; }; then
+            if grep -qw 'reinstall_alpine=1' /proc/cmdline 2>/dev/null; then
+                ENV_MODE="alpine-ram"
+            elif grep -qw 'rd.reinstall=1' /proc/cmdline 2>/dev/null || { [[ -d /run/initramfs ]] && [[ ! -f /etc/os-release ]]; }; then
                 ENV_MODE="initramfs"
             else
                 ENV_MODE="host"
@@ -628,20 +660,51 @@ find_efi_for_plan() {
     return 1
 }
 
+get_fs_uuid_linux() {
+    local dev="$1"
+    if command -v blkid >/dev/null 2>&1; then
+        blkid -s UUID -o value "$dev" 2>/dev/null || true
+    fi
+}
+
+get_fs_type_linux() {
+    local dev="$1"
+    if command -v blkid >/dev/null 2>&1; then
+        blkid -s TYPE -o value "$dev" 2>/dev/null || true
+    fi
+}
+
 mount_efi_for_plan() {
     if [[ -d "$EFI_MOUNT_POINT" ]] && mountpoint -q "$EFI_MOUNT_POINT" 2>/dev/null; then
+        PLAN_EFI_MOUNTED_BY_SCRIPT=0
+        if [[ -z "$PLAN_EFI_PART" ]]; then
+            PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "$EFI_MOUNT_POINT" 2>/dev/null || true)
+        fi
+        if [[ "$OS" == "Linux" && -n "$PLAN_EFI_PART" ]]; then
+            PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
+            PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
+        fi
         return 0
     fi
+
     mkdir -p "$EFI_MOUNT_POINT"
     local efi_part
     efi_part=$(find_efi_for_plan 2>/dev/null || true)
     [[ -n "$efi_part" ]] || error "Could not find EFI partition for plan storage"
+
     if ! mount "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
         if ! mount -t vfat "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
            ! mount -t msdos "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
            ! mount -t msdosfs "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
             error "Failed to mount EFI partition $efi_part on $EFI_MOUNT_POINT"
         fi
+    fi
+
+    PLAN_EFI_PART="$efi_part"
+    PLAN_EFI_MOUNTED_BY_SCRIPT=1
+    if [[ "$OS" == "Linux" ]]; then
+        PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
+        PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
     fi
 }
 
@@ -662,6 +725,13 @@ save_plan_to_efi() {
         printf 'WEB_PORT=%q\n' "$WEB_PORT"
         printf 'FRPC_TOML=%q\n' "$FRPC_TOML"
         printf 'AUTO_PASSWORD=%q\n' "$AUTO_PASSWORD"
+        printf 'HOLD=%q\n' "$HOLD"
+        printf 'PLAN_EFI_PART=%q\n' "$PLAN_EFI_PART"
+        printf 'PLAN_EFI_UUID=%q\n' "$PLAN_EFI_UUID"
+        printf 'PLAN_EFI_FS_TYPE=%q\n' "$PLAN_EFI_FS_TYPE"
+        printf 'PLAN_DIR_REL=%q\n' "$PLAN_DIR_REL"
+        printf 'PLAN_FILE_NAME=%q\n' "$PLAN_FILE_NAME"
+        printf 'SCRIPT_NAME=%q\n' "$SCRIPT_NAME"
     } >"$plan_file"
 
     sync
@@ -676,6 +746,347 @@ load_plan_from_efi() {
     # shellcheck disable=SC1090
     . "$plan_file"
     info "Loaded reinstall plan from $plan_file"
+}
+
+# ----------------- Alpine RAM / GRUB bootstrap -----------------
+
+detect_current_console_args() {
+    CURRENT_CONSOLE_ARGS=""
+    if [[ -r /proc/cmdline ]]; then
+        local tok
+        for tok in $(cat /proc/cmdline); do
+            case "$tok" in
+                console=*)
+                    CURRENT_CONSOLE_ARGS+=" $tok"
+                    ;;
+            esac
+        done
+    fi
+}
+
+ensure_grub_tools() {
+    [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host"
+
+    if command -v grub2-mkconfig >/dev/null 2>&1; then
+        GRUB_MKCONFIG_CMD="grub2-mkconfig"
+    elif command -v grub-mkconfig >/dev/null 2>&1; then
+        GRUB_MKCONFIG_CMD="grub-mkconfig"
+    else
+        error "Could not find grub2-mkconfig or grub-mkconfig"
+    fi
+
+    if command -v grub2-reboot >/dev/null 2>&1; then
+        GRUB_REBOOT_CMD="grub2-reboot"
+    elif command -v grub-reboot >/dev/null 2>&1; then
+        GRUB_REBOOT_CMD="grub-reboot"
+    else
+        error "Could not find grub2-reboot or grub-reboot"
+    fi
+
+    if command -v grub2-set-default >/dev/null 2>&1; then
+        GRUB_DEFAULT_CMD="grub2-set-default"
+    elif command -v grub-set-default >/dev/null 2>&1; then
+        GRUB_DEFAULT_CMD="grub-set-default"
+    else
+        GRUB_DEFAULT_CMD=""
+    fi
+
+    if [[ -d /etc/grub.d ]]; then
+        GRUB_SCRIPT_PATH="/etc/grub.d/09_reinstall_alpine"
+    else
+        error "/etc/grub.d not found; unsupported GRUB layout"
+    fi
+
+    if [[ -f /boot/grub2/grub.cfg ]]; then
+        GRUB_CFG_PATH="/boot/grub2/grub.cfg"
+    elif [[ -f /boot/grub/grub.cfg ]]; then
+        GRUB_CFG_PATH="/boot/grub/grub.cfg"
+    else
+        error "Could not find GRUB config file under /boot/grub2/grub.cfg or /boot/grub/grub.cfg"
+    fi
+}
+
+prepare_alpine_paths() {
+    mount_efi_for_plan
+
+    [[ "$MACHINE_ARCH" == "x86_64" ]] || error "Automatic Alpine RAM bootstrap currently supports host arch x86_64 only"
+
+    [[ -n "$PLAN_EFI_UUID" ]] || error "Could not determine EFI filesystem UUID"
+
+    ALPINE_BOOT_DIR_REL="/$PLAN_DIR_REL/$ALPINE_BOOT_SUBDIR"
+    ALPINE_BOOT_DIR_ABS="$EFI_MOUNT_POINT$ALPINE_BOOT_DIR_REL"
+
+    ALPINE_VMLINUZ_REL="$ALPINE_BOOT_DIR_REL/vmlinuz-virt"
+    ALPINE_INITRAMFS_REL="$ALPINE_BOOT_DIR_REL/initramfs-virt"
+    ALPINE_MODLOOP_REL="$ALPINE_BOOT_DIR_REL/modloop-virt"
+    ALPINE_APKOVL_REL="$ALPINE_BOOT_DIR_REL/reinstall.apkovl.tar.gz"
+
+    ALPINE_VMLINUZ_ABS="$EFI_MOUNT_POINT$ALPINE_VMLINUZ_REL"
+    ALPINE_INITRAMFS_ABS="$EFI_MOUNT_POINT$ALPINE_INITRAMFS_REL"
+    ALPINE_MODLOOP_ABS="$EFI_MOUNT_POINT$ALPINE_MODLOOP_REL"
+    ALPINE_APKOVL_ABS="$EFI_MOUNT_POINT$ALPINE_APKOVL_REL"
+
+    ALPINE_SCRIPT_COPY_ABS="$EFI_MOUNT_POINT/$PLAN_DIR_REL/$SCRIPT_NAME"
+}
+
+copy_script_to_efi() {
+    local self
+    self="$0"
+
+    if command -v readlink >/dev/null 2>&1; then
+        self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    fi
+    [[ -f "$self" ]] || error "Cannot locate current script file: $self"
+
+    cp "$self" "$ALPINE_SCRIPT_COPY_ABS"
+    chmod 0755 "$ALPINE_SCRIPT_COPY_ABS"
+    sync
+    info "Copied script to EFI: $ALPINE_SCRIPT_COPY_ABS"
+}
+
+download_alpine_ram_files() {
+    mkdir -p "$ALPINE_BOOT_DIR_ABS"
+
+    local base="${ALPINE_REPO_BASE}/releases/x86_64/netboot"
+
+    info "Downloading Alpine RAM kernel..."
+    http_download "$base/vmlinuz-virt" "$ALPINE_VMLINUZ_ABS"
+
+    info "Downloading Alpine RAM initramfs..."
+    http_download "$base/initramfs-virt" "$ALPINE_INITRAMFS_ABS"
+
+    info "Downloading Alpine RAM modloop..."
+    http_download "$base/modloop-virt" "$ALPINE_MODLOOP_ABS"
+
+    chmod 0644 "$ALPINE_VMLINUZ_ABS" "$ALPINE_INITRAMFS_ABS" "$ALPINE_MODLOOP_ABS"
+    sync
+}
+
+build_alpine_apkovl() {
+    local tmp ovl_dir rcfile startfile svcfile runlevel_link repofile markerfile
+    tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
+    trap 'rm -rf "$tmp"' EXIT
+
+    ovl_dir="$tmp/ovl"
+    mkdir -p \
+        "$ovl_dir/etc/apk" \
+        "$ovl_dir/etc/init.d" \
+        "$ovl_dir/etc/runlevels/default" \
+        "$ovl_dir/usr/local/sbin" \
+        "$ovl_dir/etc/reinstall"
+
+    repofile="$ovl_dir/etc/apk/repositories"
+    cat >"$repofile" <<EOF
+${ALPINE_REPO_BASE}/main
+${ALPINE_REPO_BASE}/community
+EOF
+
+    markerfile="$ovl_dir/etc/reinstall/vars"
+    cat >"$markerfile" <<EOF
+PLAN_EFI_PART='${PLAN_EFI_PART}'
+PLAN_EFI_UUID='${PLAN_EFI_UUID}'
+PLAN_DIR_REL='${PLAN_DIR_REL}'
+PLAN_FILE_NAME='${PLAN_FILE_NAME}'
+SCRIPT_NAME='${SCRIPT_NAME}'
+HOLD='${HOLD}'
+EOF
+
+    startfile="$ovl_dir/usr/local/sbin/reinstall-auto.sh"
+    cat >"$startfile" <<'EOF'
+#!/bin/sh
+set -eu
+
+LOG="/var/log/reinstall-auto.log"
+exec >>"$LOG" 2>&1
+
+echo "===== reinstall-auto start $(date) ====="
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+[ -f /etc/reinstall/vars ] || {
+    echo "Missing /etc/reinstall/vars"
+    exit 1
+}
+# shellcheck disable=SC1091
+. /etc/reinstall/vars
+
+ensure_network() {
+    if ip route 2>/dev/null | grep -q '^default'; then
+        return 0
+    fi
+
+    for dev in $(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' || true); do
+        ip link set "$dev" up 2>/dev/null || true
+        udhcpc -q -n -t 5 -i "$dev" 2>/dev/null || true
+        if ip route 2>/dev/null | grep -q '^default'; then
+            return 0
+        fi
+    done
+    return 0
+}
+
+mount_efi() {
+    mkdir -p /media/efi
+
+    if mountpoint -q /media/efi 2>/dev/null; then
+        return 0
+    fi
+
+    if [ -n "${PLAN_EFI_PART:-}" ] && [ -e "${PLAN_EFI_PART}" ]; then
+        mount "${PLAN_EFI_PART}" /media/efi 2>/dev/null || \
+        mount -t vfat "${PLAN_EFI_PART}" /media/efi 2>/dev/null || \
+        mount -t msdos "${PLAN_EFI_PART}" /media/efi 2>/dev/null || \
+        mount -t msdosfs "${PLAN_EFI_PART}" /media/efi 2>/dev/null || true
+    fi
+
+    if mountpoint -q /media/efi 2>/dev/null; then
+        return 0
+    fi
+
+    if [ -n "${PLAN_EFI_UUID:-}" ]; then
+        dev="$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)"
+        if [ -n "$dev" ] && [ -e "$dev" ]; then
+            mount "$dev" /media/efi 2>/dev/null || \
+            mount -t vfat "$dev" /media/efi 2>/dev/null || \
+            mount -t msdos "$dev" /media/efi 2>/dev/null || \
+            mount -t msdosfs "$dev" /media/efi 2>/dev/null || true
+        fi
+    fi
+
+    if mountpoint -q /media/efi 2>/dev/null; then
+        return 0
+    fi
+
+    for dev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p*; do
+        [ -e "$dev" ] || continue
+        mount "$dev" /media/efi 2>/dev/null || \
+        mount -t vfat "$dev" /media/efi 2>/dev/null || \
+        mount -t msdos "$dev" /media/efi 2>/dev/null || \
+        mount -t msdosfs "$dev" /media/efi 2>/dev/null || true
+        if [ -f "/media/efi/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
+            return 0
+        fi
+        umount /media/efi 2>/dev/null || true
+    done
+
+    echo "Failed to mount EFI partition"
+    return 1
+}
+
+install_runtime_deps() {
+    ensure_network
+    apk update || true
+    apk add --no-cache \
+        bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
+        e2fsprogs dosfstools || true
+}
+
+main() {
+    install_runtime_deps
+    mount_efi
+
+    PLAN_FILE="/media/efi/${PLAN_DIR_REL}/${PLAN_FILE_NAME}"
+    SCRIPT_FILE="/media/efi/${PLAN_DIR_REL}/${SCRIPT_NAME}"
+
+    [ -f "$PLAN_FILE" ] || {
+        echo "Plan file not found: $PLAN_FILE"
+        exit 1
+    }
+    [ -f "$SCRIPT_FILE" ] || {
+        echo "Script file not found: $SCRIPT_FILE"
+        exit 1
+    }
+
+    chmod 0755 "$SCRIPT_FILE" || true
+
+    echo "Launching installer phase..."
+    bash "$SCRIPT_FILE" --phase installer
+
+    rc=$?
+    echo "Installer phase finished with rc=$rc"
+
+    if [ "$rc" -eq 0 ]; then
+        if grep -q "^HOLD='2'$" /etc/reinstall/vars 2>/dev/null || grep -q '^HOLD=2$' "$PLAN_FILE" 2>/dev/null; then
+            echo "HOLD=2 detected, not rebooting."
+            exit 0
+        fi
+        sync
+        sleep 2
+        reboot -f || poweroff -f || true
+    fi
+
+    exit "$rc"
+}
+
+main "$@"
+EOF
+    chmod 0755 "$startfile"
+
+    svcfile="$ovl_dir/etc/init.d/reinstall-auto"
+    cat >"$svcfile" <<'EOF'
+#!/sbin/openrc-run
+name="reinstall-auto"
+description="Automatic reinstall runner from EFI plan"
+command="/usr/local/sbin/reinstall-auto.sh"
+command_background="no"
+depend() {
+    need localmount
+    use net
+}
+start() {
+    ebegin "Starting reinstall-auto"
+    ${command}
+    eend $?
+}
+EOF
+    chmod 0755 "$svcfile"
+
+    runlevel_link="$ovl_dir/etc/runlevels/default/reinstall-auto"
+    ln -s ../../init.d/reinstall-auto "$runlevel_link"
+
+    tar -C "$ovl_dir" -czf "$ALPINE_APKOVL_ABS" .
+    chmod 0644 "$ALPINE_APKOVL_ABS"
+    sync
+    info "Built Alpine apkovl overlay: $ALPINE_APKOVL_ABS"
+}
+
+install_grub_entry_for_alpine() {
+    ensure_grub_tools
+    detect_current_console_args
+
+    cat >"$GRUB_SCRIPT_PATH" <<EOF
+#!/bin/sh
+exec tail -n +3 \$0
+menuentry '${ALPINE_ENTRY_TITLE}' {
+    search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
+    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_dev=UUID=${PLAN_EFI_UUID} alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
+}
+EOF
+    chmod 0755 "$GRUB_SCRIPT_PATH"
+
+    info "Regenerating GRUB config..."
+    "$GRUB_MKCONFIG_CMD" -o "$GRUB_CFG_PATH" >/dev/null
+
+    info "Scheduling one-time GRUB boot into: ${ALPINE_ENTRY_TITLE}"
+    "$GRUB_REBOOT_CMD" "${ALPINE_ENTRY_TITLE}"
+}
+
+prepare_and_boot_alpine_ram() {
+    [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host"
+
+    prepare_alpine_paths
+    copy_script_to_efi
+    download_alpine_ram_files
+    build_alpine_apkovl
+    install_grub_entry_for_alpine
+
+    info "Alpine RAM installer prepared."
+    info "System will reboot now into one-time GRUB entry: ${ALPINE_ENTRY_TITLE}"
+    sync
+    sleep 2
+    reboot
 }
 
 # ----------------- installer execution (download + dd + NoCloud) -----------------
@@ -853,9 +1264,9 @@ do_install() {
 detect_env_mode
 
 PHASE="auto"
-if [[ "$1" == "--phase" ]]; then
+if [[ "${1:-}" == "--phase" ]]; then
     shift
-    [[ -n "$1" ]] || error "Need value for --phase"
+    [[ -n "${1:-}" ]] || error "Need value for --phase"
     PHASE="$1"
     shift || true
 fi
@@ -866,8 +1277,8 @@ elif [[ "$PHASE" == "installer" ]]; then
     ENV_MODE="initramfs"
 fi
 
-# Installer phase: mfsBSD / initramfs / explicit --phase installer
-if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" ]]; then
+# Installer phase: mfsBSD / initramfs / Alpine RAM / explicit --phase installer
+if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" || "$ENV_MODE" == "alpine-ram" ]]; then
     TARGET_OS=""
     TARGET_VER=""
     DISK=""
@@ -885,7 +1296,7 @@ if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" ]]; then
         case "$1" in
             --hold)
                 shift
-                [[ -n "$1" ]] || error "Need value for --hold"
+                [[ -n "${1:-}" ]] || error "Need value for --hold"
                 [[ "$1" == "1" || "$1" == "2" ]] || error "Invalid --hold: $1 (must be 1 or 2)"
                 HOLD="$1"
                 ;;
@@ -957,7 +1368,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --disk)
             shift
-            [[ -n "$1" ]] || error "Need value for --disk"
+            [[ -n "${1:-}" ]] || error "Need value for --disk"
             DISK="$1"
             ;;
         --disk=*)
@@ -965,7 +1376,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --img)
             shift
-            [[ -n "$1" ]] || error "Need value for --img"
+            [[ -n "${1:-}" ]] || error "Need value for --img"
             IMG_URL="$1"
             ;;
         --img=*)
@@ -973,12 +1384,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --password|--passwd)
             shift
-            [[ -n "$1" ]] || error "Need value for --password"
+            [[ -n "${1:-}" ]] || error "Need value for --password"
             PASSWORD="$1"
             ;;
         --ssh-key|--public-key)
             shift
-            [[ -n "$1" ]] || error "Need value for --ssh-key"
+            [[ -n "${1:-}" ]] || error "Need value for --ssh-key"
             key_line=$(parse_ssh_key "$1")
             if [[ -n "$SSH_KEYS_ALL" ]]; then
                 SSH_KEYS_ALL+=$'\n'
@@ -987,24 +1398,24 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ssh-port)
             shift
-            [[ -n "$1" ]] || error "Need value for --ssh-port"
+            [[ -n "${1:-}" ]] || error "Need value for --ssh-port"
             is_port_valid "$1" || error "Invalid --ssh-port: $1"
             SSH_PORT="$1"
             ;;
         --web-port)
             shift
-            [[ -n "$1" ]] || error "Need value for --web-port"
+            [[ -n "${1:-}" ]] || error "Need value for --web-port"
             is_port_valid "$1" || error "Invalid --web-port: $1"
             WEB_PORT="$1"
             ;;
         --frpc-toml)
             shift
-            [[ -n "$1" ]] || error "Need value for --frpc-toml"
+            [[ -n "${1:-}" ]] || error "Need value for --frpc-toml"
             FRPC_TOML="$1"
             ;;
         --hold)
             shift
-            [[ -n "$1" ]] || error "Need value for --hold"
+            [[ -n "${1:-}" ]] || error "Need value for --hold"
             [[ "$1" == "1" || "$1" == "2" ]] || error "Invalid --hold: $1 (must be 1 or 2)"
             HOLD="$1"
             ;;
@@ -1094,8 +1505,14 @@ fi
 
 save_plan_to_efi
 
+if [[ "$OS" == "Linux" ]]; then
+    prepare_and_boot_alpine_ram
+    exit 0
+fi
+
 echo
 echo "Reinstall plan has been saved to EFI."
+echo "Automatic Alpine RAM GRUB bootstrap is only implemented on Linux host."
 echo "Now configure your system to boot into the installer environment (mfsBSD or initramfs)"
 echo "and reboot manually. When the installer environment starts, this script will"
 echo "automatically load the saved plan and perform the DD + cloud-init NoCloud installation."
