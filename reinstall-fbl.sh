@@ -225,91 +225,205 @@ detect_os_arch() {
     esac
 }
 
-# -------- dependencies (check only, do not auto-install) --------
+# -------- dependencies (auto-install on Red Hat / Debian / FreeBSD only) --------
 
-ensure_dependencies_linux_generic() {
-    local missing=()
+LINUX_FAMILY=""
 
-    if ! command -v qemu-img >/dev/null 2>&1; then
-        missing+=("qemu-img")
-    fi
-    if ! command -v xz >/dev/null 2>&1; then
-        missing+=("xz")
-    fi
-    if ! command -v file >/dev/null 2>&1; then
-        missing+=("file")
-    fi
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && ! command -v fetch >/dev/null 2>&1; then
-        missing+=("curl/wget/fetch")
-    fi
+detect_linux_family() {
+    LINUX_FAMILY=""
 
-    if [[ "${#missing[@]}" -gt 0 ]]; then
-        error "Missing dependencies on Linux: ${missing[*]}
-Please install them manually with your package manager (e.g. apt, zypper, pacman) and rerun this script."
+    [[ "$OS" == "Linux" ]] || return 0
+
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+
+        local ids
+        ids=" ${ID:-} ${ID_LIKE:-} "
+
+        case "$ids" in
+            *" rhel "*|*" rocky "*|*" almalinux "*|*" centos "*|*" fedora "*)
+                LINUX_FAMILY="redhat"
+                ;;
+            *" debian "*|*" ubuntu "*)
+                LINUX_FAMILY="debian"
+                ;;
+            *)
+                LINUX_FAMILY=""
+                ;;
+        esac
     fi
 }
 
-ensure_dependencies_freebsd_host() {
-    local missing=()
-
-    if ! command -v qemu-img >/dev/null 2>&1; then
-        missing+=("qemu-img (qemu-tools)")
-    fi
-    if ! command -v xz >/dev/null 2>&1; then
-        missing+=("xz")
-    fi
-    if ! command -v file >/dev/null 2>&1; then
-        missing+=("file")
-    fi
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && ! command -v fetch >/dev/null 2>&1; then
-        missing+=("curl/wget/fetch")
-    fi
-    if ! command -v efibootmgr >/dev/null 2>&1; then
-        missing+=("efibootmgr")
-    fi
-    if ! command -v grub-mkstandalone >/dev/null 2>&1 && ! command -v grub2-mkstandalone >/dev/null 2>&1; then
-        missing+=("grub-mkstandalone")
-    fi
-
-    if [[ "${#missing[@]}" -gt 0 ]]; then
-        error "Missing dependencies on FreeBSD host: ${missing[*]}
-Hint: you can install them with:
-  pkg install qemu-tools xz curl file efibootmgr grub2"
-    fi
+have_any_downloader() {
+    command -v curl >/dev/null 2>&1 || \
+    command -v wget >/dev/null 2>&1 || \
+    command -v fetch >/dev/null 2>&1
 }
 
-ensure_dependencies_freebsd_installer() {
+missing_deps_linux_common() {
     local missing=()
 
-    if ! command -v qemu-img >/dev/null 2>&1; then
-        missing+=("qemu-img (qemu-tools)")
-    fi
-    if ! command -v xz >/dev/null 2>&1; then
-        missing+=("xz")
-    fi
-    if ! command -v file >/dev/null 2>&1; then
-        missing+=("file")
-    fi
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && ! command -v fetch >/dev/null 2>&1; then
-        missing+=("curl/wget/fetch")
-    fi
+    command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
+    command -v xz >/dev/null 2>&1 || missing+=("xz")
+    command -v file >/dev/null 2>&1 || missing+=("file")
+    have_any_downloader || missing+=("downloader")
 
-    if [[ "${#missing[@]}" -gt 0 ]]; then
-        error "Missing dependencies on FreeBSD installer environment: ${missing[*]}
-Hint: you can install them with:
-  pkg install qemu-tools xz curl file"
-    fi
+    printf '%s\n' "${missing[@]}"
+}
+
+missing_deps_freebsd_host() {
+    local missing=()
+
+    command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
+    command -v xz >/dev/null 2>&1 || missing+=("xz")
+    command -v file >/dev/null 2>&1 || missing+=("file")
+    have_any_downloader || missing+=("downloader")
+    command -v efibootmgr >/dev/null 2>&1 || missing+=("efibootmgr")
+    command -v grub-mkstandalone >/dev/null 2>&1 || command -v grub2-mkstandalone >/dev/null 2>&1 || missing+=("grub-mkstandalone")
+
+    printf '%s\n' "${missing[@]}"
+}
+
+missing_deps_freebsd_installer() {
+    local missing=()
+
+    command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
+    command -v xz >/dev/null 2>&1 || missing+=("xz")
+    command -v file >/dev/null 2>&1 || missing+=("file")
+    have_any_downloader || missing+=("downloader")
+
+    printf '%s\n' "${missing[@]}"
+}
+
+install_deps_redhat() {
+    local pkgs=()
+    local item
+
+    for item in "$@"; do
+        case "$item" in
+            qemu-img)   pkgs+=("qemu-img") ;;
+            xz)         pkgs+=("xz") ;;
+            file)       pkgs+=("file") ;;
+            downloader) pkgs+=("curl") ;;
+        esac
+    done
+
+    [[ "${#pkgs[@]}" -gt 0 ]] || return 0
+
+    command -v dnf >/dev/null 2>&1 || error "Auto-install requires dnf on Red Hat family system"
+
+    info "Installing missing dependencies with dnf: ${pkgs[*]}"
+    dnf install -y "${pkgs[@]}"
+}
+
+install_deps_debian() {
+    local pkgs=()
+    local item
+
+    for item in "$@"; do
+        case "$item" in
+            qemu-img)   pkgs+=("qemu-utils") ;;
+            xz)         pkgs+=("xz-utils") ;;
+            file)       pkgs+=("file") ;;
+            downloader) pkgs+=("curl") ;;
+        esac
+    done
+
+    [[ "${#pkgs[@]}" -gt 0 ]] || return 0
+
+    command -v apt-get >/dev/null 2>&1 || error "Auto-install requires apt-get on Debian family system"
+
+    info "Installing missing dependencies with apt-get: ${pkgs[*]}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y "${pkgs[@]}"
+}
+
+install_deps_freebsd_host() {
+    local pkgs=()
+    local item
+
+    for item in "$@"; do
+        case "$item" in
+            qemu-img)          pkgs+=("qemu-tools") ;;
+            xz)                pkgs+=("xz") ;;
+            file)              pkgs+=("file") ;;
+            downloader)        pkgs+=("curl") ;;
+            efibootmgr)        pkgs+=("efibootmgr") ;;
+            grub-mkstandalone) pkgs+=("grub2") ;;
+        esac
+    done
+
+    [[ "${#pkgs[@]}" -gt 0 ]] || return 0
+
+    command -v pkg >/dev/null 2>&1 || error "Auto-install requires pkg on FreeBSD"
+
+    info "Installing missing dependencies with pkg: ${pkgs[*]}"
+    ASSUME_ALWAYS_YES=yes pkg install "${pkgs[@]}"
+}
+
+install_deps_freebsd_installer() {
+    local pkgs=()
+    local item
+
+    for item in "$@"; do
+        case "$item" in
+            qemu-img)   pkgs+=("qemu-tools") ;;
+            xz)         pkgs+=("xz") ;;
+            file)       pkgs+=("file") ;;
+            downloader) pkgs+=("curl") ;;
+        esac
+    done
+
+    [[ "${#pkgs[@]}" -gt 0 ]] || return 0
+
+    command -v pkg >/dev/null 2>&1 || error "Auto-install requires pkg on FreeBSD"
+
+    info "Installing missing dependencies with pkg: ${pkgs[*]}"
+    ASSUME_ALWAYS_YES=yes pkg install "${pkgs[@]}"
 }
 
 ensure_dependencies() {
+    local missing=()
+
     if [[ "$OS" == "Linux" ]]; then
-        ensure_dependencies_linux_generic
-    elif [[ "$OS" == "FreeBSD" ]]; then
+        detect_linux_family
+        mapfile -t missing < <(missing_deps_linux_common)
+
+        [[ "${#missing[@]}" -gt 0 ]] || return 0
+
+        case "${LINUX_FAMILY:-}" in
+            redhat)
+                install_deps_redhat "${missing[@]}"
+                ;;
+            debian)
+                install_deps_debian "${missing[@]}"
+                ;;
+            *)
+                error "Unsupported Linux family for auto-install. Only Red Hat and Debian are supported.
+Missing dependencies: ${missing[*]}"
+                ;;
+        esac
+
+        mapfile -t missing < <(missing_deps_linux_common)
+        [[ "${#missing[@]}" -eq 0 ]] || error "Failed to install required Linux dependencies: ${missing[*]}"
+        return 0
+    fi
+
+    if [[ "$OS" == "FreeBSD" ]]; then
         if [[ "$ENV_MODE" == "host" ]]; then
-            ensure_dependencies_freebsd_host
+            mapfile -t missing < <(missing_deps_freebsd_host)
+            [[ "${#missing[@]}" -gt 0 ]] && install_deps_freebsd_host "${missing[@]}"
+            mapfile -t missing < <(missing_deps_freebsd_host)
+            [[ "${#missing[@]}" -eq 0 ]] || error "Failed to install required FreeBSD host dependencies: ${missing[*]}"
         else
-            ensure_dependencies_freebsd_installer
+            mapfile -t missing < <(missing_deps_freebsd_installer)
+            [[ "${#missing[@]}" -gt 0 ]] && install_deps_freebsd_installer "${missing[@]}"
+            mapfile -t missing < <(missing_deps_freebsd_installer)
+            [[ "${#missing[@]}" -eq 0 ]] || error "Failed to install required FreeBSD installer dependencies: ${missing[*]}"
         fi
+        return 0
     fi
 }
 
