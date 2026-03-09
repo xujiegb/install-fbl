@@ -24,6 +24,8 @@
 #   - On FreeBSD+UEFI host, automatically prepare Alpine RAM installer,
 #     build a GRUB EFI binary, add a one-time BootNext entry, reboot into Alpine RAM,
 #     and auto-continue.
+#   - Cache Alpine runtime APKs and target qcow2/qcow2.xz image onto bootstrap storage
+#     before reboot, so Alpine RAM stage can run fully offline.
 
 set -Eeuo pipefail
 export LC_ALL=C
@@ -862,6 +864,9 @@ PLAN_STORAGE_MODE="efi"
 PLAN_PATH_PREFIX_REL=""
 PLAN_EFI_PART_DISK=""
 PLAN_EFI_PART_NUM=""
+CACHED_IMG_NAME=""
+CACHED_IMG_REL=""
+CACHED_IMG_ABS=""
 
 # Alpine RAM preparation
 ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
@@ -1124,6 +1129,20 @@ mount_efi_for_plan() {
     split_freebsd_part_device "$PLAN_EFI_PART"
 }
 
+derive_cached_image_name() {
+    local src="$IMG_URL"
+    local name=""
+
+    if [[ -n "$CACHED_IMG_NAME" ]]; then
+        return 0
+    fi
+
+    name="${src##*/}"
+    [[ -n "$name" && "$name" != "$src" ]] || error "Failed to derive cached image filename from: $src"
+
+    CACHED_IMG_NAME="$name"
+}
+
 save_plan_to_efi() {
     mount_efi_for_plan
     local plan_dir="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL"
@@ -1152,6 +1171,8 @@ save_plan_to_efi() {
         printf 'PLAN_DIR_REL=%q\n' "$PLAN_DIR_REL"
         printf 'PLAN_FILE_NAME=%q\n' "$PLAN_FILE_NAME"
         printf 'SCRIPT_NAME=%q\n' "$SCRIPT_NAME"
+        printf 'CACHED_IMG_NAME=%q\n' "${CACHED_IMG_NAME:-}"
+        printf 'CACHED_IMG_REL=%q\n' "${CACHED_IMG_REL:-}"
     } >"$plan_file"
 
     sync
@@ -1388,6 +1409,9 @@ prepare_alpine_paths() {
 
     ALPINE_OFFLINE_REPO_ROOT_REL="$ALPINE_BOOT_DIR_REL/repo"
     ALPINE_OFFLINE_REPO_ROOT_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_OFFLINE_REPO_ROOT_REL"
+
+    CACHED_IMG_REL="/$PLAN_DIR_REL/images"
+    CACHED_IMG_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$CACHED_IMG_REL"
 }
 
 copy_script_to_efi() {
@@ -1621,6 +1645,39 @@ download_runtime_apk_repo() {
     info "Offline Alpine APK repository ready: $repo_root"
 }
 
+cache_target_image() {
+    local dst tmpfile
+
+    derive_cached_image_name
+    mkdir -p "$CACHED_IMG_ABS"
+    dst="$CACHED_IMG_ABS/$CACHED_IMG_NAME"
+
+    if [[ -f "$dst" ]]; then
+        info "Cached target image already exists: $dst"
+        sync
+        return 0
+    fi
+
+    info "Caching target image to bootstrap storage..."
+    info "Destination: $dst"
+
+    if [[ "$IMG_URL" =~ ^https?:// ]]; then
+        tmpfile=$(mktemp "$CACHED_IMG_ABS/.partial.${CACHED_IMG_NAME}.XXXXXX")
+        if ! http_download "$IMG_URL" "$tmpfile"; then
+            rm -f "$tmpfile"
+            error "Failed to cache target image from URL: $IMG_URL"
+        fi
+        mv "$tmpfile" "$dst"
+    else
+        [[ -f "$IMG_URL" ]] || error "Local image file not found: $IMG_URL"
+        cp "$IMG_URL" "$dst"
+    fi
+
+    chmod 0644 "$dst"
+    sync
+    info "Cached target image ready: $dst"
+}
+
 build_alpine_apkovl() {
     local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
@@ -1651,6 +1708,8 @@ PLAN_DIR_REL='${PLAN_DIR_REL}'
 PLAN_FILE_NAME='${PLAN_FILE_NAME}'
 SCRIPT_NAME='${SCRIPT_NAME}'
 HOLD='${HOLD}'
+CACHED_IMG_NAME='${CACHED_IMG_NAME}'
+CACHED_IMG_REL='${CACHED_IMG_REL}'
 EOF
 
     startfile="$ovl_dir/usr/local/sbin/reinstall-auto.sh"
@@ -1672,21 +1731,6 @@ export PATH
 }
 # shellcheck disable=SC1091
 . /etc/reinstall/vars
-
-ensure_network() {
-    if ip route 2>/dev/null | grep -q '^default'; then
-        return 0
-    fi
-
-    for dev in $(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' || true); do
-        ip link set "$dev" up 2>/dev/null || true
-        udhcpc -q -n -t 5 -i "$dev" 2>/dev/null || true
-        if ip route 2>/dev/null | grep -q '^default'; then
-            return 0
-        fi
-    done
-    return 0
-}
 
 mount_bootstrap() {
     local base_mnt dev
@@ -1773,27 +1817,28 @@ install_runtime_deps() {
     repo_community="$repo_root/community"
     pkg_manifest="$repo_root/runtime-packages.txt"
 
-    if [ -f "$pkg_manifest" ] && [ -f "$repo_main/APKINDEX.tar.gz" ] && [ -f "$repo_community/APKINDEX.tar.gz" ]; then
-        echo "Installing runtime dependencies from offline Alpine repository..."
+    [ -f "$pkg_manifest" ] || {
+        echo "Offline package manifest not found: $pkg_manifest"
+        exit 1
+    }
+    [ -f "$repo_main/APKINDEX.tar.gz" ] || {
+        echo "Offline main APKINDEX not found: $repo_main/APKINDEX.tar.gz"
+        exit 1
+    }
+    [ -f "$repo_community/APKINDEX.tar.gz" ] || {
+        echo "Offline community APKINDEX not found: $repo_community/APKINDEX.tar.gz"
+        exit 1
+    }
 
-        packages="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$pkg_manifest" | tr '\n' ' ')"
+    echo "Installing runtime dependencies from offline Alpine repository..."
 
-        apk add --no-network --allow-untrusted \
-            --repositories-file /dev/null \
-            --repository "$repo_main" \
-            --repository "$repo_community" \
-            $packages || true
+    packages="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$pkg_manifest" | tr '\n' ' ')"
 
-        return
-    fi
-
-    echo "Offline Alpine repository not found, falling back to network install"
-
-    ensure_network
-    apk update || true
-    apk add --no-cache \
-        bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
-        e2fsprogs dosfstools || true
+    apk add --no-network --allow-untrusted \
+        --repositories-file /dev/null \
+        --repository "$repo_main" \
+        --repository "$repo_community" \
+        $packages
 }
 
 main() {
@@ -1857,7 +1902,6 @@ command="/usr/local/sbin/reinstall-auto.sh"
 command_background="no"
 depend() {
     need localmount
-    use net
 }
 start() {
     ebegin "Starting reinstall-auto"
@@ -1986,9 +2030,12 @@ prepare_and_boot_alpine_ram() {
     [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host in this function"
 
     prepare_alpine_paths
+    derive_cached_image_name
     copy_script_to_efi
     download_alpine_ram_files
     download_runtime_apk_repo
+    cache_target_image
+    save_plan_to_efi
     build_alpine_apkovl
     install_grub_entry_for_alpine
 
@@ -2003,9 +2050,12 @@ prepare_and_boot_alpine_ram_freebsd() {
     [[ "$OS" == "FreeBSD" ]] || error "Automatic FreeBSD BootNext bootstrap only supports FreeBSD host"
 
     prepare_alpine_paths
+    derive_cached_image_name
     copy_script_to_efi
     download_alpine_ram_files
     download_runtime_apk_repo
+    cache_target_image
+    save_plan_to_efi
     build_alpine_apkovl
     build_freebsd_grub_efi
     install_freebsd_bootnext_entry
@@ -2019,7 +2069,29 @@ prepare_and_boot_alpine_ram_freebsd() {
 
 # ----------------- installer execution (download + dd + NoCloud) -----------------
 
+find_cached_target_image() {
+    local p
+
+    if [[ -n "${CACHED_IMG_NAME:-}" ]]; then
+        for p in \
+            "${EFI_MOUNT_POINT}${PLAN_PATH_PREFIX_REL}${CACHED_IMG_REL}/${CACHED_IMG_NAME}" \
+            "/media/bootstrap${PLAN_PATH_PREFIX_REL}${CACHED_IMG_REL}/${CACHED_IMG_NAME}" \
+            "/media/bootstrap/boot${CACHED_IMG_REL}/${CACHED_IMG_NAME}" \
+            "/media/bootstrap${CACHED_IMG_REL}/${CACHED_IMG_NAME}"
+        do
+            if [[ -f "$p" ]]; then
+                printf '%s\n' "$p"
+                return 0
+            fi
+        done
+    fi
+
+    return 1
+}
+
 do_install() {
+    local cached_img_path=""
+
     info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
     info "Target: $TARGET_OS ${TARGET_VER:-"(no version)"}"
     info "Disk: $DISK"
@@ -2039,12 +2111,12 @@ do_install() {
     IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
     IMG_RAW="$INSTALL_TMPDIR/image.raw"
 
-    if [[ "$IMG_URL" =~ ^https?:// ]]; then
-        ensure_working_network
+    if cached_img_path=$(find_cached_target_image); then
+        info "Using cached target image: $cached_img_path"
+        cp "$cached_img_path" "$IMG_QCOW"
+    else
+        error "Cached target image not found on bootstrap storage. Offline installer requires the image to be cached before reboot."
     fi
-
-    info "Downloading image..."
-    http_download "$IMG_URL" "$IMG_QCOW"
 
     if file "$IMG_QCOW" | grep -qi 'xz compressed'; then
         info "Detected xz compressed image, decompressing (progress may be shown)..."
@@ -2124,11 +2196,8 @@ do_install() {
         if [[ -n "$FRPC_TOML" ]]; then
             FRPC_PRESENT=1
             if [[ "$FRPC_TOML" =~ ^https?:// ]]; then
-                info "Downloading FRPC config: $FRPC_TOML"
-                if ! http_download "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"; then
-                    warn "Failed to download FRPC config, ignoring"
-                    FRPC_PRESENT=""
-                fi
+                warn "Offline installer cannot download FRPC config at installer stage. Use a local --frpc-toml file if needed."
+                FRPC_PRESENT=""
             elif [[ -f "$FRPC_TOML" ]]; then
                 info "Copying FRPC config from: $FRPC_TOML"
                 cp "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"
@@ -2176,6 +2245,10 @@ do_install() {
         done <<<"$SSH_KEYS_ALL"
     else
         echo "  (none)"
+    fi
+
+    if [[ -n "${CACHED_IMG_NAME:-}" ]]; then
+        echo "Cached image:  $CACHED_IMG_NAME"
     fi
 
     if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
@@ -2442,6 +2515,8 @@ if [[ -z "$IMG_URL" ]] && [[ "$TARGET_OS" == "redhat" ]]; then
     error "For redhat you must specify image URL with --img"
 fi
 
+derive_cached_image_name
+
 info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
 info "Target: $TARGET_OS ${TARGET_VER:-"(no version)"}"
 info "Disk: $DISK"
@@ -2460,6 +2535,7 @@ echo "Disk device:  $DISK"
 echo "Target OS:    $TARGET_OS ${TARGET_VER:-"(no version)"}"
 echo "Username:     root"
 echo "SSH port:     ${SSH_PORT:-22}"
+echo "Cached image: ${CACHED_IMG_NAME}"
 if [[ -n "$PASSWORD_HASH" ]]; then
     if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
         echo "Generated root password:"
