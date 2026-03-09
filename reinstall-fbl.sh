@@ -935,7 +935,7 @@ split_freebsd_part_device() {
 
     case "$dev" in
         *p[0-9]*)
-            PLAN_EFI_PART_DISK="/dev/${dev%p[0-9]*}"
+            PLAN_EFI_PART_DISK="/dev/${dev%%p[0-9]*}"
             PLAN_EFI_PART_NUM="${dev##*p}"
             ;;
         *)
@@ -1738,6 +1738,10 @@ do_install() {
     fi
 
     INSTALL_TMPDIR=$(mktemp -d /tmp/reinstall-cloudinit.XXXXXX)
+    # Intentionally no EXIT trap here.
+    # This installer normally runs in a transient environment and reboots soon after dd,
+    # so leftover files under /tmp are acceptable if an intermediate step aborts.
+    # We still remove INSTALL_TMPDIR explicitly on the successful path below.
 
     IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
     IMG_RAW="$INSTALL_TMPDIR/image.raw"
