@@ -826,6 +826,7 @@ ALPINE_FREEBSD_GRUB_EFI_REL=""
 ALPINE_FREEBSD_GRUB_EFI_ABS=""
 ALPINE_NETBOOT_ARCH=""
 ALPINE_KERNEL_FLAVOR=""
+ALPINE_KERNEL_CMDLINE_COMMON="ip=dhcp nomodeset panic=5 console=tty0 console=ttyS0,115200n8"
 GRUB_SCRIPT_PATH=""
 GRUB_CFG_PATH=""
 GRUB_MKCONFIG_CMD=""
@@ -1334,8 +1335,8 @@ download_alpine_ram_files() {
 
     base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/netboot"
 
-    # Prefer virt, then fall back to lts. This works for x86_64 and lets aarch64 use lts if virt is absent.
-    for flavor in virt lts; do
+    # Prefer lts, then fall back to virt.
+    for flavor in lts virt; do
         info "Trying Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${flavor}"
         if http_download "$base/vmlinuz-${flavor}" "$tmpdir/vmlinuz" &&
            http_download "$base/initramfs-${flavor}" "$tmpdir/initramfs" &&
@@ -1594,7 +1595,7 @@ install_grub_entry_for_alpine() {
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
     search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_dev=UUID=${PLAN_EFI_UUID} alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ${ALPINE_KERNEL_CMDLINE_COMMON} alpine_dev=UUID=${PLAN_EFI_UUID} alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -1603,7 +1604,7 @@ EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
-    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} apkovl=/boot${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux /boot${ALPINE_VMLINUZ_REL} ${ALPINE_KERNEL_CMDLINE_COMMON} alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} apkovl=/boot${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd /boot${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -1627,7 +1628,7 @@ build_freebsd_grub_efi() {
     cfg="$tmp/grub.cfg"
     cat >"$cfg" <<EOF
 search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_dev=UUID=${PLAN_EFI_UUID} alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1
+linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ${ALPINE_KERNEL_CMDLINE_COMMON} alpine_dev=UUID=${PLAN_EFI_UUID} alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
