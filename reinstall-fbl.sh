@@ -1331,7 +1331,6 @@ download_alpine_ram_files() {
 
     local base flavor tmpdir ok=0
     tmpdir=$(mktemp -d /tmp/reinstall-alpine-netboot.XXXXXX)
-    trap 'rm -rf "$tmpdir"' RETURN
 
     base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/netboot"
 
@@ -1354,13 +1353,14 @@ download_alpine_ram_files() {
         rm -f "$tmpdir/vmlinuz" "$tmpdir/initramfs" "$tmpdir/modloop"
     done
 
+    rm -rf -- "$tmpdir"
+
     [[ "$ok" -eq 1 ]] || error "Failed to download Alpine RAM kernel/initramfs/modloop for arch=${ALPINE_NETBOOT_ARCH} from ${base}"
 }
 
 build_alpine_apkovl() {
     local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
-    trap 'rm -rf "$tmp"' RETURN
 
     ovl_dir="$tmp/ovl"
 
@@ -1580,6 +1580,9 @@ EOF
     ln -s ../../init.d/reinstall-auto "$runlevel_link"
 
     tar -C "$ovl_dir" -czf "$ALPINE_APKOVL_ABS" .
+
+    rm -rf -- "$tmp"
+
     chmod 0644 "$ALPINE_APKOVL_ABS"
     sync
     info "Built Alpine apkovl overlay: $ALPINE_APKOVL_ABS"
@@ -1623,7 +1626,6 @@ build_freebsd_grub_efi() {
 
     local tmp cfg
     tmp=$(mktemp -d /tmp/reinstall-freebsd-grub.XXXXXX)
-    trap 'rm -rf "$tmp"' RETURN
 
     cfg="$tmp/grub.cfg"
     cat >"$cfg" <<EOF
@@ -1639,6 +1641,9 @@ EOF
         -o "$ALPINE_FREEBSD_GRUB_EFI_ABS" \
         "boot/grub/grub.cfg=$cfg" \
         --modules="part_gpt fat search search_fs_uuid linux normal echo"
+
+    rm -rf -- "$tmp"
+
     chmod 0644 "$ALPINE_FREEBSD_GRUB_EFI_ABS"
     sync
 }
@@ -1733,7 +1738,6 @@ do_install() {
     fi
 
     INSTALL_TMPDIR=$(mktemp -d /tmp/reinstall-cloudinit.XXXXXX)
-    trap 'rm -rf "$INSTALL_TMPDIR"' EXIT
 
     IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
     IMG_RAW="$INSTALL_TMPDIR/image.raw"
@@ -1841,6 +1845,8 @@ do_install() {
     else
         warn "EFI could not be mounted; target system can still boot, but cloud-init configuration may not be applied."
     fi
+
+    rm -rf -- "$INSTALL_TMPDIR"
 
     info "Image write and cloud-init NoCloud injection completed."
 
