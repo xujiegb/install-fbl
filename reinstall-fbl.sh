@@ -225,7 +225,7 @@ detect_os_arch() {
     esac
 }
 
-# -------- dependencies (auto-install on Red Hat / Debian / FreeBSD only) --------
+# -------- dependencies (auto-install on Red Hat / FreeBSD only) --------
 
 LINUX_FAMILY=""
 
@@ -244,9 +244,6 @@ detect_linux_family() {
         case "$ids" in
             *" rhel "*|*" rocky "*|*" almalinux "*|*" centos "*|*" fedora "*)
                 LINUX_FAMILY="redhat"
-                ;;
-            *" debian "*|*" ubuntu "*)
-                LINUX_FAMILY="debian"
                 ;;
             *)
                 LINUX_FAMILY=""
@@ -269,7 +266,7 @@ missing_deps_linux_common() {
     command -v file >/dev/null 2>&1 || missing+=("file")
     have_any_downloader || missing+=("downloader")
 
-    printf '%s\n' "${missing[@]}"
+    ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
 }
 
 missing_deps_freebsd_host() {
@@ -282,7 +279,7 @@ missing_deps_freebsd_host() {
     command -v efibootmgr >/dev/null 2>&1 || missing+=("efibootmgr")
     command -v grub-mkstandalone >/dev/null 2>&1 || command -v grub2-mkstandalone >/dev/null 2>&1 || missing+=("grub-mkstandalone")
 
-    printf '%s\n' "${missing[@]}"
+    ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
 }
 
 missing_deps_freebsd_installer() {
@@ -293,7 +290,7 @@ missing_deps_freebsd_installer() {
     command -v file >/dev/null 2>&1 || missing+=("file")
     have_any_downloader || missing+=("downloader")
 
-    printf '%s\n' "${missing[@]}"
+    ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
 }
 
 install_deps_redhat() {
@@ -315,29 +312,6 @@ install_deps_redhat() {
 
     info "Installing missing dependencies with dnf: ${pkgs[*]}"
     dnf install -y "${pkgs[@]}"
-}
-
-install_deps_debian() {
-    local pkgs=()
-    local item
-
-    for item in "$@"; do
-        case "$item" in
-            qemu-img)   pkgs+=("qemu-utils") ;;
-            xz)         pkgs+=("xz-utils") ;;
-            file)       pkgs+=("file") ;;
-            downloader) pkgs+=("curl") ;;
-        esac
-    done
-
-    [[ "${#pkgs[@]}" -gt 0 ]] || return 0
-
-    command -v apt-get >/dev/null 2>&1 || error "Auto-install requires apt-get on Debian family system"
-
-    info "Installing missing dependencies with apt-get: ${pkgs[*]}"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y "${pkgs[@]}"
 }
 
 install_deps_freebsd_host() {
@@ -397,11 +371,8 @@ ensure_dependencies() {
             redhat)
                 install_deps_redhat "${missing[@]}"
                 ;;
-            debian)
-                install_deps_debian "${missing[@]}"
-                ;;
             *)
-                error "Unsupported Linux family for auto-install. Only Red Hat and Debian are supported.
+                error "Unsupported Linux family for auto-install. Only Red Hat family Linux is supported.
 Missing dependencies: ${missing[*]}"
                 ;;
         esac
