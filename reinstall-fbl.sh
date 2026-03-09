@@ -786,6 +786,8 @@ PLAN_EFI_PART=""
 PLAN_EFI_UUID=""
 PLAN_EFI_FS_TYPE=""
 PLAN_EFI_MOUNTED_BY_SCRIPT=0
+PLAN_STORAGE_MODE="efi"
+PLAN_PATH_PREFIX_REL=""
 
 # Alpine RAM preparation
 ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
@@ -909,19 +911,80 @@ get_fs_type_freebsd() {
 }
 
 mount_efi_for_plan() {
-    if [[ -d "$EFI_MOUNT_POINT" ]] && mountpoint -q "$EFI_MOUNT_POINT" 2>/dev/null; then
-        PLAN_EFI_MOUNTED_BY_SCRIPT=0
-        if [[ -z "$PLAN_EFI_PART" ]]; then
-            if [[ "$OS" == "Linux" ]]; then
+    if [[ "$OS" == "Linux" ]]; then
+        # Prefer real EFI/ESP if available.
+        if [[ -d "/boot/efi" ]] && mountpoint -q "/boot/efi" 2>/dev/null; then
+            EFI_MOUNT_POINT="/boot/efi"
+            PLAN_STORAGE_MODE="efi"
+            PLAN_PATH_PREFIX_REL=""
+            PLAN_EFI_MOUNTED_BY_SCRIPT=0
+            if [[ -z "$PLAN_EFI_PART" ]]; then
                 PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "$EFI_MOUNT_POINT" 2>/dev/null || true)
-            elif [[ "$OS" == "FreeBSD" ]]; then
-                PLAN_EFI_PART=$(mount | awk -v mnt="$EFI_MOUNT_POINT" '$3 == "on" && $4 == mnt {print $1; exit}' || true)
             fi
+            if [[ -n "$PLAN_EFI_PART" ]]; then
+                PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
+                PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
+            fi
+            return 0
         fi
-        if [[ "$OS" == "Linux" && -n "$PLAN_EFI_PART" ]]; then
+
+        local efi_part=""
+        efi_part=$(find_efi_for_plan 2>/dev/null || true)
+        if [[ -n "$efi_part" ]]; then
+            EFI_MOUNT_POINT="/boot/efi"
+            mkdir -p "$EFI_MOUNT_POINT"
+            if ! mount "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
+                if ! mount -t vfat "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
+                   ! mount -t msdos "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
+                   ! mount -t msdosfs "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
+                    error "Failed to mount EFI partition $efi_part on $EFI_MOUNT_POINT"
+                fi
+            fi
+            PLAN_STORAGE_MODE="efi"
+            PLAN_PATH_PREFIX_REL=""
+            PLAN_EFI_PART="$efi_part"
+            PLAN_EFI_MOUNTED_BY_SCRIPT=1
             PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
             PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
-        elif [[ "$OS" == "FreeBSD" && -n "$PLAN_EFI_PART" ]]; then
+            return 0
+        fi
+
+        # Linux fallback: no EFI found, use /boot instead.
+        if [[ -d "/boot" ]]; then
+            EFI_MOUNT_POINT="/boot"
+            PLAN_STORAGE_MODE="boot"
+            PLAN_EFI_MOUNTED_BY_SCRIPT=0
+
+            if mountpoint -q "/boot" 2>/dev/null; then
+                PLAN_PATH_PREFIX_REL=""
+                if [[ -z "$PLAN_EFI_PART" ]]; then
+                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/boot" 2>/dev/null || true)
+                fi
+            else
+                PLAN_PATH_PREFIX_REL="/boot"
+                if [[ -z "$PLAN_EFI_PART" ]]; then
+                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/" 2>/dev/null || true)
+                fi
+            fi
+
+            if [[ -n "$PLAN_EFI_PART" ]]; then
+                PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
+                PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
+            fi
+            return 0
+        fi
+
+        error "Could not find EFI partition for plan storage, and /boot fallback is unavailable"
+    fi
+
+    if [[ -d "$EFI_MOUNT_POINT" ]] && mountpoint -q "$EFI_MOUNT_POINT" 2>/dev/null; then
+        PLAN_STORAGE_MODE="efi"
+        PLAN_PATH_PREFIX_REL=""
+        PLAN_EFI_MOUNTED_BY_SCRIPT=0
+        if [[ -z "$PLAN_EFI_PART" ]]; then
+            PLAN_EFI_PART=$(mount | awk -v mnt="$EFI_MOUNT_POINT" '$3 == "on" && $4 == mnt {print $1; exit}' || true)
+        fi
+        if [[ -n "$PLAN_EFI_PART" ]]; then
             PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
             PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
         fi
@@ -941,20 +1004,17 @@ mount_efi_for_plan() {
         fi
     fi
 
+    PLAN_STORAGE_MODE="efi"
+    PLAN_PATH_PREFIX_REL=""
     PLAN_EFI_PART="$efi_part"
     PLAN_EFI_MOUNTED_BY_SCRIPT=1
-    if [[ "$OS" == "Linux" ]]; then
-        PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
-        PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
-    elif [[ "$OS" == "FreeBSD" ]]; then
-        PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
-        PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
-    fi
+    PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
+    PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
 }
 
 save_plan_to_efi() {
     mount_efi_for_plan
-    local plan_dir="$EFI_MOUNT_POINT/$PLAN_DIR_REL"
+    local plan_dir="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL"
     local plan_file="$plan_dir/$PLAN_FILE_NAME"
     mkdir -p "$plan_dir"
 
@@ -973,6 +1033,8 @@ save_plan_to_efi() {
         printf 'PLAN_EFI_PART=%q\n' "$PLAN_EFI_PART"
         printf 'PLAN_EFI_UUID=%q\n' "$PLAN_EFI_UUID"
         printf 'PLAN_EFI_FS_TYPE=%q\n' "$PLAN_EFI_FS_TYPE"
+        printf 'PLAN_STORAGE_MODE=%q\n' "$PLAN_STORAGE_MODE"
+        printf 'PLAN_PATH_PREFIX_REL=%q\n' "$PLAN_PATH_PREFIX_REL"
         printf 'PLAN_DIR_REL=%q\n' "$PLAN_DIR_REL"
         printf 'PLAN_FILE_NAME=%q\n' "$PLAN_FILE_NAME"
         printf 'SCRIPT_NAME=%q\n' "$SCRIPT_NAME"
@@ -983,10 +1045,48 @@ save_plan_to_efi() {
 }
 
 load_plan_from_efi() {
+    local plan_dir plan_file boot_mnt candidate
+
+    if [[ -f /etc/reinstall/vars ]]; then
+        # shellcheck disable=SC1091
+        . /etc/reinstall/vars
+    fi
+
+    if [[ "$OS" == "Linux" && "${PLAN_STORAGE_MODE:-efi}" == "boot" ]]; then
+        boot_mnt="/media/bootstrap"
+        mkdir -p "$boot_mnt"
+
+        if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+            if [[ -n "${PLAN_EFI_PART:-}" ]] && [[ -e "${PLAN_EFI_PART}" ]]; then
+                mount "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || true
+            fi
+            if ! mountpoint -q "$boot_mnt" 2>/dev/null && [[ -n "${PLAN_EFI_UUID:-}" ]]; then
+                candidate="$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)"
+                if [[ -n "$candidate" ]] && [[ -e "$candidate" ]]; then
+                    mount "$candidate" "$boot_mnt" 2>/dev/null || true
+                fi
+            fi
+        fi
+
+        [[ -d "$boot_mnt" ]] || error "Could not prepare Linux bootstrap mount point"
+
+        plan_dir="$boot_mnt${PLAN_PATH_PREFIX_REL:-}/$PLAN_DIR_REL"
+        plan_file="$plan_dir/$PLAN_FILE_NAME"
+        [[ -f "$plan_file" ]] || error "Plan file not found on Linux bootstrap storage: $plan_file"
+
+        EFI_MOUNT_POINT="$boot_mnt${PLAN_PATH_PREFIX_REL:-}"
+        # shellcheck disable=SC1090
+        . "$plan_file"
+        PASSWORD="${PASSWORD:-}"
+        PASSWORD_HASH="${PASSWORD_HASH:-}"
+        info "Loaded reinstall plan from $plan_file"
+        return 0
+    fi
+
     mount_efi_for_plan
-    local plan_dir="$EFI_MOUNT_POINT/$PLAN_DIR_REL"
-    local plan_file="$plan_dir/$PLAN_FILE_NAME"
-    [[ -f "$plan_file" ]] || error "Plan file not found on EFI: $plan_file"
+    plan_dir="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL"
+    plan_file="$plan_dir/$PLAN_FILE_NAME"
+    [[ -f "$plan_file" ]] || error "Plan file not found on bootstrap storage: $plan_file"
     # shellcheck disable=SC1090
     . "$plan_file"
     PASSWORD="${PASSWORD:-}"
@@ -1086,24 +1186,28 @@ prepare_alpine_paths() {
             ;;
     esac
 
-    [[ -n "$PLAN_EFI_UUID" ]] || error "Could not determine EFI filesystem UUID"
+    if [[ "$PLAN_STORAGE_MODE" == "efi" ]]; then
+        [[ -n "$PLAN_EFI_UUID" ]] || error "Could not determine EFI filesystem UUID"
+    else
+        [[ -n "$PLAN_EFI_PART" || -n "$PLAN_EFI_UUID" ]] || error "Could not determine Linux /boot fallback source"
+    fi
 
     ALPINE_BOOT_DIR_REL="/$PLAN_DIR_REL/$ALPINE_BOOT_SUBDIR"
-    ALPINE_BOOT_DIR_ABS="$EFI_MOUNT_POINT$ALPINE_BOOT_DIR_REL"
+    ALPINE_BOOT_DIR_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_BOOT_DIR_REL"
 
-    # Use generic destination names on EFI so different source flavors/arches can be normalized.
+    # Use generic destination names on bootstrap storage so different source flavors/arches can be normalized.
     ALPINE_VMLINUZ_REL="$ALPINE_BOOT_DIR_REL/vmlinuz"
     ALPINE_INITRAMFS_REL="$ALPINE_BOOT_DIR_REL/initramfs"
     ALPINE_MODLOOP_REL="$ALPINE_BOOT_DIR_REL/modloop"
     ALPINE_APKOVL_REL="$ALPINE_BOOT_DIR_REL/reinstall.apkovl.tar.gz"
 
-    ALPINE_VMLINUZ_ABS="$EFI_MOUNT_POINT$ALPINE_VMLINUZ_REL"
-    ALPINE_INITRAMFS_ABS="$EFI_MOUNT_POINT$ALPINE_INITRAMFS_REL"
-    ALPINE_MODLOOP_ABS="$EFI_MOUNT_POINT$ALPINE_MODLOOP_REL"
-    ALPINE_APKOVL_ABS="$EFI_MOUNT_POINT$ALPINE_APKOVL_REL"
+    ALPINE_VMLINUZ_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_VMLINUZ_REL"
+    ALPINE_INITRAMFS_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_INITRAMFS_REL"
+    ALPINE_MODLOOP_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_MODLOOP_REL"
+    ALPINE_APKOVL_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_APKOVL_REL"
 
-    ALPINE_SCRIPT_COPY_ABS="$EFI_MOUNT_POINT/$PLAN_DIR_REL/$SCRIPT_NAME"
-    ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$ALPINE_FREEBSD_GRUB_EFI_REL"
+    ALPINE_SCRIPT_COPY_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL/$SCRIPT_NAME"
+    ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_FREEBSD_GRUB_EFI_REL"
 }
 
 copy_script_to_efi() {
@@ -1118,7 +1222,7 @@ copy_script_to_efi() {
     cp "$self" "$ALPINE_SCRIPT_COPY_ABS"
     chmod 0755 "$ALPINE_SCRIPT_COPY_ABS"
     sync
-    info "Copied script to EFI: $ALPINE_SCRIPT_COPY_ABS"
+    info "Copied script to bootstrap storage: $ALPINE_SCRIPT_COPY_ABS"
 }
 
 download_alpine_ram_files() {
@@ -1176,6 +1280,9 @@ EOF
     cat >"$markerfile" <<EOF
 PLAN_EFI_PART='${PLAN_EFI_PART}'
 PLAN_EFI_UUID='${PLAN_EFI_UUID}'
+PLAN_EFI_FS_TYPE='${PLAN_EFI_FS_TYPE}'
+PLAN_STORAGE_MODE='${PLAN_STORAGE_MODE}'
+PLAN_PATH_PREFIX_REL='${PLAN_PATH_PREFIX_REL}'
 PLAN_DIR_REL='${PLAN_DIR_REL}'
 PLAN_FILE_NAME='${PLAN_FILE_NAME}'
 SCRIPT_NAME='${SCRIPT_NAME}'
@@ -1217,51 +1324,76 @@ ensure_network() {
     return 0
 }
 
-mount_efi() {
-    mkdir -p /media/efi
+mount_bootstrap() {
+    local base_mnt dev path_prefix
+    base_mnt=/media/bootstrap
+    path_prefix="${PLAN_PATH_PREFIX_REL:-}"
 
-    if mountpoint -q /media/efi 2>/dev/null; then
+    mkdir -p "$base_mnt"
+
+    if mountpoint -q "$base_mnt" 2>/dev/null; then
         return 0
     fi
 
-    if [ -n "${PLAN_EFI_PART:-}" ] && [ -e "${PLAN_EFI_PART}" ]; then
-        mount "${PLAN_EFI_PART}" /media/efi 2>/dev/null || \
-        mount -t vfat "${PLAN_EFI_PART}" /media/efi 2>/dev/null || \
-        mount -t msdos "${PLAN_EFI_PART}" /media/efi 2>/dev/null || \
-        mount -t msdosfs "${PLAN_EFI_PART}" /media/efi 2>/dev/null || true
+    if [ "${PLAN_STORAGE_MODE:-efi}" = "efi" ]; then
+        if [ -n "${PLAN_EFI_PART:-}" ] && [ -e "${PLAN_EFI_PART}" ]; then
+            mount "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || \
+            mount -t vfat "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || \
+            mount -t msdos "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || \
+            mount -t msdosfs "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || true
+        fi
+    else
+        if [ -n "${PLAN_EFI_PART:-}" ] && [ -e "${PLAN_EFI_PART}" ]; then
+            mount "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || true
+        fi
     fi
 
-    if mountpoint -q /media/efi 2>/dev/null; then
+    if mountpoint -q "$base_mnt" 2>/dev/null; then
         return 0
     fi
 
     if [ -n "${PLAN_EFI_UUID:-}" ]; then
         dev="$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)"
         if [ -n "$dev" ] && [ -e "$dev" ]; then
-            mount "$dev" /media/efi 2>/dev/null || \
-            mount -t vfat "$dev" /media/efi 2>/dev/null || \
-            mount -t msdos "$dev" /media/efi 2>/dev/null || \
-            mount -t msdosfs "$dev" /media/efi 2>/dev/null || true
+            if [ "${PLAN_STORAGE_MODE:-efi}" = "efi" ]; then
+                mount "$dev" "$base_mnt" 2>/dev/null || \
+                mount -t vfat "$dev" "$base_mnt" 2>/dev/null || \
+                mount -t msdos "$dev" "$base_mnt" 2>/dev/null || \
+                mount -t msdosfs "$dev" "$base_mnt" 2>/dev/null || true
+            else
+                mount "$dev" "$base_mnt" 2>/dev/null || true
+            fi
         fi
     fi
 
-    if mountpoint -q /media/efi 2>/dev/null; then
+    if mountpoint -q "$base_mnt" 2>/dev/null; then
         return 0
     fi
 
-    for dev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p*; do
-        [ -e "$dev" ] || continue
-        mount "$dev" /media/efi 2>/dev/null || \
-        mount -t vfat "$dev" /media/efi 2>/dev/null || \
-        mount -t msdos "$dev" /media/efi 2>/dev/null || \
-        mount -t msdosfs "$dev" /media/efi 2>/dev/null || true
-        if [ -f "/media/efi/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
-            return 0
-        fi
-        umount /media/efi 2>/dev/null || true
-    done
+    if [ "${PLAN_STORAGE_MODE:-efi}" = "efi" ]; then
+        for dev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p*; do
+            [ -e "$dev" ] || continue
+            mount "$dev" "$base_mnt" 2>/dev/null || \
+            mount -t vfat "$dev" "$base_mnt" 2>/dev/null || \
+            mount -t msdos "$dev" "$base_mnt" 2>/dev/null || \
+            mount -t msdosfs "$dev" "$base_mnt" 2>/dev/null || true
+            if [ -f "$base_mnt${path_prefix}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
+                return 0
+            fi
+            umount "$base_mnt" 2>/dev/null || true
+        done
+    else
+        for dev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p* /dev/mapper/*; do
+            [ -e "$dev" ] || continue
+            mount "$dev" "$base_mnt" 2>/dev/null || true
+            if [ -f "$base_mnt${path_prefix}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
+                return 0
+            fi
+            umount "$base_mnt" 2>/dev/null || true
+        done
+    fi
 
-    echo "Failed to mount EFI partition"
+    echo "Failed to mount bootstrap storage"
     return 1
 }
 
@@ -1275,10 +1407,10 @@ install_runtime_deps() {
 
 main() {
     install_runtime_deps
-    mount_efi
+    mount_bootstrap
 
-    PLAN_FILE="/media/efi/${PLAN_DIR_REL}/${PLAN_FILE_NAME}"
-    SCRIPT_FILE="/media/efi/${PLAN_DIR_REL}/${SCRIPT_NAME}"
+    PLAN_FILE="/media/bootstrap${PLAN_PATH_PREFIX_REL:-}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}"
+    SCRIPT_FILE="/media/bootstrap${PLAN_PATH_PREFIX_REL:-}/${PLAN_DIR_REL}/${SCRIPT_NAME}"
 
     [ -f "$PLAN_FILE" ] || {
         echo "Plan file not found: $PLAN_FILE"
@@ -1318,7 +1450,7 @@ EOF
     cat >"$svcfile" <<'EOF'
 #!/sbin/openrc-run
 name="reinstall-auto"
-description="Automatic reinstall runner from EFI plan"
+description="Automatic reinstall runner from bootstrap plan"
 command="/usr/local/sbin/reinstall-auto.sh"
 command_background="no"
 depend() {
@@ -1346,7 +1478,8 @@ install_grub_entry_for_alpine() {
     ensure_grub_tools
     detect_current_console_args
 
-    cat >"$GRUB_SCRIPT_PATH" <<EOF
+    if [[ "$PLAN_STORAGE_MODE" == "efi" ]]; then
+        cat >"$GRUB_SCRIPT_PATH" <<EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
@@ -1355,6 +1488,16 @@ menuentry '${ALPINE_ENTRY_TITLE}' {
     initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 }
 EOF
+    else
+        cat >"$GRUB_SCRIPT_PATH" <<EOF
+#!/bin/sh
+exec tail -n +3 \$0
+menuentry '${ALPINE_ENTRY_TITLE}' {
+    linux ${PLAN_PATH_PREFIX_REL}${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${PLAN_PATH_PREFIX_REL}${ALPINE_MODLOOP_REL} apkovl=${PLAN_PATH_PREFIX_REL}${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    initrd ${PLAN_PATH_PREFIX_REL}${ALPINE_INITRAMFS_REL}
+}
+EOF
+    fi
     chmod 0755 "$GRUB_SCRIPT_PATH"
 
     info "Regenerating GRUB config..."
