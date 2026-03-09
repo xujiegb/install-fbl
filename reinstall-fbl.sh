@@ -21,6 +21,9 @@
 # Added:
 #   - On Linux+GRUB+EFI host, automatically prepare Alpine RAM installer,
 #     add a one-time GRUB entry, reboot into Alpine RAM, and auto-continue.
+#   - On FreeBSD+UEFI host, automatically prepare Alpine RAM installer,
+#     build a GRUB EFI binary, add a one-time BootNext entry, reboot into Alpine RAM,
+#     and auto-continue.
 
 set -Eeuo pipefail
 export LC_ALL=C
@@ -124,7 +127,48 @@ http_download() {
 
 lsblk_get_kv() {
     local line="$1" key="$2"
-    sed -n "s/.*${key}=\"\\([^\"]*\\)\".*/\\1/p" <<<"$line"
+    awk -v want="$key" '
+        BEGIN {
+            len = length($0)
+            i = 1
+            while (i <= len) {
+                while (i <= len && substr($0, i, 1) == " ") i++
+                if (i > len) break
+
+                eq = index(substr($0, i), "=")
+                if (eq == 0) break
+                eq = i + eq - 1
+
+                k = substr($0, i, eq - i)
+                i = eq + 1
+
+                if (substr($0, i, 1) != "\"") break
+                i++
+
+                v = ""
+                while (i <= len) {
+                    c = substr($0, i, 1)
+                    if (c == "\\") {
+                        i++
+                        if (i <= len) v = v substr($0, i, 1)
+                    } else if (c == "\"") {
+                        break
+                    } else {
+                        v = v c
+                    }
+                    i++
+                }
+
+                if (k == want) {
+                    print v
+                    exit
+                }
+
+                i++
+                while (i <= len && substr($0, i, 1) != " ") i++
+            }
+        }
+    ' <<<"$line"
 }
 
 hash_password() {
@@ -149,7 +193,6 @@ PY
         perl -e '
             use strict;
             use warnings;
-            use MIME::Base64 qw(encode_base64);
             my $pw = shift @ARGV;
             my @chars = ("a".."z","A".."Z",0..9,".","/");
             my $salt = join("", map { $chars[rand @chars] } 1..16);
@@ -221,11 +264,17 @@ ensure_dependencies_freebsd() {
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && ! command -v fetch >/dev/null 2>&1; then
         missing+=("curl/wget/fetch")
     fi
+    if ! command -v efibootmgr >/dev/null 2>&1; then
+        missing+=("efibootmgr")
+    fi
+    if ! command -v grub-mkstandalone >/dev/null 2>&1 && ! command -v grub2-mkstandalone >/dev/null 2>&1; then
+        missing+=("grub-mkstandalone")
+    fi
 
     if [[ "${#missing[@]}" -gt 0 ]]; then
         error "Missing dependencies on FreeBSD: ${missing[*]}
 Hint: you can install them with:
-  pkg install qemu-tools xz curl file"
+  pkg install qemu-tools xz curl file efibootmgr grub2"
     fi
 }
 
@@ -641,6 +690,8 @@ ALPINE_INITRAMFS_ABS=""
 ALPINE_MODLOOP_ABS=""
 ALPINE_APKOVL_ABS=""
 ALPINE_SCRIPT_COPY_ABS=""
+ALPINE_FREEBSD_GRUB_EFI_REL=""
+ALPINE_FREEBSD_GRUB_EFI_ABS=""
 GRUB_SCRIPT_PATH=""
 GRUB_CFG_PATH=""
 GRUB_MKCONFIG_CMD=""
@@ -727,15 +778,36 @@ get_fs_type_linux() {
     fi
 }
 
+get_fs_uuid_freebsd() {
+    local dev="$1"
+    if command -v fstyp >/dev/null 2>&1; then
+        fstyp -u "$dev" 2>/dev/null || true
+    fi
+}
+
+get_fs_type_freebsd() {
+    local dev="$1"
+    if command -v fstyp >/dev/null 2>&1; then
+        fstyp "$dev" 2>/dev/null || true
+    fi
+}
+
 mount_efi_for_plan() {
     if [[ -d "$EFI_MOUNT_POINT" ]] && mountpoint -q "$EFI_MOUNT_POINT" 2>/dev/null; then
         PLAN_EFI_MOUNTED_BY_SCRIPT=0
         if [[ -z "$PLAN_EFI_PART" ]]; then
-            PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "$EFI_MOUNT_POINT" 2>/dev/null || true)
+            if [[ "$OS" == "Linux" ]]; then
+                PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "$EFI_MOUNT_POINT" 2>/dev/null || true)
+            elif [[ "$OS" == "FreeBSD" ]]; then
+                PLAN_EFI_PART=$(mount | awk -v mnt="$EFI_MOUNT_POINT" '$3 == "on" && $4 == mnt {print $1; exit}' || true)
+            fi
         fi
         if [[ "$OS" == "Linux" && -n "$PLAN_EFI_PART" ]]; then
             PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
             PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
+        elif [[ "$OS" == "FreeBSD" && -n "$PLAN_EFI_PART" ]]; then
+            PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
+            PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
         fi
         return 0
     fi
@@ -758,6 +830,9 @@ mount_efi_for_plan() {
     if [[ "$OS" == "Linux" ]]; then
         PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
         PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
+    elif [[ "$OS" == "FreeBSD" ]]; then
+        PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
+        PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
     fi
 }
 
@@ -803,7 +878,7 @@ load_plan_from_efi() {
     info "Loaded reinstall plan from $plan_file"
 }
 
-# ----------------- Alpine RAM / GRUB bootstrap -----------------
+# ----------------- Alpine RAM / boot bootstrap -----------------
 
 detect_current_console_args() {
     CURRENT_CONSOLE_ARGS=""
@@ -820,7 +895,7 @@ detect_current_console_args() {
 }
 
 ensure_grub_tools() {
-    [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host"
+    [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host in this function"
 
     if command -v grub2-mkconfig >/dev/null 2>&1; then
         GRUB_MKCONFIG_CMD="grub2-mkconfig"
@@ -861,6 +936,21 @@ ensure_grub_tools() {
     fi
 }
 
+ensure_freebsd_boot_tools() {
+    [[ "$OS" == "FreeBSD" ]] || error "Automatic FreeBSD BootNext bootstrap only supports FreeBSD host"
+    command -v efibootmgr >/dev/null 2>&1 || error "efibootmgr is required on FreeBSD host"
+    if command -v grub-mkstandalone >/dev/null 2>&1; then
+        GRUB_MKSTANDALONE_CMD="grub-mkstandalone"
+    elif command -v grub2-mkstandalone >/dev/null 2>&1; then
+        GRUB_MKSTANDALONE_CMD="grub2-mkstandalone"
+    else
+        error "grub-mkstandalone is required on FreeBSD host"
+    fi
+    if ! efibootmgr -v >/dev/null 2>&1; then
+        error "efibootmgr is present but EFI NVRAM is not accessible; FreeBSD automatic boot requires UEFI boot mode"
+    fi
+}
+
 prepare_alpine_paths() {
     mount_efi_for_plan
 
@@ -882,6 +972,9 @@ prepare_alpine_paths() {
     ALPINE_APKOVL_ABS="$EFI_MOUNT_POINT$ALPINE_APKOVL_REL"
 
     ALPINE_SCRIPT_COPY_ABS="$EFI_MOUNT_POINT/$PLAN_DIR_REL/$SCRIPT_NAME"
+
+    ALPINE_FREEBSD_GRUB_EFI_REL="$ALPINE_BOOT_DIR_REL/reinstall-grubx64.efi"
+    ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$ALPINE_FREEBSD_GRUB_EFI_REL"
 }
 
 copy_script_to_efi() {
@@ -920,6 +1013,8 @@ download_alpine_ram_files() {
 build_alpine_apkovl() {
     local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
+    trap 'rm -rf "$tmp"' RETURN
+
     ovl_dir="$tmp/ovl"
 
     mkdir -p \
@@ -1103,8 +1198,6 @@ EOF
     chmod 0644 "$ALPINE_APKOVL_ABS"
     sync
     info "Built Alpine apkovl overlay: $ALPINE_APKOVL_ABS"
-
-    rm -rf "$tmp"
 }
 
 install_grub_entry_for_alpine() {
@@ -1129,8 +1222,63 @@ EOF
     "$GRUB_REBOOT_CMD" "${ALPINE_ENTRY_TITLE}"
 }
 
+build_freebsd_grub_efi() {
+    ensure_freebsd_boot_tools
+
+    local tmp cfg
+    tmp=$(mktemp -d /tmp/reinstall-freebsd-grub.XXXXXX)
+    trap 'rm -rf "$tmp"' RETURN
+
+    cfg="$tmp/grub.cfg"
+    cat >"$cfg" <<EOF
+search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
+linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_dev=UUID=${PLAN_EFI_UUID} alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1
+initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
+boot
+EOF
+
+    info "Building standalone GRUB EFI binary for FreeBSD BootNext..."
+    "$GRUB_MKSTANDALONE_CMD" \
+        -O x86_64-efi \
+        -o "$ALPINE_FREEBSD_GRUB_EFI_ABS" \
+        "boot/grub/grub.cfg=$cfg" \
+        --modules="part_gpt fat search search_fs_uuid linux normal echo"
+    chmod 0644 "$ALPINE_FREEBSD_GRUB_EFI_ABS"
+    sync
+}
+
+install_freebsd_bootnext_entry() {
+    ensure_freebsd_boot_tools
+
+    local before after newnum
+    before=$(efibootmgr -v 2>/dev/null || true)
+
+    info "Creating FreeBSD UEFI boot entry: ${ALPINE_ENTRY_TITLE}"
+    efibootmgr -c -l "$(printf '%s' "$ALPINE_FREEBSD_GRUB_EFI_REL" | tr '/' '\\')" -L "$ALPINE_ENTRY_TITLE" >/dev/null
+
+    after=$(efibootmgr -v 2>/dev/null || true)
+
+    newnum=$(
+        awk -v label="$ALPINE_ENTRY_TITLE" '
+            $0 ~ /^Boot[0-9A-Fa-f]{4}/ && index($0, label) {
+                n = substr($1, 5, 4)
+                gsub(/\*/, "", n)
+                print n
+                found = 1
+                exit
+            }
+            END { if (!found) exit 1 }
+        ' <<<"$after" 2>/dev/null || true
+    )
+
+    [[ -n "$newnum" ]] || error "Failed to locate the newly created EFI boot entry for ${ALPINE_ENTRY_TITLE}"
+
+    info "Setting BootNext to EFI entry $newnum (${ALPINE_ENTRY_TITLE})"
+    efibootmgr -n "$newnum" >/dev/null
+}
+
 prepare_and_boot_alpine_ram() {
-    [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host"
+    [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host in this function"
 
     prepare_alpine_paths
     copy_script_to_efi
@@ -1143,6 +1291,23 @@ prepare_and_boot_alpine_ram() {
     sync
     sleep 2
     reboot
+}
+
+prepare_and_boot_alpine_ram_freebsd() {
+    [[ "$OS" == "FreeBSD" ]] || error "Automatic FreeBSD BootNext bootstrap only supports FreeBSD host"
+
+    prepare_alpine_paths
+    copy_script_to_efi
+    download_alpine_ram_files
+    build_alpine_apkovl
+    build_freebsd_grub_efi
+    install_freebsd_bootnext_entry
+
+    info "Alpine RAM installer prepared for FreeBSD UEFI BootNext."
+    info "System will reboot now into one-time UEFI entry: ${ALPINE_ENTRY_TITLE}"
+    sync
+    sleep 2
+    shutdown -r now
 }
 
 # ----------------- installer execution (download + dd + NoCloud) -----------------
@@ -1158,11 +1323,11 @@ do_install() {
         return 0
     fi
 
-    TMPDIR=$(mktemp -d /tmp/reinstall-cloudinit.XXXXXX)
-    trap 'rm -rf "$TMPDIR"' EXIT
+    INSTALL_TMPDIR=$(mktemp -d /tmp/reinstall-cloudinit.XXXXXX)
+    trap 'rm -rf "$INSTALL_TMPDIR"' EXIT
 
-    IMG_QCOW="$TMPDIR/image.qcow2"
-    IMG_RAW="$TMPDIR/image.raw"
+    IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
+    IMG_RAW="$INSTALL_TMPDIR/image.raw"
 
     info "Downloading image..."
     http_download "$IMG_URL" "$IMG_QCOW"
@@ -1221,7 +1386,7 @@ do_install() {
     EFI_PART=$(find_efi_partition "$DISK")
     info "Trying EFI partition: $EFI_PART"
 
-    MNT_EFI="$TMPDIR/efi"
+    MNT_EFI="$INSTALL_TMPDIR/efi"
     mkdir -p "$MNT_EFI"
 
     if [[ "$OS" == "FreeBSD" ]]; then
@@ -1520,6 +1685,8 @@ if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
                 error "Failed to generate random password."
             fi
             AUTO_PASSWORD=1
+            # Intentionally shown once here: the plain text password is no longer stored in plan.env,
+            # so this host-stage display is the only place the user can retrieve it automatically.
             info "A random root password will be generated and shown before reboot."
             break
         fi
@@ -1595,9 +1762,14 @@ if [[ "$OS" == "Linux" ]]; then
     exit 0
 fi
 
+if [[ "$OS" == "FreeBSD" ]]; then
+    prepare_and_boot_alpine_ram_freebsd
+    exit 0
+fi
+
 echo
 echo "Reinstall plan has been saved to EFI."
-echo "Automatic Alpine RAM GRUB bootstrap is only implemented on Linux host."
+echo "Automatic installer bootstrap is not implemented on this host."
 echo "Now configure your system to boot into the installer environment (mfsBSD or initramfs)"
 echo "and reboot manually. When the installer environment starts, this script will"
 echo "automatically load the saved plan and perform the DD + cloud-init NoCloud installation."
