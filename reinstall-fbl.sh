@@ -249,7 +249,7 @@ Please install them manually with your package manager (e.g. apt, zypper, pacman
     fi
 }
 
-ensure_dependencies_freebsd() {
+ensure_dependencies_freebsd_host() {
     local missing=()
 
     if ! command -v qemu-img >/dev/null 2>&1; then
@@ -272,9 +272,32 @@ ensure_dependencies_freebsd() {
     fi
 
     if [[ "${#missing[@]}" -gt 0 ]]; then
-        error "Missing dependencies on FreeBSD: ${missing[*]}
+        error "Missing dependencies on FreeBSD host: ${missing[*]}
 Hint: you can install them with:
   pkg install qemu-tools xz curl file efibootmgr grub2"
+    fi
+}
+
+ensure_dependencies_freebsd_installer() {
+    local missing=()
+
+    if ! command -v qemu-img >/dev/null 2>&1; then
+        missing+=("qemu-img (qemu-tools)")
+    fi
+    if ! command -v xz >/dev/null 2>&1; then
+        missing+=("xz")
+    fi
+    if ! command -v file >/dev/null 2>&1; then
+        missing+=("file")
+    fi
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && ! command -v fetch >/dev/null 2>&1; then
+        missing+=("curl/wget/fetch")
+    fi
+
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        error "Missing dependencies on FreeBSD installer environment: ${missing[*]}
+Hint: you can install them with:
+  pkg install qemu-tools xz curl file"
     fi
 }
 
@@ -282,7 +305,11 @@ ensure_dependencies() {
     if [[ "$OS" == "Linux" ]]; then
         ensure_dependencies_linux_generic
     elif [[ "$OS" == "FreeBSD" ]]; then
-        ensure_dependencies_freebsd
+        if [[ "$ENV_MODE" == "host" ]]; then
+            ensure_dependencies_freebsd_host
+        else
+            ensure_dependencies_freebsd_installer
+        fi
     fi
 }
 
@@ -697,6 +724,8 @@ GRUB_CFG_PATH=""
 GRUB_MKCONFIG_CMD=""
 GRUB_REBOOT_CMD=""
 GRUB_DEFAULT_CMD=""
+GRUB_MKSTANDALONE_CMD=""
+GRUB_EFI_TARGET=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
 
@@ -954,7 +983,14 @@ ensure_freebsd_boot_tools() {
 prepare_alpine_paths() {
     mount_efi_for_plan
 
-    [[ "$MACHINE_ARCH" == "x86_64" ]] || error "Automatic Alpine RAM bootstrap currently supports host arch x86_64 only"
+    case "$MACHINE_ARCH" in
+        x86_64)
+            GRUB_EFI_TARGET="x86_64-efi"
+            ;;
+        *)
+            error "Automatic Alpine RAM bootstrap currently supports host arch x86_64 only"
+            ;;
+    esac
 
     [[ -n "$PLAN_EFI_UUID" ]] || error "Could not determine EFI filesystem UUID"
 
@@ -1239,7 +1275,7 @@ EOF
 
     info "Building standalone GRUB EFI binary for FreeBSD BootNext..."
     "$GRUB_MKSTANDALONE_CMD" \
-        -O x86_64-efi \
+        -O "$GRUB_EFI_TARGET" \
         -o "$ALPINE_FREEBSD_GRUB_EFI_ABS" \
         "boot/grub/grub.cfg=$cfg" \
         --modules="part_gpt fat search search_fs_uuid linux normal echo"
@@ -1250,28 +1286,15 @@ EOF
 install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
 
-    local before after newnum
-    before=$(efibootmgr -v 2>/dev/null || true)
-
+    local after bootorder_line newnum
     info "Creating FreeBSD UEFI boot entry: ${ALPINE_ENTRY_TITLE}"
     efibootmgr -c -l "$(printf '%s' "$ALPINE_FREEBSD_GRUB_EFI_REL" | tr '/' '\\')" -L "$ALPINE_ENTRY_TITLE" >/dev/null
 
-    after=$(efibootmgr -v 2>/dev/null || true)
+    after=$(efibootmgr 2>/dev/null || true)
+    bootorder_line=$(awk -F': ' '/^BootOrder:/ {print $2; exit}' <<<"$after" || true)
+    newnum=$(printf '%s' "$bootorder_line" | awk -F',' '{print $1}' | tr -d '[:space:]')
 
-    newnum=$(
-        awk -v label="$ALPINE_ENTRY_TITLE" '
-            $0 ~ /^Boot[0-9A-Fa-f]{4}/ && index($0, label) {
-                n = substr($1, 5, 4)
-                gsub(/\*/, "", n)
-                print n
-                found = 1
-                exit
-            }
-            END { if (!found) exit 1 }
-        ' <<<"$after" 2>/dev/null || true
-    )
-
-    [[ -n "$newnum" ]] || error "Failed to locate the newly created EFI boot entry for ${ALPINE_ENTRY_TITLE}"
+    [[ -n "$newnum" ]] || error "Failed to determine new EFI boot entry from BootOrder after creating ${ALPINE_ENTRY_TITLE}"
 
     info "Setting BootNext to EFI entry $newnum (${ALPINE_ENTRY_TITLE})"
     efibootmgr -n "$newnum" >/dev/null
