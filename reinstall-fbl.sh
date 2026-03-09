@@ -22,7 +22,7 @@
 #   - On Linux+GRUB+EFI host, automatically prepare Alpine RAM installer,
 #     add a one-time GRUB entry, reboot into Alpine RAM, and auto-continue.
 
-set -eE
+set -Eeuo pipefail
 export LC_ALL=C
 
 SCRIPT_NAME="${0##*/}"
@@ -102,7 +102,7 @@ EOF
 }
 
 to_lower() {
-    LC_ALL=C tr 'A-Z' 'a-z'
+    printf '%s' "${1:-}" | LC_ALL=C tr 'A-Z' 'a-z'
 }
 
 is_port_valid() {
@@ -120,6 +120,47 @@ http_download() {
     else
         error "No curl/wget/fetch found, cannot download: $url"
     fi
+}
+
+lsblk_get_kv() {
+    local line="$1" key="$2"
+    sed -n "s/.*${key}=\"\\([^\"]*\\)\".*/\\1/p" <<<"$line"
+}
+
+hash_password() {
+    local plain="$1"
+
+    if command -v openssl >/dev/null 2>&1; then
+        openssl passwd -6 "$plain"
+        return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$plain" <<'PY'
+import crypt
+import sys
+pw = sys.argv[1]
+print(crypt.crypt(pw, crypt.mksalt(crypt.METHOD_SHA512)))
+PY
+        return 0
+    fi
+
+    if command -v perl >/dev/null 2>&1; then
+        perl -e '
+            use strict;
+            use warnings;
+            use MIME::Base64 qw(encode_base64);
+            my $pw = shift @ARGV;
+            my @chars = ("a".."z","A".."Z",0..9,".","/");
+            my $salt = join("", map { $chars[rand @chars] } 1..16);
+            my $rounds = 5000;
+            my $out = crypt($pw, "\$6\$rounds=$rounds\$$salt\$");
+            print "$out\n";
+        ' "$plain"
+        return 0
+    fi
+
+    error "No password hashing tool found. Install openssl or python3 or perl, or use --ssh-key only."
 }
 
 detect_os_arch() {
@@ -152,6 +193,9 @@ ensure_dependencies_linux_generic() {
     if ! command -v xz >/dev/null 2>&1; then
         missing+=("xz")
     fi
+    if ! command -v file >/dev/null 2>&1; then
+        missing+=("file")
+    fi
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && ! command -v fetch >/dev/null 2>&1; then
         missing+=("curl/wget/fetch")
     fi
@@ -171,6 +215,9 @@ ensure_dependencies_freebsd() {
     if ! command -v xz >/dev/null 2>&1; then
         missing+=("xz")
     fi
+    if ! command -v file >/dev/null 2>&1; then
+        missing+=("file")
+    fi
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && ! command -v fetch >/dev/null 2>&1; then
         missing+=("curl/wget/fetch")
     fi
@@ -178,7 +225,7 @@ ensure_dependencies_freebsd() {
     if [[ "${#missing[@]}" -gt 0 ]]; then
         error "Missing dependencies on FreeBSD: ${missing[*]}
 Hint: you can install them with:
-  pkg install qemu-tools xz curl"
+  pkg install qemu-tools xz curl file"
     fi
 }
 
@@ -299,18 +346,17 @@ Available options:
         grep -qE '^(ecdsa-sha2-nistp(256|384|521)|ssh-(ed25519|rsa)) ' <<<"$1"
     }
 
-    val_lower=$(to_lower <<<"$val")
+    val_lower=$(to_lower "$val")
 
     case "$val_lower" in
         github:*|gitlab:*|http://*|https://*)
             if [[ "$val_lower" == http* ]]; then
                 key_url="$val"
             else
-                # github:user or github:user:name → only take the first part after the first colon as username
                 local site user extra
                 IFS=: read -r site user extra <<<"$val"
                 [[ -n "$user" ]] || ssh_key_error_and_exit "Need a username for $site"
-                site=$(to_lower <<<"$site")
+                site=$(to_lower "$site")
                 key_url="https://$site.com/$user.keys"
             fi
             info "Downloading SSH key from: $key_url"
@@ -432,44 +478,45 @@ get_default_image_url() {
     esac
 }
 
-# Improved: find EFI partition by type/label first, then fall back to old logic
 find_efi_partition() {
     local disk="$1"
 
     if [[ "$OS" == "Linux" ]]; then
-        # Prefer lsblk to accurately locate EFI System Partition
         if command -v lsblk >/dev/null 2>&1; then
-            local base part line
+            local base part line name type parttype fstype partlabel partflags
             base="${disk#/dev/}"
             while read -r line; do
-                eval "$line"   # NAME=... TYPE=... PARTTYPE=... FSTYPE=... PARTLABEL=... PARTFLAGS=...
-                [[ "$TYPE" == "part" ]] || continue
-                case "$NAME" in
+                name=$(lsblk_get_kv "$line" "NAME")
+                type=$(lsblk_get_kv "$line" "TYPE")
+                parttype=$(lsblk_get_kv "$line" "PARTTYPE")
+                fstype=$(lsblk_get_kv "$line" "FSTYPE")
+                partlabel=$(lsblk_get_kv "$line" "PARTLABEL")
+                partflags=$(lsblk_get_kv "$line" "PARTFLAGS")
+
+                [[ "$type" == "part" ]] || continue
+                case "$name" in
                     "$base"*) ;;
                     *) continue ;;
                 esac
-                # 1 GPT EFI GUID
-                if [[ "$PARTTYPE" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]]; then
-                    part="/dev/$NAME"
+
+                if [[ "$parttype" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]]; then
+                    part="/dev/$name"
                     echo "$part"
                     return 0
                 fi
-                # 2 Partition label containing EFI / ESP
-                if echo "$PARTLABEL" | grep -qiE 'efi|esp'; then
-                    part="/dev/$NAME"
+                if echo "$partlabel" | grep -qiE 'efi|esp'; then
+                    part="/dev/$name"
                     echo "$part"
                     return 0
                 fi
-                # 3 vfat with boot,esp flags
-                if [[ "$FSTYPE" == "vfat" ]] && echo "$PARTFLAGS" | grep -qi 'boot,esp'; then
-                    part="/dev/$NAME"
+                if [[ "$fstype" == "vfat" ]] && echo "$partflags" | grep -qi 'boot,esp'; then
+                    part="/dev/$name"
                     echo "$part"
                     return 0
                 fi
             done < <(lsblk -P -o NAME,TYPE,PARTTYPE,FSTYPE,PARTLABEL,PARTFLAGS "$disk" 2>/dev/null || true)
         fi
 
-        # Fallback: keep the original guess strategy
         case "$disk" in
             */nvme*|*/*nvd*)
                 echo "${disk}p1"
@@ -479,7 +526,6 @@ find_efi_partition() {
                 ;;
         esac
     else
-        # FreeBSD: use gpart to find partition with type = efi
         if command -v gpart >/dev/null 2>&1; then
             local d p
             d="${disk#/dev/}"
@@ -489,7 +535,6 @@ find_efi_partition() {
                 return 0
             fi
         fi
-        # Fallback: keep the original p1 guess
         echo "${disk}p1"
     fi
 }
@@ -507,14 +552,15 @@ EOF
     {
         echo "#cloud-config"
 
-        if [[ -n "$PASSWORD" ]]; then
+        if [[ -n "$PASSWORD_HASH" ]]; then
             cat <<EOF
 ssh_pwauth: true
 disable_root: false
 chpasswd:
   list: |
-    root:${PASSWORD}
+    root:${PASSWORD_HASH}
   expire: false
+  encrypted: true
 EOF
         fi
 
@@ -601,6 +647,7 @@ GRUB_MKCONFIG_CMD=""
 GRUB_REBOOT_CMD=""
 GRUB_DEFAULT_CMD=""
 CURRENT_CONSOLE_ARGS=""
+AUTO_YES=0
 
 detect_env_mode() {
     local os
@@ -633,14 +680,20 @@ find_efi_for_plan() {
     os=$(uname -s)
     if [[ "$os" == "Linux" ]]; then
         if command -v lsblk >/dev/null 2>&1; then
-            local line NAME TYPE PARTTYPE PARTLABEL PARTFLAGS FSTYPE
+            local line name type parttype partlabel partflags fstype
             while read -r line; do
-                eval "$line"
-                [[ "$TYPE" == "part" ]] || continue
-                if [[ "$PARTTYPE" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] ||
-                   echo "${PARTLABEL:-}" | grep -qiE 'efi|esp' ||
-                   { [[ "$FSTYPE" == "vfat" ]] && echo "${PARTFLAGS:-}" | grep -qi 'boot,esp'; }; then
-                    echo "/dev/$NAME"
+                name=$(lsblk_get_kv "$line" "NAME")
+                type=$(lsblk_get_kv "$line" "TYPE")
+                parttype=$(lsblk_get_kv "$line" "PARTTYPE")
+                fstype=$(lsblk_get_kv "$line" "FSTYPE")
+                partlabel=$(lsblk_get_kv "$line" "PARTLABEL")
+                partflags=$(lsblk_get_kv "$line" "PARTFLAGS")
+
+                [[ "$type" == "part" ]] || continue
+                if [[ "$parttype" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] ||
+                   echo "${partlabel:-}" | grep -qiE 'efi|esp' ||
+                   { [[ "$fstype" == "vfat" ]] && echo "${partflags:-}" | grep -qi 'boot,esp'; }; then
+                    echo "/dev/$name"
                     return 0
                 fi
             done < <(lsblk -P -o NAME,TYPE,PARTTYPE,FSTYPE,PARTLABEL,PARTFLAGS 2>/dev/null || true)
@@ -719,7 +772,7 @@ save_plan_to_efi() {
         printf 'TARGET_VER=%q\n' "$TARGET_VER"
         printf 'DISK=%q\n' "$DISK"
         printf 'IMG_URL=%q\n' "$IMG_URL"
-        printf 'PASSWORD=%q\n' "$PASSWORD"
+        printf 'PASSWORD_HASH=%q\n' "$PASSWORD_HASH"
         printf 'SSH_KEYS_ALL=%q\n' "$SSH_KEYS_ALL"
         printf 'SSH_PORT=%q\n' "$SSH_PORT"
         printf 'WEB_PORT=%q\n' "$WEB_PORT"
@@ -745,6 +798,8 @@ load_plan_from_efi() {
     [[ -f "$plan_file" ]] || error "Plan file not found on EFI: $plan_file"
     # shellcheck disable=SC1090
     . "$plan_file"
+    PASSWORD="${PASSWORD:-}"
+    PASSWORD_HASH="${PASSWORD_HASH:-}"
     info "Loaded reinstall plan from $plan_file"
 }
 
@@ -863,11 +918,10 @@ download_alpine_ram_files() {
 }
 
 build_alpine_apkovl() {
-    local tmp ovl_dir rcfile startfile svcfile runlevel_link repofile markerfile
+    local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
-    trap 'rm -rf "$tmp"' EXIT
-
     ovl_dir="$tmp/ovl"
+
     mkdir -p \
         "$ovl_dir/etc/apk" \
         "$ovl_dir/etc/init.d" \
@@ -1001,7 +1055,7 @@ main() {
     chmod 0755 "$SCRIPT_FILE" || true
 
     echo "Launching installer phase..."
-    bash "$SCRIPT_FILE" --phase installer
+    bash "$SCRIPT_FILE" --phase installer --yes
 
     rc=$?
     echo "Installer phase finished with rc=$rc"
@@ -1049,6 +1103,8 @@ EOF
     chmod 0644 "$ALPINE_APKOVL_ABS"
     sync
     info "Built Alpine apkovl overlay: $ALPINE_APKOVL_ABS"
+
+    rm -rf "$tmp"
 }
 
 install_grub_entry_for_alpine() {
@@ -1126,15 +1182,19 @@ do_install() {
 
     echo
     echo "WARNING: dd will be run on $DISK. ALL DATA ON THIS DISK WILL BE LOST!"
-    read -r -p "Type 'yes' or 'y' to continue: " ans
 
-    case "$ans" in
-        y|Y|yes|YES|Yes)
-            ;;
-        *)
-            error "Operation cancelled by user."
-            ;;
-    esac
+    if [[ "$AUTO_YES" -eq 1 ]]; then
+        info "AUTO_YES=1, skipping interactive confirmation."
+    else
+        read -r -p "Type 'yes' or 'y' to continue: " ans
+        case "$ans" in
+            y|Y|yes|YES|Yes)
+                ;;
+            *)
+                error "Operation cancelled by user."
+                ;;
+        esac
+    fi
 
     info "Writing image to disk with dd, this may take a while..."
     if [[ "$OS" == "FreeBSD" ]]; then
@@ -1145,7 +1205,6 @@ do_install() {
             dd if="$IMG_RAW" of="$DISK" bs=4M conv=fsync
         fi
     else
-        # Linux: keep original behavior, use GNU dd status=progress
         dd if="$IMG_RAW" of="$DISK" bs=4M conv=fsync status=progress
     fi
     sync
@@ -1223,9 +1282,8 @@ do_install() {
     echo "Username:     root"
     echo "SSH port:     $FINAL_SSH_PORT"
 
-    if [[ -n "$PASSWORD" ]]; then
-        echo "Root password:"
-        echo "  $PASSWORD"
+    if [[ -n "$PASSWORD_HASH" ]]; then
+        echo "Root password: configured (stored as hash; plain text is not kept in plan.env)"
     else
         echo "Root password: (not set; SSH key login only)"
     fi
@@ -1241,7 +1299,7 @@ do_install() {
 
     if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
         echo
-        echo "NOTE: The above root password was auto-generated."
+        echo "NOTE: The root password was auto-generated and should have been shown before reboot."
     fi
     echo "=============================================================="
 
@@ -1283,6 +1341,7 @@ if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" || "$ENV_MODE" == "a
     TARGET_VER=""
     DISK=""
     PASSWORD=""
+    PASSWORD_HASH=""
     SSH_KEYS_ALL=""
     SSH_PORT=""
     WEB_PORT=""
@@ -1290,8 +1349,8 @@ if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" || "$ENV_MODE" == "a
     FRPC_PRESENT=""
     HOLD="0"
     AUTO_PASSWORD=0
+    AUTO_YES=0
 
-    # Only allow adjusting --hold in installer mode; other args are ignored.
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --hold)
@@ -1299,6 +1358,9 @@ if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" || "$ENV_MODE" == "a
                 [[ -n "${1:-}" ]] || error "Need value for --hold"
                 [[ "$1" == "1" || "$1" == "2" ]] || error "Invalid --hold: $1 (must be 1 or 2)"
                 HOLD="$1"
+                ;;
+            --yes|--force)
+                AUTO_YES=1
                 ;;
             *)
                 warn "Ignoring argument in installer mode: $1"
@@ -1332,13 +1394,14 @@ if [[ $# -lt 1 ]]; then
     usage
 fi
 
-TARGET_OS=$(echo "$1" | to_lower)
+TARGET_OS=$(to_lower "$1")
 shift || true
 
 TARGET_VER=""
 IMG_URL=""
 DISK=""
 PASSWORD=""
+PASSWORD_HASH=""
 SSH_KEYS_ALL=""
 SSH_PORT=""
 WEB_PORT=""
@@ -1427,7 +1490,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 detect_os_arch
-ensure_dependencies  # no auto-install, just verify deps
+ensure_dependencies
 
 if [[ -n "$DISK" ]]; then
     if [[ "$DISK" != /dev/* ]]; then
@@ -1441,7 +1504,6 @@ if [[ ! -b "$DISK" ]] && [[ ! -c "$DISK" ]]; then
     error "Target disk $DISK does not exist or is not a block/char device"
 fi
 
-# Password / SSH interaction: plain text, convenient for initramfs / VPS to directly see whether input is correct
 if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
     echo "No --password or --ssh-key specified."
     echo "You can set a root password now, or leave empty to auto-generate a random 20-character password."
@@ -1458,7 +1520,7 @@ if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
                 error "Failed to generate random password."
             fi
             AUTO_PASSWORD=1
-            info "A random root password will be generated and shown in the final summary."
+            info "A random root password will be generated and shown before reboot."
             break
         fi
 
@@ -1473,6 +1535,10 @@ if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
             echo
         fi
     done
+fi
+
+if [[ -n "$PASSWORD" ]]; then
+    PASSWORD_HASH=$(hash_password "$PASSWORD")
 fi
 
 if [[ -z "$TARGET_VER" ]]; then
@@ -1504,6 +1570,25 @@ if [[ "$HOLD" == "1" ]]; then
 fi
 
 save_plan_to_efi
+
+echo
+echo "==================== Host stage summary ====================="
+echo "Disk device:  $DISK"
+echo "Target OS:    $TARGET_OS ${TARGET_VER:-"(no version)"}"
+echo "Username:     root"
+echo "SSH port:     ${SSH_PORT:-22}"
+if [[ -n "$PASSWORD_HASH" ]]; then
+    if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
+        echo "Generated root password:"
+        echo "  $PASSWORD"
+    else
+        echo "Root password: provided by user (plain text will NOT be saved to EFI)"
+    fi
+else
+    echo "Root password: (not set; SSH key login only)"
+fi
+echo "============================================================"
+echo
 
 if [[ "$OS" == "Linux" ]]; then
     prepare_and_boot_alpine_ram
