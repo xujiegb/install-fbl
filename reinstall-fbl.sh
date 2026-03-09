@@ -719,6 +719,8 @@ ALPINE_APKOVL_ABS=""
 ALPINE_SCRIPT_COPY_ABS=""
 ALPINE_FREEBSD_GRUB_EFI_REL=""
 ALPINE_FREEBSD_GRUB_EFI_ABS=""
+ALPINE_NETBOOT_ARCH=""
+ALPINE_KERNEL_FLAVOR=""
 GRUB_SCRIPT_PATH=""
 GRUB_CFG_PATH=""
 GRUB_MKCONFIG_CMD=""
@@ -986,9 +988,16 @@ prepare_alpine_paths() {
     case "$MACHINE_ARCH" in
         x86_64)
             GRUB_EFI_TARGET="x86_64-efi"
+            ALPINE_NETBOOT_ARCH="x86_64"
+            ALPINE_FREEBSD_GRUB_EFI_REL="/$PLAN_DIR_REL/$ALPINE_BOOT_SUBDIR/reinstall-grubx64.efi"
+            ;;
+        aarch64)
+            GRUB_EFI_TARGET="arm64-efi"
+            ALPINE_NETBOOT_ARCH="aarch64"
+            ALPINE_FREEBSD_GRUB_EFI_REL="/$PLAN_DIR_REL/$ALPINE_BOOT_SUBDIR/reinstall-grubaa64.efi"
             ;;
         *)
-            error "Automatic Alpine RAM bootstrap currently supports host arch x86_64 only"
+            error "Automatic Alpine RAM bootstrap currently supports host arch x86_64 and aarch64 only"
             ;;
     esac
 
@@ -997,9 +1006,10 @@ prepare_alpine_paths() {
     ALPINE_BOOT_DIR_REL="/$PLAN_DIR_REL/$ALPINE_BOOT_SUBDIR"
     ALPINE_BOOT_DIR_ABS="$EFI_MOUNT_POINT$ALPINE_BOOT_DIR_REL"
 
-    ALPINE_VMLINUZ_REL="$ALPINE_BOOT_DIR_REL/vmlinuz-virt"
-    ALPINE_INITRAMFS_REL="$ALPINE_BOOT_DIR_REL/initramfs-virt"
-    ALPINE_MODLOOP_REL="$ALPINE_BOOT_DIR_REL/modloop-virt"
+    # Use generic destination names on EFI so different source flavors/arches can be normalized.
+    ALPINE_VMLINUZ_REL="$ALPINE_BOOT_DIR_REL/vmlinuz"
+    ALPINE_INITRAMFS_REL="$ALPINE_BOOT_DIR_REL/initramfs"
+    ALPINE_MODLOOP_REL="$ALPINE_BOOT_DIR_REL/modloop"
     ALPINE_APKOVL_REL="$ALPINE_BOOT_DIR_REL/reinstall.apkovl.tar.gz"
 
     ALPINE_VMLINUZ_ABS="$EFI_MOUNT_POINT$ALPINE_VMLINUZ_REL"
@@ -1008,8 +1018,6 @@ prepare_alpine_paths() {
     ALPINE_APKOVL_ABS="$EFI_MOUNT_POINT$ALPINE_APKOVL_REL"
 
     ALPINE_SCRIPT_COPY_ABS="$EFI_MOUNT_POINT/$PLAN_DIR_REL/$SCRIPT_NAME"
-
-    ALPINE_FREEBSD_GRUB_EFI_REL="$ALPINE_BOOT_DIR_REL/reinstall-grubx64.efi"
     ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$ALPINE_FREEBSD_GRUB_EFI_REL"
 }
 
@@ -1031,19 +1039,32 @@ copy_script_to_efi() {
 download_alpine_ram_files() {
     mkdir -p "$ALPINE_BOOT_DIR_ABS"
 
-    local base="${ALPINE_REPO_BASE}/releases/x86_64/netboot"
+    local base flavor tmpdir ok=0
+    tmpdir=$(mktemp -d /tmp/reinstall-alpine-netboot.XXXXXX)
+    trap 'rm -rf "$tmpdir"' RETURN
 
-    info "Downloading Alpine RAM kernel..."
-    http_download "$base/vmlinuz-virt" "$ALPINE_VMLINUZ_ABS"
+    base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/netboot"
 
-    info "Downloading Alpine RAM initramfs..."
-    http_download "$base/initramfs-virt" "$ALPINE_INITRAMFS_ABS"
+    # Prefer virt, then fall back to lts. This works for x86_64 and lets aarch64 use lts if virt is absent.
+    for flavor in virt lts; do
+        info "Trying Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${flavor}"
+        if http_download "$base/vmlinuz-${flavor}" "$tmpdir/vmlinuz" &&
+           http_download "$base/initramfs-${flavor}" "$tmpdir/initramfs" &&
+           http_download "$base/modloop-${flavor}" "$tmpdir/modloop"; then
+            mv "$tmpdir/vmlinuz" "$ALPINE_VMLINUZ_ABS"
+            mv "$tmpdir/initramfs" "$ALPINE_INITRAMFS_ABS"
+            mv "$tmpdir/modloop" "$ALPINE_MODLOOP_ABS"
+            chmod 0644 "$ALPINE_VMLINUZ_ABS" "$ALPINE_INITRAMFS_ABS" "$ALPINE_MODLOOP_ABS"
+            sync
+            ALPINE_KERNEL_FLAVOR="$flavor"
+            ok=1
+            info "Selected Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}"
+            break
+        fi
+        rm -f "$tmpdir/vmlinuz" "$tmpdir/initramfs" "$tmpdir/modloop"
+    done
 
-    info "Downloading Alpine RAM modloop..."
-    http_download "$base/modloop-virt" "$ALPINE_MODLOOP_ABS"
-
-    chmod 0644 "$ALPINE_VMLINUZ_ABS" "$ALPINE_INITRAMFS_ABS" "$ALPINE_MODLOOP_ABS"
-    sync
+    [[ "$ok" -eq 1 ]] || error "Failed to download Alpine RAM kernel/initramfs/modloop for arch=${ALPINE_NETBOOT_ARCH} from ${base}"
 }
 
 build_alpine_apkovl() {
@@ -1286,15 +1307,33 @@ EOF
 install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
 
-    local after bootorder_line newnum
+    local before after newnum
+    before=$(
+        efibootmgr 2>/dev/null |
+        awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
+            n = substr($1, 5, 4)
+            gsub(/\*/, "", n)
+            print n
+        }' | sort -u
+    )
+
     info "Creating FreeBSD UEFI boot entry: ${ALPINE_ENTRY_TITLE}"
     efibootmgr -c -l "$(printf '%s' "$ALPINE_FREEBSD_GRUB_EFI_REL" | tr '/' '\\')" -L "$ALPINE_ENTRY_TITLE" >/dev/null
 
-    after=$(efibootmgr 2>/dev/null || true)
-    bootorder_line=$(awk -F': ' '/^BootOrder:/ {print $2; exit}' <<<"$after" || true)
-    newnum=$(printf '%s' "$bootorder_line" | awk -F',' '{print $1}' | tr -d '[:space:]')
+    after=$(
+        efibootmgr 2>/dev/null |
+        awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
+            n = substr($1, 5, 4)
+            gsub(/\*/, "", n)
+            print n
+        }' | sort -u
+    )
 
-    [[ -n "$newnum" ]] || error "Failed to determine new EFI boot entry from BootOrder after creating ${ALPINE_ENTRY_TITLE}"
+    newnum=$(
+        comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n1
+    )
+
+    [[ -n "$newnum" ]] || error "Failed to determine new EFI boot entry after creating ${ALPINE_ENTRY_TITLE}"
 
     info "Setting BootNext to EFI entry $newnum (${ALPINE_ENTRY_TITLE})"
     efibootmgr -n "$newnum" >/dev/null
