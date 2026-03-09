@@ -230,16 +230,28 @@ detect_os_arch() {
 LINUX_FAMILY=""
 
 detect_linux_family() {
+    local id_val="" id_like_val="" ids=""
     LINUX_FAMILY=""
 
     [[ "$OS" == "Linux" ]] || return 0
 
     if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
+        id_val="$(
+            (
+                # shellcheck disable=SC1091
+                . /etc/os-release 2>/dev/null
+                printf '%s' "${ID:-}"
+            ) || true
+        )"
+        id_like_val="$(
+            (
+                # shellcheck disable=SC1091
+                . /etc/os-release 2>/dev/null
+                printf '%s' "${ID_LIKE:-}"
+            ) || true
+        )"
 
-        local ids
-        ids=" ${ID:-} ${ID_LIKE:-} "
+        ids=" ${id_val} ${id_like_val} "
 
         case "$ids" in
             *" rhel "*|*" rocky "*|*" almalinux "*|*" centos "*|*" fedora "*)
@@ -815,6 +827,8 @@ GRUB_REBOOT_CMD=""
 GRUB_DEFAULT_CMD=""
 GRUB_MKSTANDALONE_CMD=""
 GRUB_EFI_TARGET=""
+PLAN_EFI_PART_DISK=""
+PLAN_EFI_PART_NUM=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
 
@@ -910,6 +924,24 @@ get_fs_type_freebsd() {
     fi
 }
 
+split_freebsd_part_device() {
+    local part="$1"
+    local dev="${part#/dev/}"
+
+    case "$dev" in
+        *p[0-9]*)
+            PLAN_EFI_PART_DISK="/dev/${dev%p[0-9]*}"
+            PLAN_EFI_PART_NUM="${dev##*p}"
+            ;;
+        *)
+            error "Unable to parse FreeBSD EFI partition device: $part"
+            ;;
+    esac
+
+    [[ -n "$PLAN_EFI_PART_DISK" && -n "$PLAN_EFI_PART_NUM" ]] || \
+        error "Failed to derive FreeBSD EFI disk/partition from: $part"
+}
+
 mount_efi_for_plan() {
     if [[ "$OS" == "Linux" ]]; then
         # Prefer real EFI/ESP if available.
@@ -987,6 +1019,7 @@ mount_efi_for_plan() {
         if [[ -n "$PLAN_EFI_PART" ]]; then
             PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
             PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
+            split_freebsd_part_device "$PLAN_EFI_PART"
         fi
         return 0
     fi
@@ -1010,6 +1043,7 @@ mount_efi_for_plan() {
     PLAN_EFI_MOUNTED_BY_SCRIPT=1
     PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
     PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
+    split_freebsd_part_device "$PLAN_EFI_PART"
 }
 
 save_plan_to_efi() {
@@ -1035,6 +1069,8 @@ save_plan_to_efi() {
         printf 'PLAN_EFI_FS_TYPE=%q\n' "$PLAN_EFI_FS_TYPE"
         printf 'PLAN_STORAGE_MODE=%q\n' "$PLAN_STORAGE_MODE"
         printf 'PLAN_PATH_PREFIX_REL=%q\n' "$PLAN_PATH_PREFIX_REL"
+        printf 'PLAN_EFI_PART_DISK=%q\n' "${PLAN_EFI_PART_DISK:-}"
+        printf 'PLAN_EFI_PART_NUM=%q\n' "${PLAN_EFI_PART_NUM:-}"
         printf 'PLAN_DIR_REL=%q\n' "$PLAN_DIR_REL"
         printf 'PLAN_FILE_NAME=%q\n' "$PLAN_FILE_NAME"
         printf 'SCRIPT_NAME=%q\n' "$SCRIPT_NAME"
@@ -1045,36 +1081,109 @@ save_plan_to_efi() {
 }
 
 load_plan_from_efi() {
-    local plan_dir plan_file boot_mnt candidate
+    local boot_mnt="/media/bootstrap"
+    local plan_file=""
+    local candidate=""
+    local vars_loaded=0
 
     if [[ -f /etc/reinstall/vars ]]; then
         # shellcheck disable=SC1091
         . /etc/reinstall/vars
+        vars_loaded=1
     fi
 
-    if [[ "$OS" == "Linux" && "${PLAN_STORAGE_MODE:-efi}" == "boot" ]]; then
-        boot_mnt="/media/bootstrap"
+    if [[ "$OS" == "Linux" ]]; then
         mkdir -p "$boot_mnt"
 
-        if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
-            if [[ -n "${PLAN_EFI_PART:-}" ]] && [[ -e "${PLAN_EFI_PART}" ]]; then
-                mount "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || true
+        # 1) 先按 /etc/reinstall/vars 里已有信息尝试
+        if [[ "$vars_loaded" -eq 1 ]] && ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+            if [[ -n "${PLAN_EFI_PART:-}" && -e "${PLAN_EFI_PART}" ]]; then
+                if [[ "${PLAN_STORAGE_MODE:-efi}" == "efi" ]]; then
+                    mount "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || \
+                    mount -t vfat "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || \
+                    mount -t msdos "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || \
+                    mount -t msdosfs "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || true
+                else
+                    mount "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || true
+                fi
             fi
             if ! mountpoint -q "$boot_mnt" 2>/dev/null && [[ -n "${PLAN_EFI_UUID:-}" ]]; then
                 candidate="$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)"
-                if [[ -n "$candidate" ]] && [[ -e "$candidate" ]]; then
-                    mount "$candidate" "$boot_mnt" 2>/dev/null || true
+                if [[ -n "$candidate" && -e "$candidate" ]]; then
+                    if [[ "${PLAN_STORAGE_MODE:-efi}" == "efi" ]]; then
+                        mount "$candidate" "$boot_mnt" 2>/dev/null || \
+                        mount -t vfat "$candidate" "$boot_mnt" 2>/dev/null || \
+                        mount -t msdos "$candidate" "$boot_mnt" 2>/dev/null || \
+                        mount -t msdosfs "$candidate" "$boot_mnt" 2>/dev/null || true
+                    else
+                        mount "$candidate" "$boot_mnt" 2>/dev/null || true
+                    fi
                 fi
             fi
         fi
 
-        [[ -d "$boot_mnt" ]] || error "Could not prepare Linux bootstrap mount point"
+        # 2) 如果还没挂上，就粗暴扫描常见块设备，并同时探测 boot / efi 两种路径
+        if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+            for candidate in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p* /dev/mapper/*; do
+                [[ -e "$candidate" ]] || continue
 
-        plan_dir="$boot_mnt${PLAN_PATH_PREFIX_REL:-}/$PLAN_DIR_REL"
-        plan_file="$plan_dir/$PLAN_FILE_NAME"
-        [[ -f "$plan_file" ]] || error "Plan file not found on Linux bootstrap storage: $plan_file"
+                mount "$candidate" "$boot_mnt" 2>/dev/null || \
+                mount -t ext4 "$candidate" "$boot_mnt" 2>/dev/null || \
+                mount -t xfs "$candidate" "$boot_mnt" 2>/dev/null || \
+                mount -t btrfs "$candidate" "$boot_mnt" 2>/dev/null || \
+                mount -t vfat "$candidate" "$boot_mnt" 2>/dev/null || \
+                mount -t msdos "$candidate" "$boot_mnt" 2>/dev/null || \
+                mount -t msdosfs "$candidate" "$boot_mnt" 2>/dev/null || true
 
-        EFI_MOUNT_POINT="$boot_mnt${PLAN_PATH_PREFIX_REL:-}"
+                if mountpoint -q "$boot_mnt" 2>/dev/null; then
+                    if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                        PLAN_STORAGE_MODE="boot"
+                        PLAN_PATH_PREFIX_REL=""
+                        plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+                        EFI_MOUNT_POINT="$boot_mnt"
+                        PLAN_EFI_PART="$candidate"
+                        break
+                    elif [[ -f "$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                        PLAN_STORAGE_MODE="boot"
+                        PLAN_PATH_PREFIX_REL="/boot"
+                        plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+                        EFI_MOUNT_POINT="$boot_mnt"
+                        PLAN_EFI_PART="$candidate"
+                        break
+                    elif [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                        PLAN_STORAGE_MODE="efi"
+                        PLAN_PATH_PREFIX_REL=""
+                        plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+                        EFI_MOUNT_POINT="$boot_mnt"
+                        PLAN_EFI_PART="$candidate"
+                        break
+                    fi
+                    umount "$boot_mnt" 2>/dev/null || true
+                fi
+            done
+        fi
+
+        # 3) 如果 mount 成功但 plan_file 还没选出来，再按两种路径查一次
+        if [[ -z "$plan_file" && -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
+            if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                if [[ "${PLAN_STORAGE_MODE:-}" == "boot" ]]; then
+                    PLAN_PATH_PREFIX_REL=""
+                else
+                    PLAN_STORAGE_MODE="efi"
+                    PLAN_PATH_PREFIX_REL=""
+                fi
+                plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+                EFI_MOUNT_POINT="$boot_mnt"
+            elif [[ -f "$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                PLAN_STORAGE_MODE="boot"
+                PLAN_PATH_PREFIX_REL="/boot"
+                plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+                EFI_MOUNT_POINT="$boot_mnt"
+            fi
+        fi
+
+        [[ -n "$plan_file" && -f "$plan_file" ]] || error "Plan file not found on Linux bootstrap storage"
+
         # shellcheck disable=SC1090
         . "$plan_file"
         PASSWORD="${PASSWORD:-}"
@@ -1084,8 +1193,7 @@ load_plan_from_efi() {
     fi
 
     mount_efi_for_plan
-    plan_dir="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL"
-    plan_file="$plan_dir/$PLAN_FILE_NAME"
+    plan_file="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL/$PLAN_FILE_NAME"
     [[ -f "$plan_file" ]] || error "Plan file not found on bootstrap storage: $plan_file"
     # shellcheck disable=SC1090
     . "$plan_file"
@@ -1536,6 +1644,10 @@ install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
 
     local before after newnum
+
+    [[ -n "${PLAN_EFI_PART_DISK:-}" ]] || split_freebsd_part_device "$PLAN_EFI_PART"
+    [[ -n "${PLAN_EFI_PART_NUM:-}" ]] || error "Missing FreeBSD EFI partition number"
+
     before=$(
         efibootmgr 2>/dev/null |
         awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
@@ -1546,7 +1658,11 @@ install_freebsd_bootnext_entry() {
     )
 
     info "Creating FreeBSD UEFI boot entry: ${ALPINE_ENTRY_TITLE}"
-    efibootmgr -c -l "$(printf '%s' "$ALPINE_FREEBSD_GRUB_EFI_REL" | tr '/' '\\')" -L "$ALPINE_ENTRY_TITLE" >/dev/null
+    efibootmgr -c \
+        --disk "$PLAN_EFI_PART_DISK" \
+        --part "$PLAN_EFI_PART_NUM" \
+        -l "$(printf '%s' "$ALPINE_FREEBSD_GRUB_EFI_REL" | tr '/' '\\')" \
+        -L "$ALPINE_ENTRY_TITLE" >/dev/null
 
     after=$(
         efibootmgr 2>/dev/null |
@@ -1558,7 +1674,7 @@ install_freebsd_bootnext_entry() {
     )
 
     newnum=$(
-        comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n1
+        comm -13 <(printf '%s' "$before" | sort) <(printf '%s' "$after" | sort) | head -n1
     )
 
     [[ -n "$newnum" ]] || error "Failed to determine new EFI boot entry after creating ${ALPINE_ENTRY_TITLE}"
