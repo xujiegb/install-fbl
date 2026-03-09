@@ -125,6 +125,62 @@ http_download() {
     fi
 }
 
+ensure_working_network() {
+    if [[ "$OS" == "Linux" ]]; then
+        if command -v ip >/dev/null 2>&1 && ip route 2>/dev/null | grep -q '^default'; then
+            return 0
+        fi
+
+        if command -v ip >/dev/null 2>&1; then
+            local dev
+            for dev in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo$' || true); do
+                ip link set "$dev" up 2>/dev/null || true
+
+                if command -v udhcpc >/dev/null 2>&1; then
+                    udhcpc -q -n -t 5 -i "$dev" 2>/dev/null || true
+                elif command -v dhclient >/dev/null 2>&1; then
+                    dhclient -1 "$dev" 2>/dev/null || true
+                fi
+
+                if ip route 2>/dev/null | grep -q '^default'; then
+                    return 0
+                fi
+            done
+        fi
+
+        error "Unable to obtain network connectivity on Linux installer environment"
+    fi
+
+    if [[ "$OS" == "FreeBSD" ]]; then
+        if command -v route >/dev/null 2>&1 && route -n get default >/dev/null 2>&1; then
+            return 0
+        fi
+
+        if command -v ifconfig >/dev/null 2>&1; then
+            local dev
+            for dev in $(ifconfig -l 2>/dev/null || true); do
+                case "$dev" in
+                    lo*|pflog*|pfsync*|tun*|tap*) continue ;;
+                esac
+
+                ifconfig "$dev" up 2>/dev/null || true
+
+                if command -v dhclient >/dev/null 2>&1; then
+                    dhclient "$dev" 2>/dev/null || true
+                fi
+
+                if command -v route >/dev/null 2>&1 && route -n get default >/dev/null 2>&1; then
+                    return 0
+                fi
+            done
+        fi
+
+        error "Unable to obtain network connectivity on FreeBSD installer environment"
+    fi
+
+    error "Unsupported OS for network bootstrap: $OS"
+}
+
 lsblk_get_kv() {
     local line="$1" key="$2"
     awk -v want="$key" '
@@ -824,9 +880,11 @@ ALPINE_APKOVL_ABS=""
 ALPINE_SCRIPT_COPY_ABS=""
 ALPINE_FREEBSD_GRUB_EFI_REL=""
 ALPINE_FREEBSD_GRUB_EFI_ABS=""
+ALPINE_OFFLINE_REPO_ROOT_REL=""
+ALPINE_OFFLINE_REPO_ROOT_ABS=""
 ALPINE_NETBOOT_ARCH=""
 ALPINE_KERNEL_FLAVOR=""
-ALPINE_KERNEL_CMDLINE_COMMON="ip=dhcp nomodeset panic=5 console=tty0 console=ttyS0,115200n8"
+ALPINE_KERNEL_CMDLINE_COMMON="ip=none nomodeset panic=5 console=tty0 console=ttyS0,115200n8"
 GRUB_SCRIPT_PATH=""
 GRUB_CFG_PATH=""
 GRUB_MKCONFIG_CMD=""
@@ -836,6 +894,24 @@ GRUB_MKSTANDALONE_CMD=""
 GRUB_EFI_TARGET=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
+
+ALPINE_RUNTIME_APK_PACKAGES=(
+    bash
+    curl
+    wget
+    xz
+    qemu-img
+    util-linux
+    coreutils
+    grep
+    sed
+    gawk
+    findutils
+    file
+    tar
+    e2fsprogs
+    dosfstools
+)
 
 detect_env_mode() {
     local os
@@ -1309,6 +1385,9 @@ prepare_alpine_paths() {
 
     ALPINE_SCRIPT_COPY_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL/$SCRIPT_NAME"
     ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_FREEBSD_GRUB_EFI_REL"
+
+    ALPINE_OFFLINE_REPO_ROOT_REL="$ALPINE_BOOT_DIR_REL/repo"
+    ALPINE_OFFLINE_REPO_ROOT_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_OFFLINE_REPO_ROOT_REL"
 }
 
 copy_script_to_efi() {
@@ -1356,6 +1435,190 @@ download_alpine_ram_files() {
     rm -rf -- "$tmpdir"
 
     [[ "$ok" -eq 1 ]] || error "Failed to download Alpine RAM kernel/initramfs/modloop for arch=${ALPINE_NETBOOT_ARCH} from ${base}"
+}
+
+download_runtime_apk_repo() {
+    local repo_root main_dir community_dir tmpdir
+    local main_base community_base
+    local main_index_tgz community_index_tgz
+    local main_index_txt community_index_txt
+    local roots_file resolved_file manifest_file
+    local repo filename pkg
+    local line kind
+
+    repo_root="$ALPINE_OFFLINE_REPO_ROOT_ABS"
+    main_dir="$repo_root/main"
+    community_dir="$repo_root/community"
+    tmpdir=$(mktemp -d /tmp/reinstall-alpine-apkrepo.XXXXXX)
+
+    mkdir -p "$main_dir" "$community_dir"
+
+    main_base="${ALPINE_REPO_BASE}/main/${ALPINE_NETBOOT_ARCH}"
+    community_base="${ALPINE_REPO_BASE}/community/${ALPINE_NETBOOT_ARCH}"
+
+    main_index_tgz="$tmpdir/APKINDEX.main.tar.gz"
+    community_index_tgz="$tmpdir/APKINDEX.community.tar.gz"
+    main_index_txt="$tmpdir/APKINDEX.main"
+    community_index_txt="$tmpdir/APKINDEX.community"
+    roots_file="$tmpdir/runtime-packages.txt"
+    resolved_file="$tmpdir/resolved.tsv"
+    manifest_file="$repo_root/runtime-packages.txt"
+
+    info "Preparing offline Alpine APK repository..."
+    info "Downloading Alpine APKINDEX (main/community)..."
+
+    http_download "$main_base/APKINDEX.tar.gz" "$main_index_tgz"
+    http_download "$community_base/APKINDEX.tar.gz" "$community_index_tgz"
+
+    tar -xzOf "$main_index_tgz" > "$main_index_txt"
+    tar -xzOf "$community_index_tgz" > "$community_index_txt"
+
+    cp "$main_index_tgz" "$main_dir/APKINDEX.tar.gz"
+    cp "$community_index_tgz" "$community_dir/APKINDEX.tar.gz"
+
+    printf '%s\n' "${ALPINE_RUNTIME_APK_PACKAGES[@]}" > "$roots_file"
+    cp "$roots_file" "$manifest_file"
+
+    awk -v ROOTS="$roots_file" '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+
+        function normalize_dep(dep, tmp) {
+            tmp = trim(dep)
+            if (tmp == "" || tmp ~ /^!/) return ""
+            sub(/[<>=~].*$/, "", tmp)
+            return tmp
+        }
+
+        function commit_record(    i, n, arr, tok) {
+            if (pkg == "") return
+
+            pkg_repo[pkg] = current_repo
+            pkg_file[pkg] = pkg "-" ver ".apk"
+            pkg_deps[pkg] = deps
+
+            if (!(pkg in provider_pkg)) provider_pkg[pkg] = pkg
+
+            n = split(provides, arr, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) {
+                tok = normalize_dep(arr[i])
+                if (tok != "" && !(tok in provider_pkg)) {
+                    provider_pkg[tok] = pkg
+                }
+            }
+
+            pkg = ""
+            ver = ""
+            deps = ""
+            provides = ""
+        }
+
+        BEGIN {
+            while ((getline line < ROOTS) > 0) {
+                line = trim(line)
+                if (line != "") roots[++roots_n] = line
+            }
+            close(ROOTS)
+        }
+
+        {
+            current_repo = (FILENAME ~ /APKINDEX\.main$/) ? "main" : "community"
+        }
+
+        /^$/ {
+            commit_record()
+            next
+        }
+
+        {
+            tag = substr($0, 1, 2)
+            val = substr($0, 3)
+
+            if (tag == "P:") pkg = val
+            else if (tag == "V:") ver = val
+            else if (tag == "D:") deps = val
+            else if (tag == "p:") provides = val
+        }
+
+        END {
+            commit_record()
+
+            qh = 1
+            qt = 0
+
+            for (i = 1; i <= roots_n; i++) {
+                tok = normalize_dep(roots[i])
+
+                if (tok == "") continue
+
+                if (tok in pkg_file) resolved = tok
+                else if (tok in provider_pkg) resolved = provider_pkg[tok]
+                else {
+                    print "WARN\t" tok
+                    continue
+                }
+
+                if (!queued[resolved]++) queue[++qt] = resolved
+            }
+
+            while (qh <= qt) {
+                cur = queue[qh++]
+
+                if (emitted[cur]++) continue
+
+                print pkg_repo[cur] "\t" pkg_file[cur] "\t" cur
+
+                n = split(pkg_deps[cur], arr, /[[:space:]]+/)
+                for (i = 1; i <= n; i++) {
+                    tok = normalize_dep(arr[i])
+                    if (tok == "") continue
+
+                    if (tok in pkg_file) resolved = tok
+                    else if (tok in provider_pkg) resolved = provider_pkg[tok]
+                    else continue
+
+                    if (!queued[resolved]++) queue[++qt] = resolved
+                }
+            }
+        }
+    ' "$main_index_txt" "$community_index_txt" > "$resolved_file"
+
+    while IFS=$'\t' read -r kind filename pkg; do
+        [[ -n "${kind:-}" ]] || continue
+
+        if [[ "$kind" == "WARN" ]]; then
+            warn "Offline APK resolver could not resolve root package token: $filename"
+            continue
+        fi
+
+        repo="$kind"
+
+        case "$repo" in
+            main)
+                if [[ ! -f "$main_dir/$filename" ]]; then
+                    info "Downloading offline APK [main]: $filename"
+                    http_download "$main_base/$filename" "$main_dir/$filename"
+                fi
+                ;;
+            community)
+                if [[ ! -f "$community_dir/$filename" ]]; then
+                    info "Downloading offline APK [community]: $filename"
+                    http_download "$community_base/$filename" "$community_dir/$filename"
+                fi
+                ;;
+            *)
+                warn "Unknown offline APK repo kind: $repo ($filename)"
+                ;;
+        esac
+    done < "$resolved_file"
+
+    rm -rf -- "$tmpdir"
+    sync
+
+    info "Offline Alpine APK repository ready: $repo_root"
 }
 
 build_alpine_apkovl() {
@@ -1499,6 +1762,33 @@ mount_bootstrap() {
 }
 
 install_runtime_deps() {
+    local repo_root repo_main repo_community pkg_manifest packages
+
+    repo_root="/media/bootstrap/${PLAN_DIR_REL}/alpine/repo"
+    if [ ! -d "$repo_root" ]; then
+        repo_root="/media/bootstrap/boot/${PLAN_DIR_REL}/alpine/repo"
+    fi
+
+    repo_main="$repo_root/main"
+    repo_community="$repo_root/community"
+    pkg_manifest="$repo_root/runtime-packages.txt"
+
+    if [ -f "$pkg_manifest" ] && [ -f "$repo_main/APKINDEX.tar.gz" ] && [ -f "$repo_community/APKINDEX.tar.gz" ]; then
+        echo "Installing runtime dependencies from offline Alpine repository..."
+
+        packages="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$pkg_manifest" | tr '\n' ' ')"
+
+        apk add --no-network --allow-untrusted \
+            --repositories-file /dev/null \
+            --repository "$repo_main" \
+            --repository "$repo_community" \
+            $packages || true
+
+        return
+    fi
+
+    echo "Offline Alpine repository not found, falling back to network install"
+
     ensure_network
     apk update || true
     apk add --no-cache \
@@ -1508,8 +1798,9 @@ install_runtime_deps() {
 
 main() {
     local bootstrap_prefix=""
-    install_runtime_deps
+
     mount_bootstrap
+    install_runtime_deps
 
     if [ -f "/media/bootstrap/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
         bootstrap_prefix=""
@@ -1697,6 +1988,7 @@ prepare_and_boot_alpine_ram() {
     prepare_alpine_paths
     copy_script_to_efi
     download_alpine_ram_files
+    download_runtime_apk_repo
     build_alpine_apkovl
     install_grub_entry_for_alpine
 
@@ -1713,6 +2005,7 @@ prepare_and_boot_alpine_ram_freebsd() {
     prepare_alpine_paths
     copy_script_to_efi
     download_alpine_ram_files
+    download_runtime_apk_repo
     build_alpine_apkovl
     build_freebsd_grub_efi
     install_freebsd_bootnext_entry
@@ -1745,6 +2038,10 @@ do_install() {
 
     IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
     IMG_RAW="$INSTALL_TMPDIR/image.raw"
+
+    if [[ "$IMG_URL" =~ ^https?:// ]]; then
+        ensure_working_network
+    fi
 
     info "Downloading image..."
     http_download "$IMG_URL" "$IMG_QCOW"
