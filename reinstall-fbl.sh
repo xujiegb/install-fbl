@@ -276,6 +276,7 @@ missing_deps_linux_common() {
     command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
     command -v xz >/dev/null 2>&1 || missing+=("xz")
     command -v file >/dev/null 2>&1 || missing+=("file")
+    command -v tar >/dev/null 2>&1 || missing+=("tar")
     have_any_downloader || missing+=("downloader")
 
     ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
@@ -287,6 +288,7 @@ missing_deps_freebsd_host() {
     command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
     command -v xz >/dev/null 2>&1 || missing+=("xz")
     command -v file >/dev/null 2>&1 || missing+=("file")
+    command -v tar >/dev/null 2>&1 || missing+=("tar")
     have_any_downloader || missing+=("downloader")
     command -v efibootmgr >/dev/null 2>&1 || missing+=("efibootmgr")
     command -v grub-mkstandalone >/dev/null 2>&1 || command -v grub2-mkstandalone >/dev/null 2>&1 || missing+=("grub-mkstandalone")
@@ -300,6 +302,7 @@ missing_deps_freebsd_installer() {
     command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
     command -v xz >/dev/null 2>&1 || missing+=("xz")
     command -v file >/dev/null 2>&1 || missing+=("file")
+    command -v tar >/dev/null 2>&1 || missing+=("tar")
     have_any_downloader || missing+=("downloader")
 
     ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
@@ -314,6 +317,7 @@ install_deps_redhat() {
             qemu-img)   pkgs+=("qemu-img") ;;
             xz)         pkgs+=("xz") ;;
             file)       pkgs+=("file") ;;
+            tar)        pkgs+=("tar") ;;
             downloader) pkgs+=("curl") ;;
         esac
     done
@@ -335,6 +339,7 @@ install_deps_freebsd_host() {
             qemu-img)          pkgs+=("qemu-tools") ;;
             xz)                pkgs+=("xz") ;;
             file)              pkgs+=("file") ;;
+            tar)               pkgs+=("tar") ;;
             downloader)        pkgs+=("curl") ;;
             efibootmgr)        pkgs+=("efibootmgr") ;;
             grub-mkstandalone) pkgs+=("grub2") ;;
@@ -358,6 +363,7 @@ install_deps_freebsd_installer() {
             qemu-img)   pkgs+=("qemu-tools") ;;
             xz)         pkgs+=("xz") ;;
             file)       pkgs+=("file") ;;
+            tar)        pkgs+=("tar") ;;
             downloader) pkgs+=("curl") ;;
         esac
     done
@@ -986,14 +992,13 @@ mount_efi_for_plan() {
             EFI_MOUNT_POINT="/boot"
             PLAN_STORAGE_MODE="boot"
             PLAN_EFI_MOUNTED_BY_SCRIPT=0
+            PLAN_PATH_PREFIX_REL=""
 
             if mountpoint -q "/boot" 2>/dev/null; then
-                PLAN_PATH_PREFIX_REL=""
                 if [[ -z "$PLAN_EFI_PART" ]]; then
                     PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/boot" 2>/dev/null || true)
                 fi
             else
-                PLAN_PATH_PREFIX_REL="/boot"
                 if [[ -z "$PLAN_EFI_PART" ]]; then
                     PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/" 2>/dev/null || true)
                 fi
