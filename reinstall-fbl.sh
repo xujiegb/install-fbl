@@ -302,7 +302,6 @@ missing_deps_freebsd_installer() {
     command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
     command -v xz >/dev/null 2>&1 || missing+=("xz")
     command -v file >/dev/null 2>&1 || missing+=("file")
-    command -v tar >/dev/null 2>&1 || missing+=("tar")
     have_any_downloader || missing+=("downloader")
 
     ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
@@ -339,7 +338,7 @@ install_deps_freebsd_host() {
             qemu-img)          pkgs+=("qemu-tools") ;;
             xz)                pkgs+=("xz") ;;
             file)              pkgs+=("file") ;;
-            tar)               pkgs+=("tar") ;;
+            tar)               : ;;
             downloader)        pkgs+=("curl") ;;
             efibootmgr)        pkgs+=("efibootmgr") ;;
             grub-mkstandalone) pkgs+=("grub2") ;;
@@ -363,7 +362,6 @@ install_deps_freebsd_installer() {
             qemu-img)   pkgs+=("qemu-tools") ;;
             xz)         pkgs+=("xz") ;;
             file)       pkgs+=("file") ;;
-            tar)        pkgs+=("tar") ;;
             downloader) pkgs+=("curl") ;;
         esac
     done
@@ -806,6 +804,8 @@ PLAN_EFI_FS_TYPE=""
 PLAN_EFI_MOUNTED_BY_SCRIPT=0
 PLAN_STORAGE_MODE="efi"
 PLAN_PATH_PREFIX_REL=""
+PLAN_EFI_PART_DISK=""
+PLAN_EFI_PART_NUM=""
 
 # Alpine RAM preparation
 ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
@@ -833,8 +833,6 @@ GRUB_REBOOT_CMD=""
 GRUB_DEFAULT_CMD=""
 GRUB_MKSTANDALONE_CMD=""
 GRUB_EFI_TARGET=""
-PLAN_EFI_PART_DISK=""
-PLAN_EFI_PART_NUM=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
 
@@ -991,15 +989,13 @@ mount_efi_for_plan() {
         if [[ -d "/boot" ]]; then
             EFI_MOUNT_POINT="/boot"
             PLAN_STORAGE_MODE="boot"
-            PLAN_EFI_MOUNTED_BY_SCRIPT=0
             PLAN_PATH_PREFIX_REL=""
+            PLAN_EFI_MOUNTED_BY_SCRIPT=0
 
-            if mountpoint -q "/boot" 2>/dev/null; then
-                if [[ -z "$PLAN_EFI_PART" ]]; then
+            if [[ -z "$PLAN_EFI_PART" ]]; then
+                if mountpoint -q "/boot" 2>/dev/null; then
                     PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/boot" 2>/dev/null || true)
-                fi
-            else
-                if [[ -z "$PLAN_EFI_PART" ]]; then
+                else
                     PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/" 2>/dev/null || true)
                 fi
             fi
@@ -1100,7 +1096,7 @@ load_plan_from_efi() {
     if [[ "$OS" == "Linux" ]]; then
         mkdir -p "$boot_mnt"
 
-        # 1) 先按 /etc/reinstall/vars 里已有信息尝试
+        # 1) 优先按 /etc/reinstall/vars 提供的信息尝试挂载
         if [[ "$vars_loaded" -eq 1 ]] && ! mountpoint -q "$boot_mnt" 2>/dev/null; then
             if [[ -n "${PLAN_EFI_PART:-}" && -e "${PLAN_EFI_PART}" ]]; then
                 if [[ "${PLAN_STORAGE_MODE:-efi}" == "efi" ]]; then
@@ -1127,7 +1123,9 @@ load_plan_from_efi() {
             fi
         fi
 
-        # 2) 如果还没挂上，就粗暴扫描常见块设备，并同时探测 boot / efi 两种路径
+        # 2) 如果还没挂上，就扫描常见块设备，同时探测两种路径：
+        #    /REINSTALL/plan.env
+        #    /boot/REINSTALL/plan.env
         if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
             for candidate in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p* /dev/mapper/*; do
                 [[ -e "$candidate" ]] || continue
@@ -1155,28 +1153,17 @@ load_plan_from_efi() {
                         EFI_MOUNT_POINT="$boot_mnt"
                         PLAN_EFI_PART="$candidate"
                         break
-                    elif [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                        PLAN_STORAGE_MODE="efi"
-                        PLAN_PATH_PREFIX_REL=""
-                        plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-                        EFI_MOUNT_POINT="$boot_mnt"
-                        PLAN_EFI_PART="$candidate"
-                        break
                     fi
                     umount "$boot_mnt" 2>/dev/null || true
                 fi
             done
         fi
 
-        # 3) 如果 mount 成功但 plan_file 还没选出来，再按两种路径查一次
+        # 3) 如果已挂载但 plan_file 还没定，再查一次
         if [[ -z "$plan_file" && -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
             if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                if [[ "${PLAN_STORAGE_MODE:-}" == "boot" ]]; then
-                    PLAN_PATH_PREFIX_REL=""
-                else
-                    PLAN_STORAGE_MODE="efi"
-                    PLAN_PATH_PREFIX_REL=""
-                fi
+                PLAN_STORAGE_MODE="boot"
+                PLAN_PATH_PREFIX_REL=""
                 plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
                 EFI_MOUNT_POINT="$boot_mnt"
             elif [[ -f "$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
@@ -1438,9 +1425,8 @@ ensure_network() {
 }
 
 mount_bootstrap() {
-    local base_mnt dev path_prefix
+    local base_mnt dev
     base_mnt=/media/bootstrap
-    path_prefix="${PLAN_PATH_PREFIX_REL:-}"
 
     mkdir -p "$base_mnt"
 
@@ -1490,7 +1476,7 @@ mount_bootstrap() {
             mount -t vfat "$dev" "$base_mnt" 2>/dev/null || \
             mount -t msdos "$dev" "$base_mnt" 2>/dev/null || \
             mount -t msdosfs "$dev" "$base_mnt" 2>/dev/null || true
-            if [ -f "$base_mnt${path_prefix}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
+            if [ -f "$base_mnt/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
                 return 0
             fi
             umount "$base_mnt" 2>/dev/null || true
@@ -1499,7 +1485,8 @@ mount_bootstrap() {
         for dev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p* /dev/mapper/*; do
             [ -e "$dev" ] || continue
             mount "$dev" "$base_mnt" 2>/dev/null || true
-            if [ -f "$base_mnt${path_prefix}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
+            if [ -f "$base_mnt/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ] || \
+               [ -f "$base_mnt/boot/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
                 return 0
             fi
             umount "$base_mnt" 2>/dev/null || true
@@ -1519,11 +1506,21 @@ install_runtime_deps() {
 }
 
 main() {
+    local bootstrap_prefix=""
     install_runtime_deps
     mount_bootstrap
 
-    PLAN_FILE="/media/bootstrap${PLAN_PATH_PREFIX_REL:-}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}"
-    SCRIPT_FILE="/media/bootstrap${PLAN_PATH_PREFIX_REL:-}/${PLAN_DIR_REL}/${SCRIPT_NAME}"
+    if [ -f "/media/bootstrap/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
+        bootstrap_prefix=""
+    elif [ -f "/media/bootstrap/boot/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
+        bootstrap_prefix="/boot"
+    else
+        echo "Plan file not found under /media/bootstrap or /media/bootstrap/boot"
+        exit 1
+    fi
+
+    PLAN_FILE="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}"
+    SCRIPT_FILE="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/${SCRIPT_NAME}"
 
     [ -f "$PLAN_FILE" ] || {
         echo "Plan file not found: $PLAN_FILE"
@@ -1606,8 +1603,8 @@ EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
-    linux ${PLAN_PATH_PREFIX_REL}${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${PLAN_PATH_PREFIX_REL}${ALPINE_MODLOOP_REL} apkovl=${PLAN_PATH_PREFIX_REL}${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
-    initrd ${PLAN_PATH_PREFIX_REL}${ALPINE_INITRAMFS_REL}
+    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} apkovl=/boot${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    initrd /boot${ALPINE_INITRAMFS_REL}
 }
 EOF
     fi
