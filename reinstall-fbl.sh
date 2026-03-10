@@ -1384,7 +1384,6 @@ download_alpine_ram_files() {
 
     local base flavor tmpdir ok=0
     tmpdir=$(mktemp -d /tmp/reinstall-alpine-netboot.XXXXXX)
-    trap 'rm -rf "$tmpdir"' RETURN
 
     base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/netboot"
 
@@ -1407,13 +1406,14 @@ download_alpine_ram_files() {
         rm -f "$tmpdir/vmlinuz" "$tmpdir/initramfs" "$tmpdir/modloop"
     done
 
+    rm -rf "$tmpdir"
+
     [[ "$ok" -eq 1 ]] || error "Failed to download Alpine RAM kernel/initramfs/modloop for arch=${ALPINE_NETBOOT_ARCH} from ${base}"
 }
 
 build_alpine_apkovl() {
     local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
-    trap 'rm -rf "$tmp"' RETURN
 
     ovl_dir="$tmp/ovl"
 
@@ -1638,6 +1638,7 @@ EOF
     tar -C "$ovl_dir" -czf "$ALPINE_APKOVL_ABS" .
     chmod 0644 "$ALPINE_APKOVL_ABS"
     sync
+    rm -rf "$tmp"
     info "Built Alpine apkovl overlay: $ALPINE_APKOVL_ABS"
 }
 
@@ -1679,7 +1680,6 @@ build_freebsd_grub_efi() {
 
     local tmp cfg
     tmp=$(mktemp -d /tmp/reinstall-freebsd-grub.XXXXXX)
-    trap 'rm -rf "$tmp"' RETURN
 
     cfg="$tmp/grub.cfg"
     cat >"$cfg" <<EOF
@@ -1697,6 +1697,7 @@ EOF
         --modules="part_gpt fat search search_fs_uuid linux normal echo"
     chmod 0644 "$ALPINE_FREEBSD_GRUB_EFI_ABS"
     sync
+    rm -rf "$tmp"
 }
 
 install_freebsd_bootnext_entry() {
