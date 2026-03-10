@@ -1211,7 +1211,7 @@ load_plan_from_efi() {
                     umount "$boot_mnt" 2>/dev/null || true
                 fi
             done
-        }
+        fi
 
         # 3) 如果已挂载但 plan_file 还没定，再查一次
         if [[ -z "$plan_file" && -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
@@ -1226,7 +1226,7 @@ load_plan_from_efi() {
                 plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
                 EFI_MOUNT_POINT="$boot_mnt"
             fi
-        }
+        fi
 
         [[ -n "$plan_file" && -f "$plan_file" ]] || error "Plan file not found on Linux bootstrap storage"
 
