@@ -869,6 +869,7 @@ PLAN_EFI_PART_NUM=""
 # Alpine RAM preparation
 ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
 ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/v3.22"
+ALPINE_NETBOOT_SUBDIR="netboot-3.22.3"
 ALPINE_BOOT_SUBDIR="alpine"
 ALPINE_BOOT_DIR_REL=""
 ALPINE_BOOT_DIR_ABS=""
@@ -1394,10 +1395,10 @@ download_alpine_ram_files() {
     tmpdir=$(mktemp -d /tmp/reinstall-alpine-netboot.XXXXXX)
     trap 'rm -rf "$tmpdir"' RETURN
 
-    base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/netboot"
+    base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/${ALPINE_NETBOOT_SUBDIR}"
     ALPINE_KERNEL_FLAVOR="lts"
 
-    info "Using fixed Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR} (Alpine 3.22 / Linux 6.12)"
+    info "Using fixed Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}, source=${base}"
 
     http_download "$base/vmlinuz-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/vmlinuz"
     http_download "$base/initramfs-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/initramfs"
