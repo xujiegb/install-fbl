@@ -1157,7 +1157,7 @@ load_plan_from_efi() {
                     umount "$boot_mnt" 2>/dev/null || true
                 fi
             done
-        fi
+        }
 
         # 3) 如果已挂载但 plan_file 还没定，再查一次
         if [[ -z "$plan_file" && -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
@@ -1507,8 +1507,8 @@ install_runtime_deps() {
 
 main() {
     local bootstrap_prefix=""
-    install_runtime_deps
     mount_bootstrap
+    install_runtime_deps
 
     if [ -f "/media/bootstrap/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
         bootstrap_prefix=""
@@ -1655,8 +1655,8 @@ install_freebsd_bootnext_entry() {
         awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
             n = substr($1, 5, 4)
             gsub(/\*/, "", n)
-            print n
-        }' | sort -u
+            printf "%d\n", strtonum("0x" n)
+        }' | sort -n -u
     )
 
     info "Creating FreeBSD UEFI boot entry: ${ALPINE_ENTRY_TITLE}"
@@ -1671,15 +1671,17 @@ install_freebsd_bootnext_entry() {
         awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
             n = substr($1, 5, 4)
             gsub(/\*/, "", n)
-            print n
-        }' | sort -u
+            printf "%d\n", strtonum("0x" n)
+        }' | sort -n -u
     )
 
     newnum=$(
-        comm -13 <(printf '%s' "$before" | sort -u) <(printf '%s' "$after" | sort -u) | head -n1
+        comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n1
     )
 
     [[ -n "$newnum" ]] || error "Failed to determine new EFI boot entry after creating ${ALPINE_ENTRY_TITLE}"
+
+    printf -v newnum '%04X' "$newnum"
 
     info "Setting BootNext to EFI entry $newnum (${ALPINE_ENTRY_TITLE})"
     efibootmgr -n "$newnum" >/dev/null
