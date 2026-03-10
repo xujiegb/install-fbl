@@ -1457,11 +1457,13 @@ EOF
 
     startfile="$ovl_dir/usr/local/sbin/reinstall-auto.sh"
     cat >"$startfile" <<'EOF'
-#!/bin/sh
+#!/bin/bash
 set -eu
 
 LOG="/var/log/reinstall-auto.log"
-exec >>"$LOG" 2>&1
+mkdir -p /var/log
+touch "$LOG"
+exec > >(tee -a "$LOG") 2>&1
 
 echo "===== reinstall-auto start $(date) ====="
 
