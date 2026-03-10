@@ -125,6 +125,59 @@ http_download() {
     fi
 }
 
+http_content_length() {
+    local url="$1"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsIL "$url" | awk '
+            BEGIN { IGNORECASE=1 }
+            /^Content-Length:/ { gsub("\r", "", $2); print $2; exit }
+        '
+        return 0
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        wget --server-response --spider "$url" 2>&1 | awk '
+            BEGIN { IGNORECASE=1 }
+            /^  Content-Length:/ { gsub("\r", "", $2); print $2; exit }
+        '
+        return 0
+    fi
+
+    return 1
+}
+
+get_available_bytes() {
+    local path="$1"
+    df -Pk "$path" 2>/dev/null | awk 'NR==2 { print $4 * 1024 }'
+}
+
+precheck_tmp_space_for_image() {
+    local url="$1"
+    local avail size need
+
+    avail=$(get_available_bytes /tmp)
+    [[ -n "$avail" ]] || {
+        warn "Could not determine available space under /tmp, skipping space precheck."
+        return 0
+    }
+
+    size=$(http_content_length "$url" || true)
+    [[ -n "$size" ]] || {
+        warn "Could not determine remote image size, skipping /tmp space precheck."
+        return 0
+    }
+
+    need=$(( size * 3 ))
+
+    if [[ "$avail" -lt "$need" ]]; then
+        error "Insufficient space under /tmp for installation workflow.
+Available: ${avail} bytes
+Estimated required: ${need} bytes
+Remote image size: ${size} bytes"
+    fi
+}
+
 lsblk_get_kv() {
     local line="$1" key="$2"
     awk -v want="$key" '
@@ -1158,7 +1211,7 @@ load_plan_from_efi() {
                     umount "$boot_mnt" 2>/dev/null || true
                 fi
             done
-        fi
+        }
 
         # 3) 如果已挂载但 plan_file 还没定，再查一次
         if [[ -z "$plan_file" && -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
@@ -1173,7 +1226,7 @@ load_plan_from_efi() {
                 plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
                 EFI_MOUNT_POINT="$boot_mnt"
             fi
-        fi
+        }
 
         [[ -n "$plan_file" && -f "$plan_file" ]] || error "Plan file not found on Linux bootstrap storage"
 
@@ -1649,10 +1702,21 @@ EOF
 install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
 
-    local before after newnum
+    local before after newnum old
 
     [[ -n "${PLAN_EFI_PART_DISK:-}" ]] || split_freebsd_part_device "$PLAN_EFI_PART"
     [[ -n "${PLAN_EFI_PART_NUM:-}" ]] || error "Missing FreeBSD EFI partition number"
+
+    efibootmgr 2>/dev/null | awk -v title="$ALPINE_ENTRY_TITLE" '
+        $0 ~ title {
+            n = substr($1, 5, 4)
+            gsub(/\*/, "", n)
+            print n
+        }
+    ' | while read -r old; do
+        [[ -n "$old" ]] || continue
+        efibootmgr -b "$old" -B >/dev/null 2>&1 || true
+    done
 
     before=$(
         efibootmgr 2>/dev/null |
@@ -1742,6 +1806,9 @@ do_install() {
 
     IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
     IMG_RAW="$INSTALL_TMPDIR/image.raw"
+
+    info "Prechecking temporary space..."
+    precheck_tmp_space_for_image "$IMG_URL"
 
     info "Downloading image..."
     http_download "$IMG_URL" "$IMG_QCOW"
