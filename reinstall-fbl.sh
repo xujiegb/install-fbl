@@ -97,7 +97,7 @@ Password / SSH key behaviour:
   - If you specify --password, you may omit --ssh-key.
   - If you specify neither password nor ssh-key:
       * The script will prompt for a root password.
-      * If you leave it empty, a random 20-character password (A–Z, a–z, 0–9) will be generated.
+      * If you leave it empty, a random 20-character password (A-Z, a-z, 0-9) will be generated.
       * The generated password will be printed before reboot.
   - Username is always: root
 EOF
@@ -1427,8 +1427,45 @@ download_alpine_ram_files() {
     info "Selected Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}"
 }
 
+# -------- Offline APK repository helpers --------
+
+prepare_local_apk_repo() {
+    local repo_dir="$1"
+
+    info "Downloading necessary APK packages for offline use..."
+    mkdir -p "$repo_dir"
+
+    local packages=(
+        "bash" "curl" "wget" "xz" "qemu-img" "util-linux" "coreutils"
+        "grep" "sed" "gawk" "findutils" "file" "tar" "e2fsprogs" "dosfstools"
+    )
+
+    for pkg in "${packages[@]}"; do
+        info "Fetching APK: $pkg"
+        apk fetch --output "$repo_dir" "$pkg" || warn "Failed to fetch APK: $pkg, continuing"
+    done
+
+    info "Building local APK repository index..."
+    apk index -o "$repo_dir/APKINDEX.tar.gz" "$repo_dir"/*.apk
+}
+
+embed_repo_in_apkovl() {
+    local repo_dir="$1"
+    local ovl_dir="$2"
+
+    info "Embedding local APK repository into apkovl..."
+    mkdir -p "$ovl_dir/local_apk_repo"
+    cp -r "$repo_dir"/. "$ovl_dir/local_apk_repo/"
+
+    # Prepend local repo so it is tried first; online repo remains as fallback
+    local repo_file="$ovl_dir/etc/apk/repositories"
+    local existing_repos=""
+    [[ -f "$repo_file" ]] && existing_repos=$(cat "$repo_file")
+    printf 'file:///local_apk_repo\n%s\n' "$existing_repos" >"$repo_file"
+}
+
 build_alpine_apkovl() {
-    local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
+    local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile local_repo_dir
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
 
     ovl_dir="$tmp/ovl"
@@ -1445,6 +1482,12 @@ build_alpine_apkovl() {
 ${ALPINE_REPO_BASE}/main
 ${ALPINE_REPO_BASE}/community
 EOF
+
+    # Prepare and embed offline APK repo so Alpine RAM can install packages
+    # without relying solely on network availability.
+    local_repo_dir="$tmp/local_apk_repo"
+    prepare_local_apk_repo "$local_repo_dir"
+    embed_repo_in_apkovl "$local_repo_dir" "$ovl_dir"
 
     markerfile="$ovl_dir/etc/reinstall/vars"
     cat >"$markerfile" <<EOF
