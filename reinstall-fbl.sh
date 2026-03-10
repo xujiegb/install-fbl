@@ -130,16 +130,14 @@ http_content_length() {
 
     if command -v curl >/dev/null 2>&1; then
         curl -fsIL "$url" | awk '
-            BEGIN { IGNORECASE=1 }
-            /^Content-Length:/ { gsub("\r", "", $2); print $2; exit }
+            /^[Cc]ontent-[Ll]ength:/ { gsub("\r", "", $2); print $2; exit }
         '
         return 0
     fi
 
     if command -v wget >/dev/null 2>&1; then
         wget --server-response --spider "$url" 2>&1 | awk '
-            BEGIN { IGNORECASE=1 }
-            /^  Content-Length:/ { gsub("\r", "", $2); print $2; exit }
+            /^  [Cc]ontent-[Ll]ength:/ { gsub("\r", "", $2); print $2; exit }
         '
         return 0
     fi
@@ -168,7 +166,11 @@ precheck_tmp_space_for_image() {
         return 0
     }
 
-    need=$(( size * 3 ))
+    if [[ "$url" == *.xz ]]; then
+        need=$(( size * 7 ))
+    else
+        need=$(( size * 3 ))
+    fi
 
     if [[ "$avail" -lt "$need" ]]; then
         error "Insufficient space under /tmp for installation workflow.
@@ -784,23 +786,26 @@ EOF
     {
         echo "#cloud-config"
 
-        if [[ -n "$PASSWORD_HASH" ]]; then
-            cat <<EOF
-ssh_pwauth: true
-disable_root: false
-users:
-  - name: root
-    lock_passwd: false
-    passwd: "${PASSWORD_HASH}"
-EOF
-        fi
+        if [[ -n "$PASSWORD_HASH" || -n "$SSH_KEYS_ALL" ]]; then
+            echo "ssh_pwauth: true"
+            echo "disable_root: false"
+            echo "users:"
+            echo "  - name: root"
 
-        if [[ -n "$SSH_KEYS_ALL" ]]; then
-            echo "ssh_authorized_keys:"
-            while IFS= read -r line; do
-                [[ -n "$line" ]] || continue
-                printf '  - %s\n' "$line"
-            done <<<"$SSH_KEYS_ALL"
+            if [[ -n "$PASSWORD_HASH" ]]; then
+                echo "    lock_passwd: false"
+                echo "    passwd: \"${PASSWORD_HASH}\""
+            else
+                echo "    lock_passwd: true"
+            fi
+
+            if [[ -n "$SSH_KEYS_ALL" ]]; then
+                echo "    ssh_authorized_keys:"
+                while IFS= read -r line; do
+                    [[ -n "$line" ]] || continue
+                    printf '      - %s\n' "$line"
+                done <<<"$SSH_KEYS_ALL"
+            fi
         fi
 
         if [[ -n "$WEB_PORT" ]]; then
@@ -863,7 +868,7 @@ PLAN_EFI_PART_NUM=""
 
 # Alpine RAM preparation
 ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
-ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/v3.23"
+ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/v3.22"
 ALPINE_BOOT_SUBDIR="alpine"
 ALPINE_BOOT_DIR_REL=""
 ALPINE_BOOT_DIR_ABS=""
@@ -1369,8 +1374,11 @@ copy_script_to_efi() {
     self="$0"
 
     if command -v readlink >/dev/null 2>&1; then
-        self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+        self=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+    elif command -v realpath >/dev/null 2>&1; then
+        self=$(realpath "$0" 2>/dev/null || echo "$0")
     fi
+
     [[ -f "$self" ]] || error "Cannot locate current script file: $self"
 
     cp "$self" "$ALPINE_SCRIPT_COPY_ABS"
@@ -1382,38 +1390,33 @@ copy_script_to_efi() {
 download_alpine_ram_files() {
     mkdir -p "$ALPINE_BOOT_DIR_ABS"
 
-    local base flavor tmpdir ok=0
+    local base tmpdir
     tmpdir=$(mktemp -d /tmp/reinstall-alpine-netboot.XXXXXX)
+    trap 'rm -rf "$tmpdir"' RETURN
 
     base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/netboot"
+    ALPINE_KERNEL_FLAVOR="lts"
 
-    # Prefer virt, then fall back to lts. This works for x86_64 and lets aarch64 use lts if virt is absent.
-    for flavor in virt lts; do
-        info "Trying Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${flavor}"
-        if http_download "$base/vmlinuz-${flavor}" "$tmpdir/vmlinuz" &&
-           http_download "$base/initramfs-${flavor}" "$tmpdir/initramfs" &&
-           http_download "$base/modloop-${flavor}" "$tmpdir/modloop"; then
-            mv "$tmpdir/vmlinuz" "$ALPINE_VMLINUZ_ABS"
-            mv "$tmpdir/initramfs" "$ALPINE_INITRAMFS_ABS"
-            mv "$tmpdir/modloop" "$ALPINE_MODLOOP_ABS"
-            chmod 0644 "$ALPINE_VMLINUZ_ABS" "$ALPINE_INITRAMFS_ABS" "$ALPINE_MODLOOP_ABS"
-            sync
-            ALPINE_KERNEL_FLAVOR="$flavor"
-            info "Selected Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}"
-            ok=1
-            break
-        fi
-        rm -f "$tmpdir/vmlinuz" "$tmpdir/initramfs" "$tmpdir/modloop"
-    done
+    info "Using fixed Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR} (Alpine 3.22 / Linux 6.12)"
 
-    rm -rf "$tmpdir"
+    http_download "$base/vmlinuz-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/vmlinuz"
+    http_download "$base/initramfs-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/initramfs"
+    http_download "$base/modloop-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/modloop"
 
-    [[ "$ok" -eq 1 ]] || error "Failed to download Alpine RAM kernel/initramfs/modloop for arch=${ALPINE_NETBOOT_ARCH} from ${base}"
+    mv "$tmpdir/vmlinuz" "$ALPINE_VMLINUZ_ABS"
+    mv "$tmpdir/initramfs" "$ALPINE_INITRAMFS_ABS"
+    mv "$tmpdir/modloop" "$ALPINE_MODLOOP_ABS"
+
+    chmod 0644 "$ALPINE_VMLINUZ_ABS" "$ALPINE_INITRAMFS_ABS" "$ALPINE_MODLOOP_ABS"
+    sync
+
+    info "Selected Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}"
 }
 
 build_alpine_apkovl() {
     local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
+    trap 'rm -rf "$tmp"' RETURN
 
     ovl_dir="$tmp/ovl"
 
@@ -1609,7 +1612,7 @@ main() {
     exit "$rc"
 }
 
-main "$@"
+main
 EOF
     chmod 0755 "$startfile"
 
@@ -1622,7 +1625,7 @@ command="/usr/local/sbin/reinstall-auto.sh"
 command_background="no"
 depend() {
     need localmount
-    use net
+    use networking
 }
 start() {
     ebegin "Starting reinstall-auto"
@@ -1638,7 +1641,6 @@ EOF
     tar -C "$ovl_dir" -czf "$ALPINE_APKOVL_ABS" .
     chmod 0644 "$ALPINE_APKOVL_ABS"
     sync
-    rm -rf "$tmp"
     info "Built Alpine apkovl overlay: $ALPINE_APKOVL_ABS"
 }
 
@@ -1680,6 +1682,7 @@ build_freebsd_grub_efi() {
 
     local tmp cfg
     tmp=$(mktemp -d /tmp/reinstall-freebsd-grub.XXXXXX)
+    trap 'rm -rf "$tmp"' RETURN
 
     cfg="$tmp/grub.cfg"
     cat >"$cfg" <<EOF
@@ -1697,7 +1700,6 @@ EOF
         --modules="part_gpt fat search search_fs_uuid linux normal echo"
     chmod 0644 "$ALPINE_FREEBSD_GRUB_EFI_ABS"
     sync
-    rm -rf "$tmp"
 }
 
 install_freebsd_bootnext_entry() {
@@ -1708,16 +1710,18 @@ install_freebsd_bootnext_entry() {
     [[ -n "${PLAN_EFI_PART_DISK:-}" ]] || split_freebsd_part_device "$PLAN_EFI_PART"
     [[ -n "${PLAN_EFI_PART_NUM:-}" ]] || error "Missing FreeBSD EFI partition number"
 
-    efibootmgr 2>/dev/null | awk -v title="$ALPINE_ENTRY_TITLE" '
-        $0 ~ title {
-            n = substr($1, 5, 4)
-            gsub(/\*/, "", n)
-            print n
-        }
-    ' | while read -r old; do
+    while read -r old; do
         [[ -n "$old" ]] || continue
-        efibootmgr -b "$old" -B >/dev/null 2>&1 || true
-    done
+        efibootmgr -b "$old" -B >/dev/null 2>&1 || warn "Failed to delete old EFI boot entry: $old"
+    done < <(
+        efibootmgr 2>/dev/null | awk -v title="$ALPINE_ENTRY_TITLE" '
+            $0 ~ title {
+                n = substr($1, 5, 4)
+                gsub(/\*/, "", n)
+                print n
+            }
+        '
+    )
 
     before=$(
         efibootmgr 2>/dev/null |
