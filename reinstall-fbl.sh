@@ -1268,6 +1268,10 @@ detect_current_console_args() {
             esac
         done
     fi
+
+    if [[ -z "$CURRENT_CONSOLE_ARGS" ]]; then
+        CURRENT_CONSOLE_ARGS=" console=ttyS0 console=tty0"
+    fi
 }
 
 ensure_grub_tools() {
@@ -1478,17 +1482,38 @@ export PATH
 . /etc/reinstall/vars
 
 ensure_network() {
+    local dev candidates="" preferred=""
+
     if ip route 2>/dev/null | grep -q '^default'; then
+        echo "[net] default route already exists"
         return 0
     fi
 
-    for dev in $(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' || true); do
+    echo "[net] probing network interfaces"
+
+    for dev in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$' || true); do
+        [ -n "$dev" ] || continue
+        if [ -r "/sys/class/net/$dev/carrier" ] && [ "$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo 0)" = "1" ]; then
+            preferred="$preferred $dev"
+        else
+            candidates="$candidates $dev"
+        fi
+    done
+
+    candidates="$preferred $candidates"
+
+    for dev in $candidates; do
+        echo "[net] trying interface: $dev"
         ip link set "$dev" up 2>/dev/null || true
-        udhcpc -q -t 10 -T 3 -i "$dev" 2>/dev/null || true
+        ip addr flush dev "$dev" 2>/dev/null || true
+        udhcpc -n -q -t 3 -T 3 -i "$dev" 2>/dev/null || true
         if ip route 2>/dev/null | grep -q '^default'; then
+            echo "[net] DHCP succeeded on $dev"
             return 0
         fi
     done
+
+    echo "[net] no DHCP lease obtained, continuing anyway"
     return 0
 }
 
@@ -1531,7 +1556,7 @@ mount_bootstrap() {
                 mount "$dev" "$base_mnt" 2>/dev/null || true
             fi
         fi
-    fi
+    }
 
     if mountpoint -q "$base_mnt" 2>/dev/null; then
         return 0
@@ -1566,8 +1591,11 @@ mount_bootstrap() {
 }
 
 install_runtime_deps() {
+    echo "[stage] ensure_network"
     ensure_network
+    echo "[stage] apk update"
     apk update || true
+    echo "[stage] apk add runtime packages"
     apk add --no-cache \
         bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
         e2fsprogs dosfstools || true
@@ -1698,7 +1726,7 @@ build_freebsd_grub_efi() {
     cfg="$tmp/grub.cfg"
     cat >"$cfg" <<EOF
 search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=none alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1
+linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=none alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1 console=ttyS0 console=tty0
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
