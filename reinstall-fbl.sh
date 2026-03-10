@@ -1393,22 +1393,31 @@ download_alpine_ram_files() {
 
     local base tmpdir
     tmpdir=$(mktemp -d /tmp/reinstall-alpine-netboot.XXXXXX)
-    trap 'rm -rf "$tmpdir"' RETURN
 
     base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/${ALPINE_NETBOOT_SUBDIR}"
     ALPINE_KERNEL_FLAVOR="lts"
 
     info "Using fixed Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}, source=${base}"
 
-    http_download "$base/vmlinuz-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/vmlinuz"
-    http_download "$base/initramfs-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/initramfs"
-    http_download "$base/modloop-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/modloop"
+    if ! http_download "$base/vmlinuz-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/vmlinuz"; then
+        rm -rf "$tmpdir"
+        error "Failed to download Alpine kernel"
+    fi
+    if ! http_download "$base/initramfs-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/initramfs"; then
+        rm -rf "$tmpdir"
+        error "Failed to download Alpine initramfs"
+    fi
+    if ! http_download "$base/modloop-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/modloop"; then
+        rm -rf "$tmpdir"
+        error "Failed to download Alpine modloop"
+    fi
 
     mv "$tmpdir/vmlinuz" "$ALPINE_VMLINUZ_ABS"
     mv "$tmpdir/initramfs" "$ALPINE_INITRAMFS_ABS"
     mv "$tmpdir/modloop" "$ALPINE_MODLOOP_ABS"
 
     chmod 0644 "$ALPINE_VMLINUZ_ABS" "$ALPINE_INITRAMFS_ABS" "$ALPINE_MODLOOP_ABS"
+    rm -rf "$tmpdir"
     sync
 
     info "Selected Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}"
@@ -1417,7 +1426,6 @@ download_alpine_ram_files() {
 build_alpine_apkovl() {
     local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
-    trap 'rm -rf "$tmp"' RETURN
 
     ovl_dir="$tmp/ovl"
 
@@ -1641,6 +1649,7 @@ EOF
 
     tar -C "$ovl_dir" -czf "$ALPINE_APKOVL_ABS" .
     chmod 0644 "$ALPINE_APKOVL_ABS"
+    rm -rf "$tmp"
     sync
     info "Built Alpine apkovl overlay: $ALPINE_APKOVL_ABS"
 }
@@ -1683,7 +1692,6 @@ build_freebsd_grub_efi() {
 
     local tmp cfg
     tmp=$(mktemp -d /tmp/reinstall-freebsd-grub.XXXXXX)
-    trap 'rm -rf "$tmp"' RETURN
 
     cfg="$tmp/grub.cfg"
     cat >"$cfg" <<EOF
@@ -1700,6 +1708,7 @@ EOF
         "boot/grub/grub.cfg=$cfg" \
         --modules="part_gpt fat search search_fs_uuid linux normal echo"
     chmod 0644 "$ALPINE_FREEBSD_GRUB_EFI_ABS"
+    rm -rf "$tmp"
     sync
 }
 
@@ -1778,7 +1787,7 @@ prepare_and_boot_alpine_ram() {
 }
 
 prepare_and_boot_alpine_ram_freebsd() {
-    [[ "$OS" == "FreeBSD" ]] || error "Automatic FreeBSD BootNext bootstrap only supports FreeBSD host"
+    [[ "$OS" == "FreeBSD" ]] || error "Automatic FreeBSD BootNext bootstrap only supports FreeBSD host in this function"
 
     prepare_alpine_paths
     copy_script_to_efi
