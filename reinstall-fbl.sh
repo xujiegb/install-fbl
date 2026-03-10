@@ -128,7 +128,7 @@ http_download() {
 lsblk_get_kv() {
     local line="$1" key="$2"
     awk -v want="$key" '
-        BEGIN {
+        {
             len = length($0)
             i = 1
             while (i <= len) {
@@ -152,6 +152,7 @@ lsblk_get_kv() {
                         i++
                         if (i <= len) v = v substr($0, i, 1)
                     } else if (c == "\"") {
+                        i++
                         break
                     } else {
                         v = v c
@@ -163,9 +164,6 @@ lsblk_get_kv() {
                     print v
                     exit
                 }
-
-                i++
-                while (i <= len && substr($0, i, 1) != " ") i++
             }
         }
     ' <<<"$line"
@@ -378,6 +376,10 @@ ensure_dependencies() {
     local missing=()
 
     if [[ "$OS" == "Linux" ]]; then
+        if [[ "$ENV_MODE" == "alpine-ram" ]] || [[ -f /etc/alpine-release ]]; then
+            return 0
+        fi
+
         detect_linux_family
         mapfile -t missing < <(missing_deps_linux_common)
 
@@ -733,11 +735,10 @@ EOF
             cat <<EOF
 ssh_pwauth: true
 disable_root: false
-chpasswd:
-  list: |
-    root:${PASSWORD_HASH}
-  expire: false
-  encrypted: true
+users:
+  - name: root
+    lock_passwd: false
+    passwd: "${PASSWORD_HASH}"
 EOF
         fi
 
@@ -1157,7 +1158,7 @@ load_plan_from_efi() {
                     umount "$boot_mnt" 2>/dev/null || true
                 fi
             done
-        }
+        fi
 
         # 3) 如果已挂载但 plan_file 还没定，再查一次
         if [[ -z "$plan_file" && -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
@@ -1507,7 +1508,9 @@ install_runtime_deps() {
 
 main() {
     local bootstrap_prefix=""
+    echo "[stage] mount_bootstrap"
     mount_bootstrap
+    echo "[stage] install_runtime_deps"
     install_runtime_deps
 
     if [ -f "/media/bootstrap/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
@@ -1533,6 +1536,7 @@ main() {
 
     chmod 0755 "$SCRIPT_FILE" || true
 
+    echo "[stage] launch installer"
     echo "Launching installer phase..."
     bash "$SCRIPT_FILE" --phase installer --yes
 
@@ -2084,7 +2088,7 @@ if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
     echo "You can set a root password now, or leave empty to auto-generate a random 20-character password."
 
     while :; do
-        read -r -p "Enter root password (leave empty to auto-generate): " pw1
+        read -r -s -p "Enter root password (leave empty to auto-generate): " pw1
         echo
 
         if [[ -z "$pw1" ]]; then
@@ -2099,7 +2103,7 @@ if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
             break
         fi
 
-        read -r -p "Confirm root password: " pw2
+        read -r -s -p "Confirm root password: " pw2
         echo
 
         if [[ "$pw1" == "$pw2" ]]; then
