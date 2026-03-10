@@ -24,8 +24,6 @@
 #   - On FreeBSD+UEFI host, automatically prepare Alpine RAM installer,
 #     build a GRUB EFI binary, add a one-time BootNext entry, reboot into Alpine RAM,
 #     and auto-continue.
-#   - Cache Alpine runtime APKs and target qcow2/qcow2.xz image onto bootstrap storage
-#     before reboot, so Alpine RAM stage can run fully offline.
 
 set -Eeuo pipefail
 export LC_ALL=C
@@ -125,62 +123,6 @@ http_download() {
     else
         error "No curl/wget/fetch found, cannot download: $url"
     fi
-}
-
-ensure_working_network() {
-    if [[ "$OS" == "Linux" ]]; then
-        if command -v ip >/dev/null 2>&1 && ip route 2>/dev/null | grep -q '^default'; then
-            return 0
-        fi
-
-        if command -v ip >/dev/null 2>&1; then
-            local dev
-            for dev in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo$' || true); do
-                ip link set "$dev" up 2>/dev/null || true
-
-                if command -v udhcpc >/dev/null 2>&1; then
-                    udhcpc -q -n -t 5 -i "$dev" 2>/dev/null || true
-                elif command -v dhclient >/dev/null 2>&1; then
-                    dhclient -1 "$dev" 2>/dev/null || true
-                fi
-
-                if ip route 2>/dev/null | grep -q '^default'; then
-                    return 0
-                fi
-            done
-        fi
-
-        error "Unable to obtain network connectivity on Linux installer environment"
-    fi
-
-    if [[ "$OS" == "FreeBSD" ]]; then
-        if command -v route >/dev/null 2>&1 && route -n get default >/dev/null 2>&1; then
-            return 0
-        fi
-
-        if command -v ifconfig >/dev/null 2>&1; then
-            local dev
-            for dev in $(ifconfig -l 2>/dev/null || true); do
-                case "$dev" in
-                    lo*|pflog*|pfsync*|tun*|tap*) continue ;;
-                esac
-
-                ifconfig "$dev" up 2>/dev/null || true
-
-                if command -v dhclient >/dev/null 2>&1; then
-                    dhclient "$dev" 2>/dev/null || true
-                fi
-
-                if command -v route >/dev/null 2>&1 && route -n get default >/dev/null 2>&1; then
-                    return 0
-                fi
-            done
-        fi
-
-        error "Unable to obtain network connectivity on FreeBSD installer environment"
-    fi
-
-    error "Unsupported OS for network bootstrap: $OS"
 }
 
 lsblk_get_kv() {
@@ -864,13 +806,10 @@ PLAN_STORAGE_MODE="efi"
 PLAN_PATH_PREFIX_REL=""
 PLAN_EFI_PART_DISK=""
 PLAN_EFI_PART_NUM=""
-CACHED_IMG_NAME=""
-CACHED_IMG_REL=""
-CACHED_IMG_ABS=""
 
 # Alpine RAM preparation
 ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
-ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/latest-stable"
+ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/v3.23"
 ALPINE_BOOT_SUBDIR="alpine"
 ALPINE_BOOT_DIR_REL=""
 ALPINE_BOOT_DIR_ABS=""
@@ -885,11 +824,8 @@ ALPINE_APKOVL_ABS=""
 ALPINE_SCRIPT_COPY_ABS=""
 ALPINE_FREEBSD_GRUB_EFI_REL=""
 ALPINE_FREEBSD_GRUB_EFI_ABS=""
-ALPINE_OFFLINE_REPO_ROOT_REL=""
-ALPINE_OFFLINE_REPO_ROOT_ABS=""
 ALPINE_NETBOOT_ARCH=""
 ALPINE_KERNEL_FLAVOR=""
-ALPINE_KERNEL_CMDLINE_COMMON="ip=none nomodeset panic=5 console=tty0 console=ttyS0,115200n8"
 GRUB_SCRIPT_PATH=""
 GRUB_CFG_PATH=""
 GRUB_MKCONFIG_CMD=""
@@ -899,24 +835,6 @@ GRUB_MKSTANDALONE_CMD=""
 GRUB_EFI_TARGET=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
-
-ALPINE_RUNTIME_APK_PACKAGES=(
-    bash
-    curl
-    wget
-    xz
-    qemu-img
-    util-linux
-    coreutils
-    grep
-    sed
-    gawk
-    findutils
-    file
-    tar
-    e2fsprogs
-    dosfstools
-)
 
 detect_env_mode() {
     local os
@@ -1129,20 +1047,6 @@ mount_efi_for_plan() {
     split_freebsd_part_device "$PLAN_EFI_PART"
 }
 
-derive_cached_image_name() {
-    local src="$IMG_URL"
-    local name=""
-
-    if [[ -n "$CACHED_IMG_NAME" ]]; then
-        return 0
-    fi
-
-    name="${src##*/}"
-    [[ -n "$name" && "$name" != "$src" ]] || error "Failed to derive cached image filename from: $src"
-
-    CACHED_IMG_NAME="$name"
-}
-
 save_plan_to_efi() {
     mount_efi_for_plan
     local plan_dir="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL"
@@ -1171,8 +1075,6 @@ save_plan_to_efi() {
         printf 'PLAN_DIR_REL=%q\n' "$PLAN_DIR_REL"
         printf 'PLAN_FILE_NAME=%q\n' "$PLAN_FILE_NAME"
         printf 'SCRIPT_NAME=%q\n' "$SCRIPT_NAME"
-        printf 'CACHED_IMG_NAME=%q\n' "${CACHED_IMG_NAME:-}"
-        printf 'CACHED_IMG_REL=%q\n' "${CACHED_IMG_REL:-}"
     } >"$plan_file"
 
     sync
@@ -1406,12 +1308,6 @@ prepare_alpine_paths() {
 
     ALPINE_SCRIPT_COPY_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL/$SCRIPT_NAME"
     ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_FREEBSD_GRUB_EFI_REL"
-
-    ALPINE_OFFLINE_REPO_ROOT_REL="$ALPINE_BOOT_DIR_REL/repo"
-    ALPINE_OFFLINE_REPO_ROOT_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_OFFLINE_REPO_ROOT_REL"
-
-    CACHED_IMG_REL="/$PLAN_DIR_REL/images"
-    CACHED_IMG_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$CACHED_IMG_REL"
 }
 
 copy_script_to_efi() {
@@ -1434,11 +1330,12 @@ download_alpine_ram_files() {
 
     local base flavor tmpdir ok=0
     tmpdir=$(mktemp -d /tmp/reinstall-alpine-netboot.XXXXXX)
+    trap 'rm -rf "$tmpdir"' RETURN
 
     base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/netboot"
 
-    # Prefer lts, then fall back to virt.
-    for flavor in lts virt; do
+    # Prefer virt, then fall back to lts. This works for x86_64 and lets aarch64 use lts if virt is absent.
+    for flavor in virt lts; do
         info "Trying Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${flavor}"
         if http_download "$base/vmlinuz-${flavor}" "$tmpdir/vmlinuz" &&
            http_download "$base/initramfs-${flavor}" "$tmpdir/initramfs" &&
@@ -1449,238 +1346,20 @@ download_alpine_ram_files() {
             chmod 0644 "$ALPINE_VMLINUZ_ABS" "$ALPINE_INITRAMFS_ABS" "$ALPINE_MODLOOP_ABS"
             sync
             ALPINE_KERNEL_FLAVOR="$flavor"
-            ok=1
             info "Selected Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}"
+            ok=1
             break
         fi
         rm -f "$tmpdir/vmlinuz" "$tmpdir/initramfs" "$tmpdir/modloop"
     done
 
-    rm -rf -- "$tmpdir"
-
     [[ "$ok" -eq 1 ]] || error "Failed to download Alpine RAM kernel/initramfs/modloop for arch=${ALPINE_NETBOOT_ARCH} from ${base}"
-}
-
-download_runtime_apk_repo() {
-    local repo_root main_dir community_dir tmpdir
-    local main_base community_base
-    local main_index_tgz community_index_tgz
-    local main_index_txt community_index_txt
-    local roots_file resolved_file manifest_file
-    local repo filename pkg
-    local line kind
-
-    repo_root="$ALPINE_OFFLINE_REPO_ROOT_ABS"
-    main_dir="$repo_root/main"
-    community_dir="$repo_root/community"
-    tmpdir=$(mktemp -d /tmp/reinstall-alpine-apkrepo.XXXXXX)
-
-    mkdir -p "$main_dir" "$community_dir"
-
-    main_base="${ALPINE_REPO_BASE}/main/${ALPINE_NETBOOT_ARCH}"
-    community_base="${ALPINE_REPO_BASE}/community/${ALPINE_NETBOOT_ARCH}"
-
-    main_index_tgz="$tmpdir/APKINDEX.main.tar.gz"
-    community_index_tgz="$tmpdir/APKINDEX.community.tar.gz"
-    main_index_txt="$tmpdir/APKINDEX.main"
-    community_index_txt="$tmpdir/APKINDEX.community"
-    roots_file="$tmpdir/runtime-packages.txt"
-    resolved_file="$tmpdir/resolved.tsv"
-    manifest_file="$repo_root/runtime-packages.txt"
-
-    info "Preparing offline Alpine APK repository..."
-    info "Downloading Alpine APKINDEX (main/community)..."
-
-    http_download "$main_base/APKINDEX.tar.gz" "$main_index_tgz"
-    http_download "$community_base/APKINDEX.tar.gz" "$community_index_tgz"
-
-    tar -xzOf "$main_index_tgz" > "$main_index_txt"
-    tar -xzOf "$community_index_tgz" > "$community_index_txt"
-
-    cp "$main_index_tgz" "$main_dir/APKINDEX.tar.gz"
-    cp "$community_index_tgz" "$community_dir/APKINDEX.tar.gz"
-
-    printf '%s\n' "${ALPINE_RUNTIME_APK_PACKAGES[@]}" > "$roots_file"
-    cp "$roots_file" "$manifest_file"
-
-    awk -v ROOTS="$roots_file" '
-        function trim(s) {
-            sub(/^[[:space:]]+/, "", s)
-            sub(/[[:space:]]+$/, "", s)
-            return s
-        }
-
-        function normalize_dep(dep, tmp) {
-            tmp = trim(dep)
-            if (tmp == "" || tmp ~ /^!/) return ""
-            sub(/[<>=~].*$/, "", tmp)
-            return tmp
-        }
-
-        function commit_record(    i, n, arr, tok) {
-            if (pkg == "") return
-
-            pkg_repo[pkg] = current_repo
-            pkg_file[pkg] = pkg "-" ver ".apk"
-            pkg_deps[pkg] = deps
-
-            if (!(pkg in provider_pkg)) provider_pkg[pkg] = pkg
-
-            n = split(provides, arr, /[[:space:]]+/)
-            for (i = 1; i <= n; i++) {
-                tok = normalize_dep(arr[i])
-                if (tok != "" && !(tok in provider_pkg)) {
-                    provider_pkg[tok] = pkg
-                }
-            }
-
-            pkg = ""
-            ver = ""
-            deps = ""
-            provides = ""
-        }
-
-        BEGIN {
-            while ((getline line < ROOTS) > 0) {
-                line = trim(line)
-                if (line != "") roots[++roots_n] = line
-            }
-            close(ROOTS)
-        }
-
-        {
-            current_repo = (FILENAME ~ /APKINDEX\.main$/) ? "main" : "community"
-        }
-
-        /^$/ {
-            commit_record()
-            next
-        }
-
-        {
-            tag = substr($0, 1, 2)
-            val = substr($0, 3)
-
-            if (tag == "P:") pkg = val
-            else if (tag == "V:") ver = val
-            else if (tag == "D:") deps = val
-            else if (tag == "p:") provides = val
-        }
-
-        END {
-            commit_record()
-
-            qh = 1
-            qt = 0
-
-            for (i = 1; i <= roots_n; i++) {
-                tok = normalize_dep(roots[i])
-
-                if (tok == "") continue
-
-                if (tok in pkg_file) resolved = tok
-                else if (tok in provider_pkg) resolved = provider_pkg[tok]
-                else {
-                    print "WARN\t" tok
-                    continue
-                }
-
-                if (!queued[resolved]++) queue[++qt] = resolved
-            }
-
-            while (qh <= qt) {
-                cur = queue[qh++]
-
-                if (emitted[cur]++) continue
-
-                print pkg_repo[cur] "\t" pkg_file[cur] "\t" cur
-
-                n = split(pkg_deps[cur], arr, /[[:space:]]+/)
-                for (i = 1; i <= n; i++) {
-                    tok = normalize_dep(arr[i])
-                    if (tok == "") continue
-
-                    if (tok in pkg_file) resolved = tok
-                    else if (tok in provider_pkg) resolved = provider_pkg[tok]
-                    else continue
-
-                    if (!queued[resolved]++) queue[++qt] = resolved
-                }
-            }
-        }
-    ' "$main_index_txt" "$community_index_txt" > "$resolved_file"
-
-    while IFS=$'\t' read -r kind filename pkg; do
-        [[ -n "${kind:-}" ]] || continue
-
-        if [[ "$kind" == "WARN" ]]; then
-            warn "Offline APK resolver could not resolve root package token: $filename"
-            continue
-        fi
-
-        repo="$kind"
-
-        case "$repo" in
-            main)
-                if [[ ! -f "$main_dir/$filename" ]]; then
-                    info "Downloading offline APK [main]: $filename"
-                    http_download "$main_base/$filename" "$main_dir/$filename"
-                fi
-                ;;
-            community)
-                if [[ ! -f "$community_dir/$filename" ]]; then
-                    info "Downloading offline APK [community]: $filename"
-                    http_download "$community_base/$filename" "$community_dir/$filename"
-                fi
-                ;;
-            *)
-                warn "Unknown offline APK repo kind: $repo ($filename)"
-                ;;
-        esac
-    done < "$resolved_file"
-
-    rm -rf -- "$tmpdir"
-    sync
-
-    info "Offline Alpine APK repository ready: $repo_root"
-}
-
-cache_target_image() {
-    local dst tmpfile
-
-    derive_cached_image_name
-    mkdir -p "$CACHED_IMG_ABS"
-    dst="$CACHED_IMG_ABS/$CACHED_IMG_NAME"
-
-    if [[ -f "$dst" ]]; then
-        info "Cached target image already exists: $dst"
-        sync
-        return 0
-    fi
-
-    info "Caching target image to bootstrap storage..."
-    info "Destination: $dst"
-
-    if [[ "$IMG_URL" =~ ^https?:// ]]; then
-        tmpfile=$(mktemp "$CACHED_IMG_ABS/.partial.${CACHED_IMG_NAME}.XXXXXX")
-        if ! http_download "$IMG_URL" "$tmpfile"; then
-            rm -f "$tmpfile"
-            error "Failed to cache target image from URL: $IMG_URL"
-        fi
-        mv "$tmpfile" "$dst"
-    else
-        [[ -f "$IMG_URL" ]] || error "Local image file not found: $IMG_URL"
-        cp "$IMG_URL" "$dst"
-    fi
-
-    chmod 0644 "$dst"
-    sync
-    info "Cached target image ready: $dst"
 }
 
 build_alpine_apkovl() {
     local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
+    trap 'rm -rf "$tmp"' RETURN
 
     ovl_dir="$tmp/ovl"
 
@@ -1708,8 +1387,6 @@ PLAN_DIR_REL='${PLAN_DIR_REL}'
 PLAN_FILE_NAME='${PLAN_FILE_NAME}'
 SCRIPT_NAME='${SCRIPT_NAME}'
 HOLD='${HOLD}'
-CACHED_IMG_NAME='${CACHED_IMG_NAME}'
-CACHED_IMG_REL='${CACHED_IMG_REL}'
 EOF
 
     startfile="$ovl_dir/usr/local/sbin/reinstall-auto.sh"
@@ -1731,6 +1408,21 @@ export PATH
 }
 # shellcheck disable=SC1091
 . /etc/reinstall/vars
+
+ensure_network() {
+    if ip route 2>/dev/null | grep -q '^default'; then
+        return 0
+    fi
+
+    for dev in $(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' || true); do
+        ip link set "$dev" up 2>/dev/null || true
+        udhcpc -q -t 10 -T 3 -i "$dev" 2>/dev/null || true
+        if ip route 2>/dev/null | grep -q '^default'; then
+            return 0
+        fi
+    done
+    return 0
+}
 
 mount_bootstrap() {
     local base_mnt dev
@@ -1806,46 +1498,17 @@ mount_bootstrap() {
 }
 
 install_runtime_deps() {
-    local repo_root repo_main repo_community pkg_manifest packages
-
-    repo_root="/media/bootstrap/${PLAN_DIR_REL}/alpine/repo"
-    if [ ! -d "$repo_root" ]; then
-        repo_root="/media/bootstrap/boot/${PLAN_DIR_REL}/alpine/repo"
-    fi
-
-    repo_main="$repo_root/main"
-    repo_community="$repo_root/community"
-    pkg_manifest="$repo_root/runtime-packages.txt"
-
-    [ -f "$pkg_manifest" ] || {
-        echo "Offline package manifest not found: $pkg_manifest"
-        exit 1
-    }
-    [ -f "$repo_main/APKINDEX.tar.gz" ] || {
-        echo "Offline main APKINDEX not found: $repo_main/APKINDEX.tar.gz"
-        exit 1
-    }
-    [ -f "$repo_community/APKINDEX.tar.gz" ] || {
-        echo "Offline community APKINDEX not found: $repo_community/APKINDEX.tar.gz"
-        exit 1
-    }
-
-    echo "Installing runtime dependencies from offline Alpine repository..."
-
-    packages="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$pkg_manifest" | tr '\n' ' ')"
-
-    apk add --no-network --allow-untrusted \
-        --repositories-file /dev/null \
-        --repository "$repo_main" \
-        --repository "$repo_community" \
-        $packages
+    ensure_network
+    apk update || true
+    apk add --no-cache \
+        bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
+        e2fsprogs dosfstools || true
 }
 
 main() {
     local bootstrap_prefix=""
-
-    mount_bootstrap
     install_runtime_deps
+    mount_bootstrap
 
     if [ -f "/media/bootstrap/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
         bootstrap_prefix=""
@@ -1902,6 +1565,7 @@ command="/usr/local/sbin/reinstall-auto.sh"
 command_background="no"
 depend() {
     need localmount
+    use net
 }
 start() {
     ebegin "Starting reinstall-auto"
@@ -1915,9 +1579,6 @@ EOF
     ln -s ../../init.d/reinstall-auto "$runlevel_link"
 
     tar -C "$ovl_dir" -czf "$ALPINE_APKOVL_ABS" .
-
-    rm -rf -- "$tmp"
-
     chmod 0644 "$ALPINE_APKOVL_ABS"
     sync
     info "Built Alpine apkovl overlay: $ALPINE_APKOVL_ABS"
@@ -1933,7 +1594,7 @@ install_grub_entry_for_alpine() {
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
     search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ${ALPINE_KERNEL_CMDLINE_COMMON} alpine_dev=UUID=${PLAN_EFI_UUID} alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -1942,7 +1603,7 @@ EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
-    linux /boot${ALPINE_VMLINUZ_REL} ${ALPINE_KERNEL_CMDLINE_COMMON} alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} apkovl=/boot${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} apkovl=/boot${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd /boot${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -1961,11 +1622,12 @@ build_freebsd_grub_efi() {
 
     local tmp cfg
     tmp=$(mktemp -d /tmp/reinstall-freebsd-grub.XXXXXX)
+    trap 'rm -rf "$tmp"' RETURN
 
     cfg="$tmp/grub.cfg"
     cat >"$cfg" <<EOF
 search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ${ALPINE_KERNEL_CMDLINE_COMMON} alpine_dev=UUID=${PLAN_EFI_UUID} alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1
+linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
@@ -1976,9 +1638,6 @@ EOF
         -o "$ALPINE_FREEBSD_GRUB_EFI_ABS" \
         "boot/grub/grub.cfg=$cfg" \
         --modules="part_gpt fat search search_fs_uuid linux normal echo"
-
-    rm -rf -- "$tmp"
-
     chmod 0644 "$ALPINE_FREEBSD_GRUB_EFI_ABS"
     sync
 }
@@ -2017,7 +1676,7 @@ install_freebsd_bootnext_entry() {
     )
 
     newnum=$(
-        comm -13 <(printf '%s' "$before" | sort) <(printf '%s' "$after" | sort) | head -n1
+        comm -13 <(printf '%s' "$before" | sort -u) <(printf '%s' "$after" | sort -u) | head -n1
     )
 
     [[ -n "$newnum" ]] || error "Failed to determine new EFI boot entry after creating ${ALPINE_ENTRY_TITLE}"
@@ -2030,12 +1689,8 @@ prepare_and_boot_alpine_ram() {
     [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host in this function"
 
     prepare_alpine_paths
-    derive_cached_image_name
     copy_script_to_efi
     download_alpine_ram_files
-    download_runtime_apk_repo
-    cache_target_image
-    save_plan_to_efi
     build_alpine_apkovl
     install_grub_entry_for_alpine
 
@@ -2050,12 +1705,8 @@ prepare_and_boot_alpine_ram_freebsd() {
     [[ "$OS" == "FreeBSD" ]] || error "Automatic FreeBSD BootNext bootstrap only supports FreeBSD host"
 
     prepare_alpine_paths
-    derive_cached_image_name
     copy_script_to_efi
     download_alpine_ram_files
-    download_runtime_apk_repo
-    cache_target_image
-    save_plan_to_efi
     build_alpine_apkovl
     build_freebsd_grub_efi
     install_freebsd_bootnext_entry
@@ -2069,29 +1720,7 @@ prepare_and_boot_alpine_ram_freebsd() {
 
 # ----------------- installer execution (download + dd + NoCloud) -----------------
 
-find_cached_target_image() {
-    local p
-
-    if [[ -n "${CACHED_IMG_NAME:-}" ]]; then
-        for p in \
-            "${EFI_MOUNT_POINT}${PLAN_PATH_PREFIX_REL}${CACHED_IMG_REL}/${CACHED_IMG_NAME}" \
-            "/media/bootstrap${PLAN_PATH_PREFIX_REL}${CACHED_IMG_REL}/${CACHED_IMG_NAME}" \
-            "/media/bootstrap/boot${CACHED_IMG_REL}/${CACHED_IMG_NAME}" \
-            "/media/bootstrap${CACHED_IMG_REL}/${CACHED_IMG_NAME}"
-        do
-            if [[ -f "$p" ]]; then
-                printf '%s\n' "$p"
-                return 0
-            fi
-        done
-    fi
-
-    return 1
-}
-
 do_install() {
-    local cached_img_path=""
-
     info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
     info "Target: $TARGET_OS ${TARGET_VER:-"(no version)"}"
     info "Disk: $DISK"
@@ -2103,20 +1732,13 @@ do_install() {
     fi
 
     INSTALL_TMPDIR=$(mktemp -d /tmp/reinstall-cloudinit.XXXXXX)
-    # Intentionally no EXIT trap here.
-    # This installer normally runs in a transient environment and reboots soon after dd,
-    # so leftover files under /tmp are acceptable if an intermediate step aborts.
-    # We still remove INSTALL_TMPDIR explicitly on the successful path below.
+    trap 'rm -rf "$INSTALL_TMPDIR"' EXIT
 
     IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
     IMG_RAW="$INSTALL_TMPDIR/image.raw"
 
-    if cached_img_path=$(find_cached_target_image); then
-        info "Using cached target image: $cached_img_path"
-        cp "$cached_img_path" "$IMG_QCOW"
-    else
-        error "Cached target image not found on bootstrap storage. Offline installer requires the image to be cached before reboot."
-    fi
+    info "Downloading image..."
+    http_download "$IMG_URL" "$IMG_QCOW"
 
     if file "$IMG_QCOW" | grep -qi 'xz compressed'; then
         info "Detected xz compressed image, decompressing (progress may be shown)..."
@@ -2196,8 +1818,11 @@ do_install() {
         if [[ -n "$FRPC_TOML" ]]; then
             FRPC_PRESENT=1
             if [[ "$FRPC_TOML" =~ ^https?:// ]]; then
-                warn "Offline installer cannot download FRPC config at installer stage. Use a local --frpc-toml file if needed."
-                FRPC_PRESENT=""
+                info "Downloading FRPC config: $FRPC_TOML"
+                if ! http_download "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"; then
+                    warn "Failed to download FRPC config, ignoring"
+                    FRPC_PRESENT=""
+                fi
             elif [[ -f "$FRPC_TOML" ]]; then
                 info "Copying FRPC config from: $FRPC_TOML"
                 cp "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"
@@ -2215,8 +1840,6 @@ do_install() {
     else
         warn "EFI could not be mounted; target system can still boot, but cloud-init configuration may not be applied."
     fi
-
-    rm -rf -- "$INSTALL_TMPDIR"
 
     info "Image write and cloud-init NoCloud injection completed."
 
@@ -2245,10 +1868,6 @@ do_install() {
         done <<<"$SSH_KEYS_ALL"
     else
         echo "  (none)"
-    fi
-
-    if [[ -n "${CACHED_IMG_NAME:-}" ]]; then
-        echo "Cached image:  $CACHED_IMG_NAME"
     fi
 
     if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
@@ -2474,8 +2093,6 @@ if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
                 error "Failed to generate random password."
             fi
             AUTO_PASSWORD=1
-            # Intentionally shown once here: the plain text password is no longer stored in plan.env,
-            # so this host-stage display is the only place the user can retrieve it automatically.
             info "A random root password will be generated and shown before reboot."
             break
         fi
@@ -2515,8 +2132,6 @@ if [[ -z "$IMG_URL" ]] && [[ "$TARGET_OS" == "redhat" ]]; then
     error "For redhat you must specify image URL with --img"
 fi
 
-derive_cached_image_name
-
 info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
 info "Target: $TARGET_OS ${TARGET_VER:-"(no version)"}"
 info "Disk: $DISK"
@@ -2535,7 +2150,6 @@ echo "Disk device:  $DISK"
 echo "Target OS:    $TARGET_OS ${TARGET_VER:-"(no version)"}"
 echo "Username:     root"
 echo "SSH port:     ${SSH_PORT:-22}"
-echo "Cached image: ${CACHED_IMG_NAME}"
 if [[ -n "$PASSWORD_HASH" ]]; then
     if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
         echo "Generated root password:"
