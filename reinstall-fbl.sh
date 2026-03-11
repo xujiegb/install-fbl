@@ -24,6 +24,13 @@
 #   - On FreeBSD+UEFI host, automatically prepare Alpine RAM installer,
 #     build a GRUB EFI binary, add a one-time BootNext entry, reboot into Alpine RAM,
 #     and auto-continue.
+#
+# Offline bootstrap mode:
+#   - Host phase downloads target qcow/qcow.xz to bootstrap storage in advance.
+#   - Host phase downloads required Alpine .apk packages and APKINDEX.tar.gz
+#     into local bootstrap repos.
+#   - Alpine RAM phase installs runtime deps from local repos only (no network).
+#   - Installer phase reads image from bootstrap storage only (no network).
 
 set -Eeuo pipefail
 export LC_ALL=C
@@ -97,7 +104,7 @@ Password / SSH key behaviour:
   - If you specify --password, you may omit --ssh-key.
   - If you specify neither password nor ssh-key:
       * The script will prompt for a root password.
-      * If you leave it empty, a random 20-character password (A-Z, a-z, 0-9) will be generated.
+      * If you leave it empty, a random 20-character password (A–Z, a–z, 0–9) will be generated.
       * The generated password will be printed before reboot.
   - Username is always: root
 EOF
@@ -150,6 +157,26 @@ get_available_bytes() {
     df -Pk "$path" 2>/dev/null | awk 'NR==2 { print $4 * 1024 }'
 }
 
+get_file_size_bytes() {
+    local path="$1"
+
+    if [[ ! -e "$path" ]]; then
+        return 1
+    fi
+
+    if stat -c '%s' "$path" >/dev/null 2>&1; then
+        stat -c '%s' "$path"
+        return 0
+    fi
+
+    if stat -f '%z' "$path" >/dev/null 2>&1; then
+        stat -f '%z' "$path"
+        return 0
+    fi
+
+    return 1
+}
+
 precheck_tmp_space_for_image() {
     local url="$1"
     local avail size need
@@ -177,6 +204,65 @@ precheck_tmp_space_for_image() {
 Available: ${avail} bytes
 Estimated required: ${need} bytes
 Remote image size: ${size} bytes"
+    fi
+}
+
+precheck_tmp_space_for_local_image() {
+    local path="$1"
+    local avail size need
+
+    avail=$(get_available_bytes /tmp)
+    [[ -n "$avail" ]] || {
+        warn "Could not determine available space under /tmp, skipping local image /tmp space precheck."
+        return 0
+    }
+
+    size=$(get_file_size_bytes "$path" || true)
+    [[ -n "$size" ]] || {
+        warn "Could not determine local image size for $path, skipping /tmp space precheck."
+        return 0
+    }
+
+    if [[ "$path" == *.xz ]]; then
+        need=$(( size * 7 ))
+    else
+        need=$(( size * 3 ))
+    fi
+
+    if [[ "$avail" -lt "$need" ]]; then
+        error "Insufficient space under /tmp for offline installation workflow.
+Available: ${avail} bytes
+Estimated required: ${need} bytes
+Local image size: ${size} bytes
+Local image path: ${path}"
+    fi
+}
+
+precheck_bootstrap_space_for_download() {
+    local mount_path="$1" url="$2" multiplier="${3:-2}"
+    local avail size need
+
+    avail=$(get_available_bytes "$mount_path")
+    [[ -n "$avail" ]] || {
+        warn "Could not determine available space under $mount_path, skipping bootstrap space precheck."
+        return 0
+    }
+
+    size=$(http_content_length "$url" || true)
+    [[ -n "$size" ]] || {
+        warn "Could not determine remote size for $url, skipping bootstrap space precheck."
+        return 0
+    }
+
+    need=$(( size * multiplier ))
+
+    if [[ "$avail" -lt "$need" ]]; then
+        error "Insufficient space on bootstrap storage.
+Bootstrap path: ${mount_path}
+Available: ${avail} bytes
+Estimated required: ${need} bytes
+Remote file size: ${size} bytes
+URL: ${url}"
     fi
 }
 
@@ -896,6 +982,24 @@ GRUB_EFI_TARGET=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
 
+# Offline bundle paths
+BOOTSTRAP_CACHE_DIR_REL=""
+BOOTSTRAP_CACHE_DIR_ABS=""
+BOOTSTRAP_APKREPO_DIR_REL=""
+BOOTSTRAP_APKREPO_DIR_ABS=""
+BOOTSTRAP_APKREPO_MAIN_REL=""
+BOOTSTRAP_APKREPO_MAIN_ABS=""
+BOOTSTRAP_APKREPO_COMMUNITY_REL=""
+BOOTSTRAP_APKREPO_COMMUNITY_ABS=""
+BOOTSTRAP_IMG_REL=""
+BOOTSTRAP_IMG_ABS=""
+BOOTSTRAP_IMG_NAME=""
+
+ALPINE_RUNTIME_PKGS=(
+    bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar
+    e2fsprogs dosfstools
+)
+
 detect_env_mode() {
     local os
     os=$(uname -s)
@@ -1256,6 +1360,45 @@ load_plan_from_efi() {
 
 # ----------------- Alpine RAM / boot bootstrap -----------------
 
+normalize_dep_token() {
+    local tok="$1"
+
+    tok="${tok%%[*}"
+    tok="${tok%%~*}"
+    tok="${tok%%<*}"
+    tok="${tok%%>*}"
+    tok="${tok%%=*}"
+
+    if [[ "$tok" == \!* ]]; then
+        echo ""
+        return 0
+    fi
+
+    printf '%s\n' "$tok"
+}
+
+setup_bootstrap_bundle_paths() {
+    local root_abs="$1"
+
+    BOOTSTRAP_CACHE_DIR_REL="/$PLAN_DIR_REL/cache"
+    BOOTSTRAP_APKREPO_DIR_REL="/$PLAN_DIR_REL/apkrepo"
+    BOOTSTRAP_APKREPO_MAIN_REL="$BOOTSTRAP_APKREPO_DIR_REL/main"
+    BOOTSTRAP_APKREPO_COMMUNITY_REL="$BOOTSTRAP_APKREPO_DIR_REL/community"
+
+    if [[ "${IMG_URL:-}" == *.xz ]]; then
+        BOOTSTRAP_IMG_NAME="image.qcow2.xz"
+    else
+        BOOTSTRAP_IMG_NAME="image.qcow2"
+    fi
+    BOOTSTRAP_IMG_REL="$BOOTSTRAP_CACHE_DIR_REL/$BOOTSTRAP_IMG_NAME"
+
+    BOOTSTRAP_CACHE_DIR_ABS="$root_abs$BOOTSTRAP_CACHE_DIR_REL"
+    BOOTSTRAP_APKREPO_DIR_ABS="$root_abs$BOOTSTRAP_APKREPO_DIR_REL"
+    BOOTSTRAP_APKREPO_MAIN_ABS="$root_abs$BOOTSTRAP_APKREPO_MAIN_REL"
+    BOOTSTRAP_APKREPO_COMMUNITY_ABS="$root_abs$BOOTSTRAP_APKREPO_COMMUNITY_REL"
+    BOOTSTRAP_IMG_ABS="$root_abs$BOOTSTRAP_IMG_REL"
+}
+
 detect_current_console_args() {
     CURRENT_CONSOLE_ARGS=""
     if [[ -r /proc/cmdline ]]; then
@@ -1372,6 +1515,8 @@ prepare_alpine_paths() {
 
     ALPINE_SCRIPT_COPY_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL/$SCRIPT_NAME"
     ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_FREEBSD_GRUB_EFI_REL"
+
+    setup_bootstrap_bundle_paths "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL"
 }
 
 copy_script_to_efi() {
@@ -1427,45 +1572,177 @@ download_alpine_ram_files() {
     info "Selected Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}"
 }
 
-# -------- Offline APK repository helpers --------
+build_local_apk_repo() {
+    local root_main_url root_community_url tmpdir
+    local main_index community_index all_records selected_list
+    declare -A PKG_VER PKG_REPO PKG_DEPS PROVIDE_TO_PKG RESOLVED SEEN
 
-prepare_local_apk_repo() {
-    local repo_dir="$1"
+    mkdir -p "$BOOTSTRAP_APKREPO_MAIN_ABS" "$BOOTSTRAP_APKREPO_COMMUNITY_ABS"
 
-    info "Downloading necessary APK packages for offline use..."
-    mkdir -p "$repo_dir"
+    root_main_url="${ALPINE_REPO_BASE}/main/${ALPINE_NETBOOT_ARCH}"
+    root_community_url="${ALPINE_REPO_BASE}/community/${ALPINE_NETBOOT_ARCH}"
 
-    local packages=(
-        "bash" "curl" "wget" "xz" "qemu-img" "util-linux" "coreutils"
-        "grep" "sed" "gawk" "findutils" "file" "tar" "e2fsprogs" "dosfstools"
-    )
+    tmpdir=$(mktemp -d /tmp/reinstall-apkrepo.XXXXXX)
+    trap 'rm -rf "$tmpdir"' RETURN
 
-    for pkg in "${packages[@]}"; do
-        info "Fetching APK: $pkg"
-        apk fetch --output "$repo_dir" "$pkg" || warn "Failed to fetch APK: $pkg, continuing"
+    main_index="$tmpdir/main.APKINDEX.tar.gz"
+    community_index="$tmpdir/community.APKINDEX.tar.gz"
+
+    info "Downloading Alpine APKINDEX (main)..."
+    http_download "$root_main_url/APKINDEX.tar.gz" "$main_index"
+    info "Downloading Alpine APKINDEX (community)..."
+    http_download "$root_community_url/APKINDEX.tar.gz" "$community_index"
+
+    cp "$main_index" "$BOOTSTRAP_APKREPO_MAIN_ABS/APKINDEX.tar.gz"
+    cp "$community_index" "$BOOTSTRAP_APKREPO_COMMUNITY_ABS/APKINDEX.tar.gz"
+
+    tar -xOzf "$main_index" APKINDEX >"$tmpdir/main.APKINDEX"
+    tar -xOzf "$community_index" APKINDEX >"$tmpdir/community.APKINDEX"
+
+    {
+        sed 's/$/\r/' "$tmpdir/main.APKINDEX"
+        printf '\r\n'
+        sed 's/$/\r/' "$tmpdir/community.APKINDEX"
+        printf '\r\n'
+    } >"$tmpdir/all.APKINDEX.crlf"
+
+    awk '
+        BEGIN { RS="\r\n\r\n"; ORS="" }
+        {
+            gsub(/\r/, "", $0)
+            if (length($0) > 0) {
+                print $0 "\n\034\n"
+            }
+        }
+    ' "$tmpdir/all.APKINDEX.crlf" >"$tmpdir/all.records"
+
+    all_records="$tmpdir/all.records"
+    selected_list="$tmpdir/selected.list"
+
+    while IFS= read -r -d '' rec; do
+        local name="" ver="" deps="" provides="" repo=""
+        name=$(awk -F': ' '$1=="P"{print $2; exit}' <<<"$rec")
+        ver=$(awk -F': ' '$1=="V"{print $2; exit}' <<<"$rec")
+        deps=$(awk -F': ' '$1=="D"{print $2; exit}' <<<"$rec")
+        provides=$(awk -F': ' '$1=="p"{print $2; exit}' <<<"$rec")
+
+        [[ -n "$name" && -n "$ver" ]] || continue
+
+        if grep -q "^P: $name$" "$tmpdir/main.APKINDEX"; then
+            repo="main"
+        else
+            repo="community"
+        fi
+
+        if [[ -z "${PKG_VER[$name]:-}" ]]; then
+            PKG_VER["$name"]="$ver"
+            PKG_REPO["$name"]="$repo"
+            PKG_DEPS["$name"]="$deps"
+        fi
+
+        local p tok norm
+        for tok in $provides; do
+            norm=$(normalize_dep_token "$tok")
+            [[ -n "$norm" ]] || continue
+            if [[ -z "${PROVIDE_TO_PKG[$norm]:-}" ]]; then
+                PROVIDE_TO_PKG["$norm"]="$name"
+            fi
+        done
+    done < <(while IFS= read -r -d $'\034' chunk; do printf '%s\0' "$chunk"; done <"$all_records")
+
+    resolve_pkg() {
+        local want="$1"
+        local tok norm deps dep real
+
+        [[ -n "$want" ]] || return 0
+        [[ -z "${RESOLVED[$want]:-}" ]] || return 0
+        [[ -z "${SEEN[$want]:-}" ]] || return 0
+        SEEN["$want"]=1
+
+        real="$want"
+        if [[ -z "${PKG_VER[$real]:-}" ]]; then
+            real="${PROVIDE_TO_PKG[$want]:-}"
+        fi
+
+        [[ -n "$real" ]] || return 0
+        [[ -n "${PKG_VER[$real]:-}" ]] || return 0
+        [[ -z "${RESOLVED[$real]:-}" ]] || return 0
+
+        RESOLVED["$real"]=1
+        printf '%s\n' "$real" >>"$selected_list"
+
+        deps="${PKG_DEPS[$real]:-}"
+        for tok in $deps; do
+            norm=$(normalize_dep_token "$tok")
+            [[ -n "$norm" ]] || continue
+            case "$norm" in
+                so:*|cmd:*|/bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*)
+                    dep="${PROVIDE_TO_PKG[$norm]:-}"
+                    ;;
+                *)
+                    dep="$norm"
+                    if [[ -z "${PKG_VER[$dep]:-}" ]]; then
+                        dep="${PROVIDE_TO_PKG[$dep]:-}"
+                    fi
+                    ;;
+            esac
+            [[ -n "$dep" ]] || continue
+            resolve_pkg "$dep"
+        done
+    }
+
+    : >"$selected_list"
+    for pkg in "${ALPINE_RUNTIME_PKGS[@]}"; do
+        resolve_pkg "$pkg"
     done
 
-    info "Building local APK repository index..."
-    apk index -o "$repo_dir/APKINDEX.tar.gz" "$repo_dir"/*.apk
+    sort -u "$selected_list" -o "$selected_list"
+
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] || continue
+        local ver repo url dst_dir
+        ver="${PKG_VER[$pkg]}"
+        repo="${PKG_REPO[$pkg]}"
+        if [[ "$repo" == "main" ]]; then
+            url="$root_main_url/${pkg}-${ver}.apk"
+            dst_dir="$BOOTSTRAP_APKREPO_MAIN_ABS"
+        else
+            url="$root_community_url/${pkg}-${ver}.apk"
+            dst_dir="$BOOTSTRAP_APKREPO_COMMUNITY_ABS"
+        fi
+        if [[ -f "$dst_dir/${pkg}-${ver}.apk" ]]; then
+            info "APK already cached: ${pkg}-${ver}.apk"
+            continue
+        fi
+        info "Downloading APK: ${pkg}-${ver}.apk ($repo)"
+        http_download "$url" "$dst_dir/${pkg}-${ver}.apk"
+    done <"$selected_list"
+
+    sync
+    rm -rf "$tmpdir"
+    trap - RETURN
+
+    info "Built local Alpine APK repos under: $BOOTSTRAP_APKREPO_DIR_ABS"
 }
 
-embed_repo_in_apkovl() {
-    local repo_dir="$1"
-    local ovl_dir="$2"
+download_target_image_to_bootstrap() {
+    mkdir -p "$BOOTSTRAP_CACHE_DIR_ABS"
 
-    info "Embedding local APK repository into apkovl..."
-    mkdir -p "$ovl_dir/local_apk_repo"
-    cp -r "$repo_dir"/. "$ovl_dir/local_apk_repo/"
+    precheck_bootstrap_space_for_download "$EFI_MOUNT_POINT" "$IMG_URL" 2
 
-    # Prepend local repo so it is tried first; online repo remains as fallback
-    local repo_file="$ovl_dir/etc/apk/repositories"
-    local existing_repos=""
-    [[ -f "$repo_file" ]] && existing_repos=$(cat "$repo_file")
-    printf 'file:///local_apk_repo\n%s\n' "$existing_repos" >"$repo_file"
+    if [[ -f "$BOOTSTRAP_IMG_ABS" ]]; then
+        info "Target image already cached on bootstrap storage: $BOOTSTRAP_IMG_ABS"
+        return 0
+    fi
+
+    info "Downloading target image to bootstrap storage..."
+    http_download "$IMG_URL" "$BOOTSTRAP_IMG_ABS"
+    sync
+    info "Cached target image: $BOOTSTRAP_IMG_ABS"
 }
 
 build_alpine_apkovl() {
-    local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile local_repo_dir
+    local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
 
     ovl_dir="$tmp/ovl"
@@ -1478,16 +1755,9 @@ build_alpine_apkovl() {
         "$ovl_dir/etc/reinstall"
 
     repofile="$ovl_dir/etc/apk/repositories"
-    cat >"$repofile" <<EOF
-${ALPINE_REPO_BASE}/main
-${ALPINE_REPO_BASE}/community
+    cat >"$repofile" <<'EOF'
+# repositories will be rewritten at runtime to point at bootstrap local repos
 EOF
-
-    # Prepare and embed offline APK repo so Alpine RAM can install packages
-    # without relying solely on network availability.
-    local_repo_dir="$tmp/local_apk_repo"
-    prepare_local_apk_repo "$local_repo_dir"
-    embed_repo_in_apkovl "$local_repo_dir" "$ovl_dir"
 
     markerfile="$ovl_dir/etc/reinstall/vars"
     cat >"$markerfile" <<EOF
@@ -1523,42 +1793,6 @@ export PATH
 }
 # shellcheck disable=SC1091
 . /etc/reinstall/vars
-
-ensure_network() {
-    local dev candidates="" preferred=""
-
-    if ip route 2>/dev/null | grep -q '^default'; then
-        echo "[net] default route already exists"
-        return 0
-    fi
-
-    echo "[net] probing network interfaces"
-
-    for dev in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$' || true); do
-        [ -n "$dev" ] || continue
-        if [ -r "/sys/class/net/$dev/carrier" ] && [ "$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo 0)" = "1" ]; then
-            preferred="$preferred $dev"
-        else
-            candidates="$candidates $dev"
-        fi
-    done
-
-    candidates="$preferred $candidates"
-
-    for dev in $candidates; do
-        echo "[net] trying interface: $dev"
-        ip link set "$dev" up 2>/dev/null || true
-        ip addr flush dev "$dev" 2>/dev/null || true
-        udhcpc -n -q -t 3 -T 3 -i "$dev" 2>/dev/null || true
-        if ip route 2>/dev/null | grep -q '^default'; then
-            echo "[net] DHCP succeeded on $dev"
-            return 0
-        fi
-    done
-
-    echo "[net] no DHCP lease obtained, continuing anyway"
-    return 0
-}
 
 mount_bootstrap() {
     local base_mnt dev
@@ -1633,23 +1867,35 @@ mount_bootstrap() {
     return 1
 }
 
-install_runtime_deps() {
-    echo "[stage] ensure_network"
-    ensure_network
-    echo "[stage] apk update"
-    apk update || true
-    echo "[stage] apk add runtime packages"
-    apk add --no-cache \
+install_runtime_deps_offline() {
+    local bootstrap_prefix="$1"
+    local repo_main="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/apkrepo/main"
+    local repo_community="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/apkrepo/community"
+
+    [ -d "$repo_main" ] || {
+        echo "Local APK repo missing: $repo_main"
+        exit 1
+    }
+    [ -d "$repo_community" ] || {
+        echo "Local APK repo missing: $repo_community"
+        exit 1
+    }
+
+    cat > /etc/apk/repositories <<REPOEOF
+$repo_main
+$repo_community
+REPOEOF
+
+    echo "[stage] apk add (offline local repos)"
+    apk add --no-cache --allow-untrusted \
         bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
-        e2fsprogs dosfstools || true
+        e2fsprogs dosfstools
 }
 
 main() {
     local bootstrap_prefix=""
     echo "[stage] mount_bootstrap"
     mount_bootstrap
-    echo "[stage] install_runtime_deps"
-    install_runtime_deps
 
     if [ -f "/media/bootstrap/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
         bootstrap_prefix=""
@@ -1659,6 +1905,9 @@ main() {
         echo "Plan file not found under /media/bootstrap or /media/bootstrap/boot"
         exit 1
     fi
+
+    echo "[stage] install_runtime_deps_offline"
+    install_runtime_deps_offline "$bootstrap_prefix"
 
     PLAN_FILE="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}"
     SCRIPT_FILE="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/${SCRIPT_NAME}"
@@ -1707,7 +1956,6 @@ command="/usr/local/sbin/reinstall-auto.sh"
 command_background="no"
 depend() {
     need localmount
-    use networking
 }
 start() {
     ebegin "Starting reinstall-auto"
@@ -1849,6 +2097,8 @@ prepare_and_boot_alpine_ram() {
     prepare_alpine_paths
     copy_script_to_efi
     download_alpine_ram_files
+    download_target_image_to_bootstrap
+    build_local_apk_repo
     build_alpine_apkovl
     install_grub_entry_for_alpine
 
@@ -1865,6 +2115,8 @@ prepare_and_boot_alpine_ram_freebsd() {
     prepare_alpine_paths
     copy_script_to_efi
     download_alpine_ram_files
+    download_target_image_to_bootstrap
+    build_local_apk_repo
     build_alpine_apkovl
     build_freebsd_grub_efi
     install_freebsd_bootnext_entry
@@ -1877,6 +2129,26 @@ prepare_and_boot_alpine_ram_freebsd() {
 }
 
 # ----------------- installer execution (download + dd + NoCloud) -----------------
+
+locate_bootstrap_image() {
+    local root_abs="$1"
+    local p1 p2
+
+    p1="$root_abs/$PLAN_DIR_REL/cache/image.qcow2"
+    p2="$root_abs/$PLAN_DIR_REL/cache/image.qcow2.xz"
+
+    if [[ -f "$p1" ]]; then
+        echo "$p1"
+        return 0
+    fi
+
+    if [[ -f "$p2" ]]; then
+        echo "$p2"
+        return 0
+    fi
+
+    return 1
+}
 
 do_install() {
     info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
@@ -1895,20 +2167,24 @@ do_install() {
     IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
     IMG_RAW="$INSTALL_TMPDIR/image.raw"
 
+    local bootstrap_root_abs local_img
+    bootstrap_root_abs="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL"
+    local_img=$(locate_bootstrap_image "$bootstrap_root_abs" || true)
+    [[ -n "$local_img" ]] || error "Offline target image not found on bootstrap storage under $bootstrap_root_abs/$PLAN_DIR_REL/cache"
+
     info "Prechecking temporary space..."
-    precheck_tmp_space_for_image "$IMG_URL"
+    precheck_tmp_space_for_local_image "$local_img"
 
-    info "Downloading image..."
-    http_download "$IMG_URL" "$IMG_QCOW"
-
-    if file "$IMG_QCOW" | grep -qi 'xz compressed'; then
-        info "Detected xz compressed image, decompressing (progress may be shown)..."
-        mv "$IMG_QCOW" "$IMG_QCOW.xz"
+    info "Using offline cached image: $local_img"
+    if file "$local_img" | grep -qi 'xz compressed'; then
+        info "Detected xz compressed cached image, decompressing (progress may be shown)..."
         if command -v pv >/dev/null 2>&1; then
-            xz -dc "$IMG_QCOW.xz" | pv >"$IMG_QCOW"
+            xz -dc "$local_img" | pv >"$IMG_QCOW"
         else
-            xz -dc "$IMG_QCOW.xz" >"$IMG_QCOW"
+            xz -dc "$local_img" >"$IMG_QCOW"
         fi
+    else
+        cp "$local_img" "$IMG_QCOW"
     fi
 
     info "Converting qcow2 to raw with qemu-img (with progress)..."
