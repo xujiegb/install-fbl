@@ -31,6 +31,11 @@
 #     into local bootstrap repos.
 #   - Alpine RAM phase installs runtime deps from local repos only (no network).
 #   - Installer phase reads image from bootstrap storage only (no network).
+#
+# Important compatibility note:
+#   - This script is intended for cloud images that support NoCloud and probe EFI seed data
+#     on first boot. In practice, actual datasource behavior differs across images/releases.
+#   - Validate your target image before relying on unattended deployment.
 
 set -Eeuo pipefail
 export LC_ALL=C
@@ -60,8 +65,10 @@ Usage:
   $SCRIPT_NAME redhat         [--disk /dev/sdX] --img URL [options...]
 
 If --disk is not specified, the script will try to auto-detect the main disk:
-  - On Linux, picks the largest non-removable disk from lsblk.
-  - On FreeBSD, picks the largest non-cd disk from kern.disks using diskinfo.
+  - Prefer the disk that backs the current /, /boot, and EFI mountpoints.
+  - If those agree, that disk is recommended first.
+  - If they cannot be resolved, fall back to the largest non-removable disk.
+  - On host phase, a candidate list is shown and explicit confirmation is required.
 
 Options:
   --disk DISK          Target disk, e.g. /dev/sda, /dev/vda, /dev/nvme0n1, /dev/ada0
@@ -95,6 +102,10 @@ Options:
                          - HTTP(S): download to EFI:/nocloud/frpc.toml
                        cloud-init will add a runcmd section that tries to copy this to /etc/frp
                        and start frpc if available.
+
+  --post-install-hook PATH
+                       Optional explicit post-install hook script to run after image write/injection.
+                       This replaces the old implicit current-directory hook behavior.
 
   --hold 1             Only validate and print planned actions, do not download or write disk.
   --hold 2             Perform dd + NoCloud injection but do NOT reboot.
@@ -319,13 +330,19 @@ hash_password() {
     fi
 
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "$plain" <<'PY'
-import crypt
+        if python3 - <<'PY' >/dev/null 2>&1
+from passlib.hash import sha512_crypt
+print("ok")
+PY
+        then
+            python3 - "$plain" <<'PY'
+from passlib.hash import sha512_crypt
 import sys
 pw = sys.argv[1]
-print(crypt.crypt(pw, crypt.mksalt(crypt.METHOD_SHA512)))
+print(sha512_crypt.hash(pw))
 PY
-        return 0
+            return 0
+        fi
     fi
 
     if command -v perl >/dev/null 2>&1; then
@@ -342,7 +359,7 @@ PY
         return 0
     fi
 
-    error "No password hashing tool found. Install openssl or python3 or perl, or use --ssh-key only."
+    error "No password hashing tool found. Install openssl, or python3 with passlib, or perl, or use --ssh-key only."
 }
 
 detect_os_arch() {
@@ -557,31 +574,218 @@ Missing dependencies: ${missing[*]}"
     fi
 }
 
+# -------- disk detection / confirmation --------
+
+AUTO_DETECTED_DISK=""
+AUTO_DETECT_REASON=""
+DISK_CANDIDATE_LINES=""
+DISK_AUTO_SELECTED=0
+
+linux_source_to_disk() {
+    local src="$1" name pkname typ
+    [[ -n "$src" ]] || return 1
+    [[ -b "$src" ]] || return 1
+
+    if command -v lsblk >/dev/null 2>&1; then
+        pkname=$(lsblk -ndo PKNAME "$src" 2>/dev/null | head -n1 || true)
+        if [[ -n "$pkname" ]]; then
+            echo "/dev/$pkname"
+            return 0
+        fi
+
+        typ=$(lsblk -ndo TYPE "$src" 2>/dev/null | head -n1 || true)
+        name=$(lsblk -ndo NAME "$src" 2>/dev/null | head -n1 || true)
+        if [[ "$typ" == "disk" && -n "$name" ]]; then
+            echo "/dev/$name"
+            return 0
+        fi
+    fi
+
+    case "$src" in
+        /dev/nvme*n*p[0-9]*|/dev/mmcblk*p[0-9]*)
+            echo "${src%p*}"
+            return 0
+            ;;
+        /dev/sd[a-z][0-9]*|/dev/vd[a-z][0-9]*|/dev/xvd[a-z][0-9]*)
+            echo "${src%%[0-9]*}"
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+linux_find_mount_source() {
+    local mnt="$1"
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -n -o SOURCE --target "$mnt" 2>/dev/null | head -n1 || true
+    fi
+}
+
+linux_current_root_disk() {
+    local src
+    src=$(linux_find_mount_source "/")
+    [[ -n "$src" ]] || return 1
+    linux_source_to_disk "$src"
+}
+
+linux_current_boot_disk() {
+    local src
+    src=$(linux_find_mount_source "/boot")
+    [[ -n "$src" ]] || return 1
+    linux_source_to_disk "$src"
+}
+
+linux_current_efi_disk() {
+    local src
+    src=$(linux_find_mount_source "/boot/efi")
+    [[ -n "$src" ]] || return 1
+    linux_source_to_disk "$src"
+}
+
+linux_is_partition_of_disk() {
+    local part="$1" disk="$2" pk
+    [[ -n "$part" && -n "$disk" ]] || return 1
+    [[ -b "$part" && -b "$disk" ]] || return 1
+
+    pk=$(linux_source_to_disk "$part" || true)
+    [[ -n "$pk" && "$pk" == "$disk" ]]
+}
+
+print_disk_candidates() {
+    [[ -n "$DISK_CANDIDATE_LINES" ]] || return 0
+    echo
+    echo "Detected target disk candidates:"
+    printf '%s\n' "$DISK_CANDIDATE_LINES"
+    echo
+    echo "Recommended disk: $AUTO_DETECTED_DISK"
+    echo "Reason: $AUTO_DETECT_REASON"
+    echo
+}
+
+confirm_auto_detected_disk_host() {
+    [[ "$DISK_AUTO_SELECTED" -eq 1 ]] || return 0
+    print_disk_candidates
+    while :; do
+        read -r -p "Use recommended disk '$AUTO_DETECTED_DISK'? [yes/no]: " ans
+        case "$ans" in
+            y|Y|yes|YES|Yes)
+                return 0
+                ;;
+            n|N|no|NO|No)
+                error "Auto-detected disk was not accepted. Please rerun with --disk /dev/XXX"
+                ;;
+            *)
+                echo "Please type yes or no."
+                ;;
+        esac
+    done
+}
+
 auto_detect_disk() {
     info "Auto-detecting target disk..."
+
+    DISK_CANDIDATE_LINES=""
+    AUTO_DETECTED_DISK=""
+    AUTO_DETECT_REASON=""
+    DISK_AUTO_SELECTED=0
 
     if [[ "$OS" == "Linux" ]]; then
         if command -v lsblk >/dev/null 2>&1; then
             local best_name="" best_size=0
+            local root_disk="" boot_disk="" efi_disk=""
+            local preferred=""
+            local idx=0
+            local line name type rm size disk_path marker reason
+
+            root_disk=$(linux_current_root_disk || true)
+            boot_disk=$(linux_current_boot_disk || true)
+            efi_disk=$(linux_current_efi_disk || true)
+
+            if [[ -n "$root_disk" ]]; then
+                info "Current / appears to be on: $root_disk"
+            fi
+            if [[ -n "$boot_disk" ]]; then
+                info "Current /boot appears to be on: $boot_disk"
+            fi
+            if [[ -n "$efi_disk" ]]; then
+                info "Current EFI appears to be on: $efi_disk"
+            fi
+
+            if [[ -n "$root_disk" && -n "$boot_disk" && -n "$efi_disk" &&
+                  "$root_disk" == "$boot_disk" && "$boot_disk" == "$efi_disk" ]]; then
+                preferred="$root_disk"
+                AUTO_DETECT_REASON="current /, /boot, and EFI all resolve to the same disk"
+            elif [[ -n "$root_disk" ]]; then
+                preferred="$root_disk"
+                AUTO_DETECT_REASON="current / resolves to this disk"
+            elif [[ -n "$boot_disk" ]]; then
+                preferred="$boot_disk"
+                AUTO_DETECT_REASON="current /boot resolves to this disk"
+            elif [[ -n "$efi_disk" ]]; then
+                preferred="$efi_disk"
+                AUTO_DETECT_REASON="current EFI resolves to this disk"
+            fi
+
             while read -r name type rm size; do
                 [[ "$type" == "disk" ]] || continue
                 [[ "$rm" == "0" ]] || continue
+
+                disk_path="/dev/$name"
+                marker=""
+                reason=""
+
+                if [[ -n "$root_disk" && "$disk_path" == "$root_disk" ]]; then
+                    marker+=" root"
+                fi
+                if [[ -n "$boot_disk" && "$disk_path" == "$boot_disk" ]]; then
+                    marker+=" boot"
+                fi
+                if [[ -n "$efi_disk" && "$disk_path" == "$efi_disk" ]]; then
+                    marker+=" efi"
+                fi
+                if [[ -n "$preferred" && "$disk_path" == "$preferred" ]]; then
+                    marker+=" recommended"
+                    reason="$AUTO_DETECT_REASON"
+                fi
+
+                idx=$(( idx + 1 ))
+                if [[ -n "$DISK_CANDIDATE_LINES" ]]; then
+                    DISK_CANDIDATE_LINES+=$'\n'
+                fi
+                if [[ -n "$marker" ]]; then
+                    DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes markers:%s%s' "$idx" "$disk_path" "$size" "$marker" "${reason:+ ($reason)}")
+                else
+                    DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes' "$idx" "$disk_path" "$size")
+                fi
+
                 if [[ "$size" -gt "$best_size" ]]; then
                     best_size="$size"
                     best_name="$name"
                 fi
             done < <(lsblk -b -ndo NAME,TYPE,RM,SIZE 2>/dev/null || true)
 
+            if [[ -n "$preferred" ]]; then
+                AUTO_DETECTED_DISK="$preferred"
+                DISK="$preferred"
+                DISK_AUTO_SELECTED=1
+                info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
+                return 0
+            fi
+
             if [[ -n "$best_name" ]]; then
                 DISK="/dev/$best_name"
-                info "Auto-detected disk: $DISK (largest non-removable disk)"
+                AUTO_DETECTED_DISK="$DISK"
+                AUTO_DETECT_REASON="fallback to largest non-removable disk because /, /boot, and EFI could not be resolved confidently"
+                DISK_AUTO_SELECTED=1
+                info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
                 return 0
             fi
         fi
         error "Unable to auto-detect target disk on Linux. Please specify --disk explicitly."
     else
         if command -v sysctl >/dev/null 2>&1; then
-            local disks best_name="" best_size=0 size
+            local disks best_name="" best_size=0 size d idx=0
             disks=$(sysctl -n kern.disks 2>/dev/null || true)
             for d in $disks; do
                 case "$d" in
@@ -593,6 +797,13 @@ auto_detect_disk() {
                     size=0
                 fi
                 [[ -z "$size" ]] && size=0
+
+                idx=$(( idx + 1 ))
+                if [[ -n "$DISK_CANDIDATE_LINES" ]]; then
+                    DISK_CANDIDATE_LINES+=$'\n'
+                fi
+                DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes' "$idx" "/dev/$d" "$size")
+
                 if [[ "$size" -gt "$best_size" ]]; then
                     best_size="$size"
                     best_name="$d"
@@ -600,7 +811,10 @@ auto_detect_disk() {
             done
             if [[ -n "$best_name" ]]; then
                 DISK="/dev/$best_name"
-                info "Auto-detected disk: $DISK (largest non-cd disk via diskinfo)"
+                AUTO_DETECTED_DISK="$DISK"
+                AUTO_DETECT_REASON="fallback to largest non-cd disk via diskinfo"
+                DISK_AUTO_SELECTED=1
+                info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
                 return 0
             fi
         fi
@@ -630,17 +844,20 @@ show_partition_info() {
     echo "-------------------------------------------------------"
 }
 
-# Optional RHEL hook (does not affect initramfs auto-reinstall)
+# Explicit post-install hook only.
 run_rhel_freebsd_hook() {
-    if [[ "$OS" == "Linux" ]] && [[ -f /etc/redhat-release ]]; then
-        if [[ -f "./reinstall-fbl.sh" ]]; then
-            info "RHEL detected, running: bash reinstall-fbl.sh freebsd 14"
-            if ! bash ./reinstall-fbl.sh freebsd 14; then
-                warn "reinstall-fbl.sh freebsd 14 failed, continuing anyway."
-            fi
-        else
-            warn "RHEL detected, but ./reinstall-fbl.sh not found; skipping RHEL hook."
-        fi
+    if [[ -z "${POST_INSTALL_HOOK:-}" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "$POST_INSTALL_HOOK" ]]; then
+        warn "Post-install hook not found: $POST_INSTALL_HOOK"
+        return 0
+    fi
+
+    info "Running explicit post-install hook: $POST_INSTALL_HOOK"
+    if ! bash "$POST_INSTALL_HOOK"; then
+        warn "Post-install hook failed: $POST_INSTALL_HOOK"
     fi
 }
 
@@ -802,43 +1019,49 @@ find_efi_partition() {
     local disk="$1"
 
     if [[ "$OS" == "Linux" ]]; then
+        if command -v findmnt >/dev/null 2>&1; then
+            local mounted_efi_src mounted_efi_disk
+            mounted_efi_src=$(findmnt -n -o SOURCE --target /boot/efi 2>/dev/null | head -n1 || true)
+            if [[ -n "$mounted_efi_src" ]]; then
+                mounted_efi_disk=$(linux_source_to_disk "$mounted_efi_src" || true)
+                if [[ -n "$mounted_efi_disk" && "$mounted_efi_disk" == "$disk" ]]; then
+                    echo "$mounted_efi_src"
+                    return 0
+                fi
+            fi
+        fi
+
         if command -v lsblk >/dev/null 2>&1; then
-            local base part line name type parttype fstype partlabel partflags
-            base="${disk#/dev/}"
+            local line part path pkname parttype fstype partlabel partflags
             while read -r line; do
-                name=$(lsblk_get_kv "$line" "NAME")
-                type=$(lsblk_get_kv "$line" "TYPE")
+                path=$(lsblk_get_kv "$line" "PATH")
+                pkname=$(lsblk_get_kv "$line" "PKNAME")
                 parttype=$(lsblk_get_kv "$line" "PARTTYPE")
                 fstype=$(lsblk_get_kv "$line" "FSTYPE")
                 partlabel=$(lsblk_get_kv "$line" "PARTLABEL")
                 partflags=$(lsblk_get_kv "$line" "PARTFLAGS")
 
-                [[ "$type" == "part" ]] || continue
-                case "$name" in
-                    "$base"*) ;;
-                    *) continue ;;
-                esac
+                [[ -n "$path" && -n "$pkname" ]] || continue
+                [[ "/dev/$pkname" == "$disk" ]] || continue
 
                 if [[ "$parttype" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]]; then
-                    part="/dev/$name"
-                    echo "$part"
+                    echo "$path"
                     return 0
                 fi
-                if echo "$partlabel" | grep -qiE 'efi|esp'; then
-                    part="/dev/$name"
-                    echo "$part"
+                if echo "${partlabel:-}" | grep -qiE 'efi|esp'; then
+                    echo "$path"
                     return 0
                 fi
-                if [[ "$fstype" == "vfat" ]] && echo "$partflags" | grep -qi 'boot,esp'; then
-                    part="/dev/$name"
-                    echo "$part"
+                if [[ "$fstype" == "vfat" ]] && echo "${partflags:-}" | grep -qi 'boot,esp'; then
+                    echo "$path"
                     return 0
                 fi
-            done < <(lsblk -P -o NAME,TYPE,PARTTYPE,FSTYPE,PARTLABEL,PARTFLAGS "$disk" 2>/dev/null || true)
+            done < <(lsblk -P -o PATH,PKNAME,PARTTYPE,FSTYPE,PARTLABEL,PARTFLAGS "$disk" 2>/dev/null || true)
         fi
 
+        warn "Could not confidently identify EFI partition on $disk from lsblk metadata, falling back to partition 1 guess."
         case "$disk" in
-            */nvme*|*/*nvd*)
+            /dev/nvme*|/dev/mmcblk*)
                 echo "${disk}p1"
                 ;;
             *)
@@ -855,6 +1078,7 @@ find_efi_partition() {
                 return 0
             fi
         fi
+        warn "Could not confidently identify EFI partition on $disk from gpart metadata, falling back to partition 1 guess."
         echo "${disk}p1"
     fi
 }
@@ -873,7 +1097,11 @@ EOF
         echo "#cloud-config"
 
         if [[ -n "$PASSWORD_HASH" || -n "$SSH_KEYS_ALL" ]]; then
-            echo "ssh_pwauth: true"
+            if [[ -n "$PASSWORD_HASH" ]]; then
+                echo "ssh_pwauth: true"
+            else
+                echo "ssh_pwauth: false"
+            fi
             echo "disable_root: false"
             echo "users:"
             echo "  - name: root"
@@ -914,19 +1142,28 @@ EOF
         if [[ -n "$SSH_PORT" ]]; then
             cat <<EOF
   - |
-      # Try to change SSH port on Linux / FreeBSD
+      # Try to change SSH port on Linux / FreeBSD more defensively
       if [ -f /etc/ssh/sshd_config ]; then
-        sed -i -e 's/^#Port .*/Port ${SSH_PORT}/' -e 's/^Port .*/Port ${SSH_PORT}/' /etc/ssh/sshd_config 2>/dev/null || \
-        sed -i '' -e 's/^#Port .*/Port ${SSH_PORT}/' -e 's/^Port .*/Port ${SSH_PORT}/' /etc/ssh/sshd_config 2>/dev/null || true
+        awk '
+          /^[[:space:]]*Port[[:space:]]+/ { next }
+          { print }
+          END { print "Port ${SSH_PORT}" }
+        ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
+        cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
+        rm -f /tmp/sshd_config.reinstall || true
       fi
-      service sshd restart 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+      systemctl restart sshd 2>/dev/null || \
+      systemctl restart ssh 2>/dev/null || \
+      service sshd restart 2>/dev/null || \
+      service ssh restart 2>/dev/null || true
 EOF
         fi
 
         if [[ -n "$FRPC_PRESENT" ]]; then
             cat <<'EOF'
   - |
-      # If EFI nocloud contains frpc.toml, copy to /etc/frp and try to start frpc
+      # If EFI nocloud contains frpc.toml, copy to /etc/frp and try to start frpc.
+      # Note: actual mountpoint may vary by distro/image; /boot/efi is the common path only.
       if [ -f /boot/efi/nocloud/frpc.toml ]; then
         mkdir -p /etc/frp
         cp /boot/efi/nocloud/frpc.toml /etc/frp/frpc.toml
@@ -951,6 +1188,7 @@ PLAN_STORAGE_MODE="efi"
 PLAN_PATH_PREFIX_REL=""
 PLAN_EFI_PART_DISK=""
 PLAN_EFI_PART_NUM=""
+POST_INSTALL_HOOK=""
 
 # Alpine RAM preparation
 ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
@@ -981,6 +1219,7 @@ GRUB_MKSTANDALONE_CMD=""
 GRUB_EFI_TARGET=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
+PASSWORD_TO_DISPLAY=""
 
 # Offline bundle paths
 BOOTSTRAP_CACHE_DIR_REL=""
@@ -1030,9 +1269,19 @@ find_efi_for_plan() {
     local os
     os=$(uname -s)
     if [[ "$os" == "Linux" ]]; then
+        if command -v findmnt >/dev/null 2>&1; then
+            local mounted_src
+            mounted_src=$(findmnt -n -o SOURCE --target /boot/efi 2>/dev/null | head -n1 || true)
+            if [[ -n "$mounted_src" && -b "$mounted_src" ]]; then
+                echo "$mounted_src"
+                return 0
+            fi
+        fi
+
         if command -v lsblk >/dev/null 2>&1; then
-            local line name type parttype partlabel partflags fstype
+            local line name type parttype partlabel partflags fstype path
             while read -r line; do
+                path=$(lsblk_get_kv "$line" "PATH")
                 name=$(lsblk_get_kv "$line" "NAME")
                 type=$(lsblk_get_kv "$line" "TYPE")
                 parttype=$(lsblk_get_kv "$line" "PARTTYPE")
@@ -1044,10 +1293,14 @@ find_efi_for_plan() {
                 if [[ "$parttype" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] ||
                    echo "${partlabel:-}" | grep -qiE 'efi|esp' ||
                    { [[ "$fstype" == "vfat" ]] && echo "${partflags:-}" | grep -qi 'boot,esp'; }; then
-                    echo "/dev/$name"
+                    if [[ -n "$path" ]]; then
+                        echo "$path"
+                    else
+                        echo "/dev/$name"
+                    fi
                     return 0
                 fi
-            done < <(lsblk -P -o NAME,TYPE,PARTTYPE,FSTYPE,PARTLABEL,PARTFLAGS 2>/dev/null || true)
+            done < <(lsblk -P -o PATH,NAME,TYPE,PARTTYPE,FSTYPE,PARTLABEL,PARTFLAGS 2>/dev/null || true)
         fi
     elif [[ "$os" == "FreeBSD" ]]; then
         if command -v sysctl >/dev/null 2>&1 && command -v gpart >/dev/null 2>&1; then
@@ -1227,6 +1480,7 @@ save_plan_to_efi() {
         printf 'SSH_PORT=%q\n' "$SSH_PORT"
         printf 'WEB_PORT=%q\n' "$WEB_PORT"
         printf 'FRPC_TOML=%q\n' "$FRPC_TOML"
+        printf 'POST_INSTALL_HOOK=%q\n' "$POST_INSTALL_HOOK"
         printf 'AUTO_PASSWORD=%q\n' "$AUTO_PASSWORD"
         printf 'HOLD=%q\n' "$HOLD"
         printf 'PLAN_EFI_PART=%q\n' "$PLAN_EFI_PART"
@@ -1241,8 +1495,55 @@ save_plan_to_efi() {
         printf 'SCRIPT_NAME=%q\n' "$SCRIPT_NAME"
     } >"$plan_file"
 
+    chmod 0600 "$plan_file" 2>/dev/null || true
     sync
     info "Saved reinstall plan to $plan_file"
+}
+
+linux_bootstrap_scan_devices() {
+    local dev
+    for dev in \
+        /dev/sd[a-z][0-9]* \
+        /dev/vd[a-z][0-9]* \
+        /dev/xvd[a-z][0-9]* \
+        /dev/nvme*n*p[0-9]* \
+        /dev/mmcblk*p[0-9]*; do
+        [[ -e "$dev" ]] || continue
+        printf '%s\n' "$dev"
+    done
+}
+
+try_mount_linux_bootstrap_candidate() {
+    local candidate="$1" mountpoint_path="$2" mode="${3:-auto}"
+
+    info "Trying bootstrap candidate: $candidate"
+
+    if [[ "$mode" == "efi" ]]; then
+        mount "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t vfat "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t msdos "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t msdosfs "$candidate" "$mountpoint_path" 2>/dev/null || true
+    elif [[ "$mode" == "boot" ]]; then
+        mount "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t ext4 "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t xfs "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t btrfs "$candidate" "$mountpoint_path" 2>/dev/null || true
+    else
+        mount "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t ext4 "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t xfs "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t btrfs "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t vfat "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t msdos "$candidate" "$mountpoint_path" 2>/dev/null || \
+        mount -t msdosfs "$candidate" "$mountpoint_path" 2>/dev/null || true
+    fi
+
+    if ! mountpoint -q "$mountpoint_path" 2>/dev/null; then
+        warn "Mount failed for candidate: $candidate"
+        return 1
+    fi
+
+    return 0
 }
 
 load_plan_from_efi() {
@@ -1250,6 +1551,7 @@ load_plan_from_efi() {
     local plan_file=""
     local candidate=""
     local vars_loaded=0
+    local current_efi_src="" current_boot_src=""
 
     if [[ -f /etc/reinstall/vars ]]; then
         # shellcheck disable=SC1091
@@ -1263,67 +1565,93 @@ load_plan_from_efi() {
         # 1) 优先按 /etc/reinstall/vars 提供的信息尝试挂载
         if [[ "$vars_loaded" -eq 1 ]] && ! mountpoint -q "$boot_mnt" 2>/dev/null; then
             if [[ -n "${PLAN_EFI_PART:-}" && -e "${PLAN_EFI_PART}" ]]; then
+                info "Trying bootstrap mount from PLAN_EFI_PART: ${PLAN_EFI_PART}"
                 if [[ "${PLAN_STORAGE_MODE:-efi}" == "efi" ]]; then
-                    mount "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || \
-                    mount -t vfat "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || \
-                    mount -t msdos "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || \
-                    mount -t msdosfs "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || true
+                    try_mount_linux_bootstrap_candidate "${PLAN_EFI_PART}" "$boot_mnt" "efi" || true
                 else
-                    mount "${PLAN_EFI_PART}" "$boot_mnt" 2>/dev/null || true
+                    try_mount_linux_bootstrap_candidate "${PLAN_EFI_PART}" "$boot_mnt" "boot" || true
                 fi
             fi
             if ! mountpoint -q "$boot_mnt" 2>/dev/null && [[ -n "${PLAN_EFI_UUID:-}" ]]; then
                 candidate="$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)"
                 if [[ -n "$candidate" && -e "$candidate" ]]; then
+                    info "Trying bootstrap mount from PLAN_EFI_UUID: ${PLAN_EFI_UUID} -> ${candidate}"
                     if [[ "${PLAN_STORAGE_MODE:-efi}" == "efi" ]]; then
-                        mount "$candidate" "$boot_mnt" 2>/dev/null || \
-                        mount -t vfat "$candidate" "$boot_mnt" 2>/dev/null || \
-                        mount -t msdos "$candidate" "$boot_mnt" 2>/dev/null || \
-                        mount -t msdosfs "$candidate" "$boot_mnt" 2>/dev/null || true
+                        try_mount_linux_bootstrap_candidate "$candidate" "$boot_mnt" "efi" || true
                     else
-                        mount "$candidate" "$boot_mnt" 2>/dev/null || true
+                        try_mount_linux_bootstrap_candidate "$candidate" "$boot_mnt" "boot" || true
                     fi
                 fi
             fi
         fi
 
-        # 2) 如果还没挂上，就扫描常见块设备，同时探测两种路径：
-        #    /REINSTALL/plan.env
-        #    /boot/REINSTALL/plan.env
+        # 2) 当前系统已挂载的 EFI/boot 优先
         if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
-            for candidate in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p* /dev/mapper/*; do
-                [[ -e "$candidate" ]] || continue
-
-                mount "$candidate" "$boot_mnt" 2>/dev/null || \
-                mount -t ext4 "$candidate" "$boot_mnt" 2>/dev/null || \
-                mount -t xfs "$candidate" "$boot_mnt" 2>/dev/null || \
-                mount -t btrfs "$candidate" "$boot_mnt" 2>/dev/null || \
-                mount -t vfat "$candidate" "$boot_mnt" 2>/dev/null || \
-                mount -t msdos "$candidate" "$boot_mnt" 2>/dev/null || \
-                mount -t msdosfs "$candidate" "$boot_mnt" 2>/dev/null || true
-
-                if mountpoint -q "$boot_mnt" 2>/dev/null; then
-                    if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                        PLAN_STORAGE_MODE="boot"
-                        PLAN_PATH_PREFIX_REL=""
-                        plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-                        EFI_MOUNT_POINT="$boot_mnt"
-                        PLAN_EFI_PART="$candidate"
-                        break
-                    elif [[ -f "$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                        PLAN_STORAGE_MODE="boot"
-                        PLAN_PATH_PREFIX_REL="/boot"
-                        plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-                        EFI_MOUNT_POINT="$boot_mnt"
-                        PLAN_EFI_PART="$candidate"
-                        break
-                    fi
-                    umount "$boot_mnt" 2>/dev/null || true
-                fi
-            done
+            current_efi_src=$(findmnt -n -o SOURCE --target /boot/efi 2>/dev/null | head -n1 || true)
+            if [[ -n "$current_efi_src" && -e "$current_efi_src" ]]; then
+                info "Trying currently mounted EFI source: $current_efi_src"
+                try_mount_linux_bootstrap_candidate "$current_efi_src" "$boot_mnt" "efi" || true
+            fi
         fi
 
-        # 3) 如果已挂载但 plan_file 还没定，再查一次
+        if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+            current_boot_src=$(findmnt -n -o SOURCE --target /boot 2>/dev/null | head -n1 || true)
+            if [[ -n "$current_boot_src" && -e "$current_boot_src" ]]; then
+                info "Trying currently mounted /boot source: $current_boot_src"
+                try_mount_linux_bootstrap_candidate "$current_boot_src" "$boot_mnt" "boot" || true
+            fi
+        fi
+
+        if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+            current_boot_src=$(findmnt -n -o SOURCE --target / 2>/dev/null | head -n1 || true)
+            if [[ -n "$current_boot_src" && -e "$current_boot_src" ]]; then
+                info "Trying current root source as /boot fallback: $current_boot_src"
+                try_mount_linux_bootstrap_candidate "$current_boot_src" "$boot_mnt" "boot" || true
+            fi
+        fi
+
+        # 3) 如果已挂载，先找 plan
+        if [[ -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
+            if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                PLAN_STORAGE_MODE="boot"
+                PLAN_PATH_PREFIX_REL=""
+                plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+                EFI_MOUNT_POINT="$boot_mnt"
+            elif [[ -f "$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                PLAN_STORAGE_MODE="boot"
+                PLAN_PATH_PREFIX_REL="/boot"
+                plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+                EFI_MOUNT_POINT="$boot_mnt"
+            elif [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+            fi
+        fi
+
+        # 4) 最后才做白名单块设备扫描
+        if [[ -z "$plan_file" ]] && ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+            info "Bootstrap plan not found via explicit hints or current mounts; falling back to conservative device scan."
+            while read -r candidate; do
+                try_mount_linux_bootstrap_candidate "$candidate" "$boot_mnt" "auto" || continue
+
+                if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                    PLAN_STORAGE_MODE="boot"
+                    PLAN_PATH_PREFIX_REL=""
+                    plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+                    EFI_MOUNT_POINT="$boot_mnt"
+                    PLAN_EFI_PART="$candidate"
+                    break
+                elif [[ -f "$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
+                    PLAN_STORAGE_MODE="boot"
+                    PLAN_PATH_PREFIX_REL="/boot"
+                    plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+                    EFI_MOUNT_POINT="$boot_mnt"
+                    PLAN_EFI_PART="$candidate"
+                    break
+                fi
+                umount "$boot_mnt" 2>/dev/null || true
+            done < <(linux_bootstrap_scan_devices)
+        fi
+
         if [[ -z "$plan_file" && -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
             if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
                 PLAN_STORAGE_MODE="boot"
@@ -1574,7 +1902,7 @@ download_alpine_ram_files() {
 
 build_local_apk_repo() {
     local root_main_url root_community_url tmpdir
-    local main_index community_index all_records selected_list
+    local main_index community_index selected_list
     declare -A PKG_VER PKG_REPO PKG_DEPS PROVIDE_TO_PKG RESOLVED SEEN
 
     mkdir -p "$BOOTSTRAP_APKREPO_MAIN_ABS" "$BOOTSTRAP_APKREPO_COMMUNITY_ABS"
@@ -1599,56 +1927,40 @@ build_local_apk_repo() {
     tar -xOzf "$main_index" APKINDEX >"$tmpdir/main.APKINDEX"
     tar -xOzf "$community_index" APKINDEX >"$tmpdir/community.APKINDEX"
 
-    {
-        sed 's/$/\r/' "$tmpdir/main.APKINDEX"
-        printf '\r\n'
-        sed 's/$/\r/' "$tmpdir/community.APKINDEX"
-        printf '\r\n'
-    } >"$tmpdir/all.APKINDEX.crlf"
+    parse_apkindex_file() {
+        local file="$1" repo="$2"
+        local rec name ver deps provides tok norm
 
-    awk '
-        BEGIN { RS="\r\n\r\n"; ORS="" }
-        {
-            gsub(/\r/, "", $0)
-            if (length($0) > 0) {
-                print $0 "\n\034\n"
-            }
-        }
-    ' "$tmpdir/all.APKINDEX.crlf" >"$tmpdir/all.records"
+        while IFS= read -r -d '' rec; do
+            name=$(awk -F': ' '$1=="P"{print $2; exit}' <<<"$rec")
+            ver=$(awk -F': ' '$1=="V"{print $2; exit}' <<<"$rec")
+            deps=$(awk -F': ' '$1=="D"{print $2; exit}' <<<"$rec")
+            provides=$(awk -F': ' '$1=="p"{print $2; exit}' <<<"$rec")
 
-    all_records="$tmpdir/all.records"
-    selected_list="$tmpdir/selected.list"
+            [[ -n "$name" && -n "$ver" ]] || continue
 
-    while IFS= read -r -d '' rec; do
-        local name="" ver="" deps="" provides="" repo=""
-        name=$(awk -F': ' '$1=="P"{print $2; exit}' <<<"$rec")
-        ver=$(awk -F': ' '$1=="V"{print $2; exit}' <<<"$rec")
-        deps=$(awk -F': ' '$1=="D"{print $2; exit}' <<<"$rec")
-        provides=$(awk -F': ' '$1=="p"{print $2; exit}' <<<"$rec")
-
-        [[ -n "$name" && -n "$ver" ]] || continue
-
-        if grep -q "^P: $name$" "$tmpdir/main.APKINDEX"; then
-            repo="main"
-        else
-            repo="community"
-        fi
-
-        if [[ -z "${PKG_VER[$name]:-}" ]]; then
-            PKG_VER["$name"]="$ver"
-            PKG_REPO["$name"]="$repo"
-            PKG_DEPS["$name"]="$deps"
-        fi
-
-        local p tok norm
-        for tok in $provides; do
-            norm=$(normalize_dep_token "$tok")
-            [[ -n "$norm" ]] || continue
-            if [[ -z "${PROVIDE_TO_PKG[$norm]:-}" ]]; then
-                PROVIDE_TO_PKG["$norm"]="$name"
+            if [[ -z "${PKG_VER[$name]:-}" ]]; then
+                PKG_VER["$name"]="$ver"
+                PKG_REPO["$name"]="$repo"
+                PKG_DEPS["$name"]="$deps"
             fi
-        done
-    done < <(while IFS= read -r -d $'\034' chunk; do printf '%s\0' "$chunk"; done <"$all_records")
+
+            for tok in $provides; do
+                norm=$(normalize_dep_token "$tok")
+                [[ -n "$norm" ]] || continue
+                if [[ -z "${PROVIDE_TO_PKG[$norm]:-}" ]]; then
+                    PROVIDE_TO_PKG["$norm"]="$name"
+                fi
+            done
+        done < <(
+            awk 'BEGIN { RS=""; ORS="" } { if (length($0) > 0) printf "%s\0", $0 }' "$file"
+        )
+    }
+
+    parse_apkindex_file "$tmpdir/main.APKINDEX" "main"
+    parse_apkindex_file "$tmpdir/community.APKINDEX" "community"
+
+    selected_list="$tmpdir/selected.list"
 
     resolve_pkg() {
         local want="$1"
@@ -1806,6 +2118,7 @@ mount_bootstrap() {
 
     if [ "${PLAN_STORAGE_MODE:-efi}" = "efi" ]; then
         if [ -n "${PLAN_EFI_PART:-}" ] && [ -e "${PLAN_EFI_PART}" ]; then
+            echo "Trying bootstrap mount from PLAN_EFI_PART: ${PLAN_EFI_PART}"
             mount "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || \
             mount -t vfat "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || \
             mount -t msdos "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || \
@@ -1813,6 +2126,7 @@ mount_bootstrap() {
         fi
     else
         if [ -n "${PLAN_EFI_PART:-}" ] && [ -e "${PLAN_EFI_PART}" ]; then
+            echo "Trying bootstrap mount from PLAN_EFI_PART: ${PLAN_EFI_PART}"
             mount "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || true
         fi
     fi
@@ -1824,6 +2138,7 @@ mount_bootstrap() {
     if [ -n "${PLAN_EFI_UUID:-}" ]; then
         dev="$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)"
         if [ -n "$dev" ] && [ -e "$dev" ]; then
+            echo "Trying bootstrap mount from PLAN_EFI_UUID: ${PLAN_EFI_UUID} -> ${dev}"
             if [ "${PLAN_STORAGE_MODE:-efi}" = "efi" ]; then
                 mount "$dev" "$base_mnt" 2>/dev/null || \
                 mount -t vfat "$dev" "$base_mnt" 2>/dev/null || \
@@ -1839,9 +2154,11 @@ mount_bootstrap() {
         return 0
     fi
 
+    echo "Falling back to conservative block-device scan for bootstrap storage"
     if [ "${PLAN_STORAGE_MODE:-efi}" = "efi" ]; then
-        for dev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p*; do
+        for dev in /dev/sd[a-z][0-9]* /dev/vd[a-z][0-9]* /dev/xvd[a-z][0-9]* /dev/nvme*n*p[0-9]* /dev/mmcblk*p[0-9]*; do
             [ -e "$dev" ] || continue
+            echo "Trying candidate: $dev"
             mount "$dev" "$base_mnt" 2>/dev/null || \
             mount -t vfat "$dev" "$base_mnt" 2>/dev/null || \
             mount -t msdos "$dev" "$base_mnt" 2>/dev/null || \
@@ -1852,8 +2169,9 @@ mount_bootstrap() {
             umount "$base_mnt" 2>/dev/null || true
         done
     else
-        for dev in /dev/sd* /dev/vd* /dev/xvd* /dev/nvme*n* /dev/mmcblk*p* /dev/mapper/*; do
+        for dev in /dev/sd[a-z][0-9]* /dev/vd[a-z][0-9]* /dev/xvd[a-z][0-9]* /dev/nvme*n*p[0-9]* /dev/mmcblk*p[0-9]*; do
             [ -e "$dev" ] || continue
+            echo "Trying candidate: $dev"
             mount "$dev" "$base_mnt" 2>/dev/null || true
             if [ -f "$base_mnt/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ] || \
                [ -f "$base_mnt/boot/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
@@ -2276,6 +2594,7 @@ do_install() {
         umount "$MNT_EFI" || true
     else
         warn "EFI could not be mounted; target system can still boot, but cloud-init configuration may not be applied."
+        warn "This script assumes a cloud image that supports NoCloud via EFI seed on first boot."
     fi
 
     info "Image write and cloud-init NoCloud injection completed."
@@ -2356,6 +2675,7 @@ if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" || "$ENV_MODE" == "a
     SSH_PORT=""
     WEB_PORT=""
     FRPC_TOML=""
+    POST_INSTALL_HOOK=""
     FRPC_PRESENT=""
     HOLD="0"
     AUTO_PASSWORD=0
@@ -2416,6 +2736,7 @@ SSH_KEYS_ALL=""
 SSH_PORT=""
 WEB_PORT=""
 FRPC_TOML=""
+POST_INSTALL_HOOK=""
 FRPC_PRESENT=""
 HOLD="0"
 AUTO_PASSWORD=0
@@ -2486,6 +2807,11 @@ while [[ $# -gt 0 ]]; do
             [[ -n "${1:-}" ]] || error "Need value for --frpc-toml"
             FRPC_TOML="$1"
             ;;
+        --post-install-hook)
+            shift
+            [[ -n "${1:-}" ]] || error "Need value for --post-install-hook"
+            POST_INSTALL_HOOK="$1"
+            ;;
         --hold)
             shift
             [[ -n "${1:-}" ]] || error "Need value for --hold"
@@ -2508,6 +2834,7 @@ if [[ -n "$DISK" ]]; then
     fi
 else
     auto_detect_disk
+    confirm_auto_detected_disk_host
 fi
 
 if [[ ! -b "$DISK" ]] && [[ ! -c "$DISK" ]]; then
@@ -2529,6 +2856,7 @@ if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
             if [[ -z "$PASSWORD" ]]; then
                 error "Failed to generate random password."
             fi
+            PASSWORD_TO_DISPLAY="$PASSWORD"
             AUTO_PASSWORD=1
             info "A random root password will be generated and shown before reboot."
             break
@@ -2549,6 +2877,10 @@ fi
 
 if [[ -n "$PASSWORD" ]]; then
     PASSWORD_HASH=$(hash_password "$PASSWORD")
+    if [[ "$AUTO_PASSWORD" -ne 1 ]]; then
+        unset PASSWORD
+        PASSWORD=""
+    fi
 fi
 
 if [[ -z "$TARGET_VER" ]]; then
@@ -2584,21 +2916,34 @@ save_plan_to_efi
 echo
 echo "==================== Host stage summary ====================="
 echo "Disk device:  $DISK"
+if [[ "$DISK_AUTO_SELECTED" -eq 1 ]]; then
+    echo "Disk reason:  $AUTO_DETECT_REASON"
+fi
 echo "Target OS:    $TARGET_OS ${TARGET_VER:-"(no version)"}"
 echo "Username:     root"
 echo "SSH port:     ${SSH_PORT:-22}"
 if [[ -n "$PASSWORD_HASH" ]]; then
     if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
         echo "Generated root password:"
-        echo "  $PASSWORD"
+        echo "  $PASSWORD_TO_DISPLAY"
     else
         echo "Root password: provided by user (plain text will NOT be saved to EFI)"
     fi
 else
     echo "Root password: (not set; SSH key login only)"
 fi
+if [[ -n "$POST_INSTALL_HOOK" ]]; then
+    echo "Post-install hook: $POST_INSTALL_HOOK"
+fi
 echo "============================================================"
 echo
+
+if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
+    unset PASSWORD
+    PASSWORD=""
+fi
+unset PASSWORD_TO_DISPLAY
+PASSWORD_TO_DISPLAY=""
 
 if [[ "$OS" == "Linux" ]]; then
     prepare_and_boot_alpine_ram
