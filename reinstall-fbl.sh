@@ -1833,7 +1833,7 @@ mount_bootstrap() {
                 mount "$dev" "$base_mnt" 2>/dev/null || true
             fi
         fi
-    }
+    fi
 
     if mountpoint -q "$base_mnt" 2>/dev/null; then
         return 0
