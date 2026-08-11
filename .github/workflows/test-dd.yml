@@ -111,7 +111,6 @@ jobs:
           set firmware_args "${{ matrix.firmware_args }}"
           set arch "${{ matrix.arch }}"
 
-          # 启动 QEMU 虚拟机
           eval spawn $qemu_bin \
             $qemu_args \
             $firmware_args \
@@ -156,19 +155,31 @@ jobs:
 
           expect -re "__CI_PROMPT__# "
 
-          # 2. 下载并执行 reinstall-fbl.sh
-          puts "\n===> Starting reinstall-fbl.sh script execution...\n"
-          
+          # 2. 下载 reinstall-fbl.sh
+          puts "\n===> Downloading reinstall-fbl.sh...\n"
           send "curl -sSL https://raw.githubusercontent.com/xujiegb/install-fbl/main/reinstall-fbl.sh -o reinstall-fbl.sh && chmod +x reinstall-fbl.sh\r"
           expect -re "__CI_PROMPT__# "
 
-          # 触发 DD 重装流程
-          send "bash reinstall-fbl.sh -p 'NewSystemPass123!'\r"
+          # 先打印 help 确认支持的参数（方便调试）
+          send "./reinstall-fbl.sh --help || true\r"
+          expect -re "__CI_PROMPT__# "
 
-          # 3. 捕获重装与自动重启流程
+          # 3. 触发 DD 重装流程（使用完整参数 --password）
+          puts "\n===> Executing reinstall-fbl.sh...\n"
+          send "bash reinstall-fbl.sh --password 'NewSystemPass123!'\r"
+
+          # 4. 捕获重装与自动重启流程（增加错误拦截）
           expect {
             -re "(Rebooting|Restarting system|reboot: Restarting system|System shutdown)" {
               puts "\n===> System is rebooting after DD...\n"
+            }
+            "ERROR:" {
+              puts "\n===> ERROR detected in reinstall-fbl.sh execution!\n"
+              exit 1
+            }
+            -re "__CI_PROMPT__# " {
+              puts "\n===> reinstall-fbl.sh returned to shell prompt without rebooting!\n"
+              exit 1
             }
             timeout {
               puts "ERROR: Script failed to trigger reboot"
@@ -176,7 +187,7 @@ jobs:
             }
           }
 
-          # 4. 等待重装后的新系统完成 Boot 过程
+          # 5. 等待重装后的新系统完成 Boot 过程
           expect {
             -re "(login:|Password:)" {
               puts "\n===> New system booted successfully after DD!\n"
@@ -209,11 +220,8 @@ jobs:
 
           expect -re "__NEW_SYSTEM__# "
 
-          # 5. 校验新系统基本信息
+          # 6. 校验新系统基本信息
           send "uname -a; cat /etc/os-release\r"
-          expect -re "__NEW_SYSTEM__# "
-
-          send "ip a || ifconfig\r"
           expect -re "__NEW_SYSTEM__# "
 
           puts "\n===> DD Test Completed Successfully!\n"
