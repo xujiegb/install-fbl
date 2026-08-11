@@ -1,0 +1,224 @@
+name: QEMU Full Auto DD System Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-dd-qemu:
+    name: Test DD on ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            qemu_bin: qemu-system-x86_64
+            qemu_args: "-accel kvm -cpu host -m 4096 -smp 4"
+            qcow2_url: https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2
+            qcow2_file: rocky10-x86_64.qcow2
+            firmware_args: "" # Standard PC / Q35 BIOS or OVMF
+          
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            qemu_bin: qemu-system-aarch64
+            # 如果在 ARM 宿主机上可使用 kvm，在 x86 宿主机上回退到 tcg
+            qemu_args: "-machine virt -accel kvm -accel tcg,thread=multi -cpu max -m 4096 -smp 4"
+            qcow2_url: https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2
+            qcow2_file: rocky10-aarch64.qcow2
+            firmware_args: "-drive if=pflash,format=raw,unit=0,file=/usr/share/AAVMF/AAVMF_CODE.fd,readonly=on"
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install QEMU & Testing Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-system-arm \
+            qemu-utils \
+            qemu-efi-aarch64 \
+            expect \
+            wget \
+            curl \
+            cloud-image-utils \
+            genisoimage
+
+      - name: Download Rocky Linux 10 QCOW2 Image
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Downloading ${{ matrix.qcow2_url }}..."
+          wget -q -O "${{ matrix.qcow2_file }}" "${{ matrix.qcow2_url }}"
+          
+          # 适当扩容 qcow2 镜像，确保有足够的空间供 DD 和新系统解压
+          qemu-img resize "${{ matrix.qcow2_file }}" 20G
+          qemu-img info "${{ matrix.qcow2_file }}"
+
+      - name: Create Cloud-Init Seed ISO for Initial Login
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 生成 user-data，配置默认密码并允许 root 登录与串口终端
+          cat << 'EOF' > user-data
+          #cloud-config
+          user: root
+          password: "TestPassword123!"
+          chpasswd: { expire: False }
+          ssh_pwauth: True
+          disable_root: False
+          bootcmd:
+            - systemctl mask serial-getty@ttyS0.service || true
+          EOF
+
+          cat << 'EOF' > meta-data
+          instance-id: i-dd-test-01
+          local-hostname: dd-test-node
+          EOF
+
+          # 打包为 Cloud-Init 的 NoCloud 驱动盘
+          cloud-localds seed.iso user-data meta-data
+
+      - name: Run DD Test in QEMU via Expect
+        shell: bash
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+
+          expect << 'EOF'
+          log_user 1
+          set timeout 1800
+          
+          set qemu_bin "${{ matrix.qemu_bin }}"
+          set qemu_args "${{ matrix.qemu_args }}"
+          set qcow2 "${{ matrix.qcow2_file }}"
+          set firmware_args "${{ matrix.firmware_args }}"
+          set arch "${{ matrix.arch }}"
+
+          # 启动 QEMU 虚拟机
+          # 绑定 console/ttyS0 到 stdio
+          if {$arch == "aarch64"} {
+              set serial_cmd "-serial stdio"
+          } else {
+              set serial_cmd "-serial stdio -append console=ttyS0,115200"
+          }
+
+          eval spawn $qemu_bin \
+            $qemu_args \
+            $firmware_args \
+            -drive if=virtio,file=$qcow2,format=qcow2 \
+            -drive if=virtio,file=seed.iso,format=raw \
+            -netdev user,id=net0 \
+            -device virtio-net-pci,netdev=net0 \
+            -display none \
+            -serial stdio \
+            -monitor none
+
+          # 1. 等待首次 Boot 完成并登录
+          expect {
+            -re "(login:|dd-test-node login:)" {
+              send "root\r"
+            }
+            timeout {
+              puts "ERROR: Initial boot timeout"
+              exit 1
+            }
+          }
+
+          expect {
+            -re "Password:" {
+              send "TestPassword123!\r"
+            }
+            timeout {
+              puts "ERROR: Password prompt timeout"
+              exit 1
+            }
+          }
+
+          expect {
+            -re "(#|\\$)" {
+              send "export TERM=dumb; export PS1='__CI_PROMPT__# '\r"
+            }
+            timeout {
+              puts "ERROR: Shell prompt timeout"
+              exit 1
+            }
+          }
+
+          expect -re "__CI_PROMPT__# "
+
+          # 2. 下载并执行 reinstall-fbl.sh
+          puts "\n===> Starting reinstall-fbl.sh script execution...\n"
+          
+          # 设置新系统的 Root 密码为 NewSystemPass123!
+          send "curl -sSL https://raw.githubusercontent.com/xujiegb/install-fbl/main/reinstall-fbl.sh -o reinstall-fbl.sh && chmod +x reinstall-fbl.sh\r"
+          expect -re "__CI_PROMPT__# "
+
+          # 触发 DD 重装流程 (可以根据脚本实际参数调整，这里示例传入密码和自动重启)
+          send "bash reinstall-fbl.sh -p 'NewSystemPass123!'\r"
+
+          # 3. 捕获重装与自动重启流程
+          # Expect 需要监听 reboot 或系统关机/重启日志，重新建立连接
+          expect {
+            -re "(Rebooting|Restarting system|reboot: Restarting system)" {
+              puts "\n===> System is rebooting after DD...\n"
+            }
+            timeout {
+              puts "ERROR: Script failed to trigger reboot"
+              exit 1
+            }
+          }
+
+          # 4. 等待重装后的新系统完成 Boot 过程
+          expect {
+            -re "(login:|Password:)" {
+              puts "\n===> New system booted successfully after DD!\n"
+              send "root\r"
+            }
+            timeout {
+              puts "ERROR: New system failed to boot after DD"
+              exit 1
+            }
+          }
+
+          expect {
+            -re "Password:" {
+              send "NewSystemPass123!\r"
+            }
+            timeout {
+              send "\r"
+            }
+          }
+
+          expect {
+            -re "(#|\\$)" {
+              send "export TERM=dumb; export PS1='__NEW_SYSTEM__# '\r"
+            }
+            timeout {
+              puts "ERROR: Failed to get shell prompt on new system"
+              exit 1
+            }
+          }
+
+          expect -re "__NEW_SYSTEM__# "
+
+          # 5. 校验新系统基本信息
+          send "uname -a; cat /etc/os-release\r"
+          expect -re "__NEW_SYSTEM__# "
+
+          send "ip a || ifconfig\r"
+          expect -re "__NEW_SYSTEM__# "
+
+          puts "\n===> DD Test Completed Successfully!\n"
+          send "poweroff\r"
+          expect eof
+          EOF
