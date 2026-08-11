@@ -125,7 +125,7 @@ jobs:
 
           # 1. 等待首次 Boot 完成并登录
           expect {
-            -re "(login:|dd-test-node login:)" {
+            -re {(login:|dd-test-node login:)} {
               send "root\r"
             }
             timeout {
@@ -135,7 +135,7 @@ jobs:
           }
 
           expect {
-            -re "Password:" {
+            -re {Password:} {
               send "TestPassword123!\r"
             }
             timeout {
@@ -145,7 +145,7 @@ jobs:
           }
 
           expect {
-            -re "(#|\\$)" {
+            -re {(#|\$)} {
               send "export TERM=dumb; export PS1='__CI_PROMPT__# '\r"
             }
             timeout {
@@ -154,37 +154,37 @@ jobs:
             }
           }
 
-          expect -re "__CI_PROMPT__# "
+          expect -re {__CI_PROMPT__# }
 
           # 2. 下载 reinstall-fbl.sh
           puts "\n===> Downloading reinstall-fbl.sh...\n"
           send "curl -sSL https://raw.githubusercontent.com/xujiegb/install-fbl/main/reinstall-fbl.sh -o reinstall-fbl.sh && chmod +x reinstall-fbl.sh\r"
-          expect -re "__CI_PROMPT__# "
+          expect -re {__CI_PROMPT__# }
 
           # 3. 触发 DD 重装流程
           puts "\n===> Executing reinstall-fbl.sh...\n"
           send "bash reinstall-fbl.sh --password 'NewSystemPass123!'\r"
 
-          # 4. 捕获交互确认提示（使用 exp_continue）并等待重启
+          # 4. 捕获交互确认提示（使用 {} 避免 TCL 误解析 []）并等待重启
           expect {
-            -re "Use recommended disk.*\\? \\[yes/no\\]:" {
+            -re {Use recommended disk.*\? \[yes/no\]:} {
               puts "\n===> Auto-responding 'yes' to disk confirmation prompt...\n"
               send "yes\r"
               exp_continue
             }
-            -re "(Are you sure|Continue|\[y/N\]|\[yes/no\])" {
+            -re {(Are you sure|Continue|\[y/N\]|\[yes/no\])} {
               puts "\n===> Auto-responding 'yes' to generic prompt...\n"
               send "yes\r"
               exp_continue
             }
-            -re "(Rebooting|Restarting system|reboot: Restarting system|System shutdown)" {
+            -re {(Rebooting|Restarting system|reboot: Restarting system|System shutdown)} {
               puts "\n===> System is rebooting after DD...\n"
             }
             "ERROR:" {
               puts "\n===> ERROR detected in reinstall-fbl.sh execution!\n"
               exit 1
             }
-            -re "__CI_PROMPT__# " {
+            -re {__CI_PROMPT__# } {
               puts "\n===> Script returned to shell prompt without rebooting!\n"
               exit 1
             }
@@ -196,7 +196,7 @@ jobs:
 
           # 5. 等待重装后的新系统完成 Boot 过程并登录
           expect {
-            -re "(login:|Password:)" {
+            -re {(login:|Password:)} {
               puts "\n===> New system booted successfully after DD!\n"
               send "root\r"
             }
@@ -207,7 +207,7 @@ jobs:
           }
 
           expect {
-            -re "Password:" {
+            -re {Password:} {
               send "NewSystemPass123!\r"
             }
             timeout {
@@ -216,7 +216,7 @@ jobs:
           }
 
           expect {
-            -re "(#|\\$)" {
+            -re {(#|\$)} {
               send "export TERM=dumb; export PS1='__NEW_SYSTEM__# '\r"
             }
             timeout {
@@ -225,11 +225,11 @@ jobs:
             }
           }
 
-          expect -re "__NEW_SYSTEM__# "
+          expect -re {__NEW_SYSTEM__# }
 
           # 6. 校验新系统基本信息
           send "uname -a; cat /etc/os-release\r"
-          expect -re "__NEW_SYSTEM__# "
+          expect -re {__NEW_SYSTEM__# }
 
           puts "\n===> DD Test Completed Successfully!\n"
           send "poweroff\r"
