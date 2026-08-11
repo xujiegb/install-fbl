@@ -88,6 +88,13 @@ jobs:
           # 打包为 Cloud-Init 的 NoCloud 驱动盘
           cloud-localds seed.iso user-data meta-data
 
+      - name: Setup KVM Permissions
+        shell: bash
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+          fi
+
       - name: Run DD Test in QEMU via Expect
         shell: bash
         timeout-minutes: 60
@@ -105,13 +112,6 @@ jobs:
           set arch "${{ matrix.arch }}"
 
           # 启动 QEMU 虚拟机
-          # 绑定 console/ttyS0 到 stdio
-          if {$arch == "aarch64"} {
-              set serial_cmd "-serial stdio"
-          } else {
-              set serial_cmd "-serial stdio -append console=ttyS0,115200"
-          }
-
           eval spawn $qemu_bin \
             $qemu_args \
             $firmware_args \
@@ -159,17 +159,15 @@ jobs:
           # 2. 下载并执行 reinstall-fbl.sh
           puts "\n===> Starting reinstall-fbl.sh script execution...\n"
           
-          # 设置新系统的 Root 密码为 NewSystemPass123!
           send "curl -sSL https://raw.githubusercontent.com/xujiegb/install-fbl/main/reinstall-fbl.sh -o reinstall-fbl.sh && chmod +x reinstall-fbl.sh\r"
           expect -re "__CI_PROMPT__# "
 
-          # 触发 DD 重装流程 (可以根据脚本实际参数调整，这里示例传入密码和自动重启)
+          # 触发 DD 重装流程
           send "bash reinstall-fbl.sh -p 'NewSystemPass123!'\r"
 
           # 3. 捕获重装与自动重启流程
-          # Expect 需要监听 reboot 或系统关机/重启日志，重新建立连接
           expect {
-            -re "(Rebooting|Restarting system|reboot: Restarting system)" {
+            -re "(Rebooting|Restarting system|reboot: Restarting system|System shutdown)" {
               puts "\n===> System is rebooting after DD...\n"
             }
             timeout {
