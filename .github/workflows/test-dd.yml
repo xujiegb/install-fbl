@@ -27,7 +27,7 @@ jobs:
 
           - arch: aarch64
             # 注意：Ubuntu 26.04 的 arm64 镜像标签是 ubuntu-26.04-arm，不是 ubuntu-26.04（那是 x64 镜像）
-            runner: ubuntu-26.04-arm
+            runner: ubuntu-24.04-arm
             qemu_bin: qemu-system-aarch64
             # 必须加上 gic-version=max；accel=kvm:tcg 追加在同一个 -machine 属性里做自动回退
             qemu_args: "-machine virt,gic-version=max,accel=kvm:tcg -cpu max -m 4096 -smp 4"
