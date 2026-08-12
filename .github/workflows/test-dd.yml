@@ -90,7 +90,16 @@ jobs:
       - name: Setup KVM Permissions
         shell: bash
         run: |
-          sudo chmod 666 /dev/kvm
+          # 尝试主动加载 KVM 内核模块
+          sudo modprobe kvm || true
+          
+          # 安全检查设备节点是否存在
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            echo "KVM enabled successfully."
+          else
+            echo "::warning:: /dev/kvm device node not found! QEMU might fall back or fail."
+          fi
 
       - name: Run DD Test in QEMU via Expect
         shell: bash
