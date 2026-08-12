@@ -17,19 +17,20 @@ jobs:
           - arch: x86_64
             runner: ubuntu-26.04
             qemu_bin: qemu-system-x86_64
-            # -accel kvm:tcg: 优先用 KVM，宿主不支持嵌套虚拟化时自动降级到 tcg 软件模拟
+            # -machine accel=kvm:tcg: 优先用 KVM，宿主不支持嵌套虚拟化时自动降级到 tcg 软件模拟
+            # 注意：kvm:tcg 这种回退语法只能写在 -machine 的 accel= 属性里，不能写在独立的 -accel 选项里
             # -cpu max: kvm/tcg 下都合法，避免降级后 "-cpu host" 报错
-            qemu_args: "-accel kvm:tcg -cpu max -m 4096 -smp 4"
+            qemu_args: "-machine accel=kvm:tcg -cpu max -m 4096 -smp 4"
             qcow2_url: https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2
             qcow2_file: rocky10-x86_64.qcow2
             firmware_args: "" # Standard PC / Q35 BIOS or OVMF
 
           - arch: aarch64
             # 注意：Ubuntu 26.04 的 arm64 镜像标签是 ubuntu-26.04-arm，不是 ubuntu-26.04（那是 x64 镜像）
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             qemu_bin: qemu-system-aarch64
-            # 必须加上 gic-version=max，CPU 恢复为 max；同样用 kvm:tcg 自动回退
-            qemu_args: "-machine virt,gic-version=max -accel kvm:tcg -cpu max -m 4096 -smp 4"
+            # 必须加上 gic-version=max；accel=kvm:tcg 追加在同一个 -machine 属性里做自动回退
+            qemu_args: "-machine virt,gic-version=max,accel=kvm:tcg -cpu max -m 4096 -smp 4"
             qcow2_url: https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2
             qcow2_file: rocky10-aarch64.qcow2
             # 改用 -bios 直接加载 UEFI 固件，避免 pflash NVRAM 锁死
@@ -94,7 +95,7 @@ jobs:
         shell: bash
         run: |
           # 这里只做诊断输出，不再用它来决定成败——
-          # 真正的加速器选择交给下面 QEMU 命令里的 "-accel kvm:tcg" 自动回退处理，
+          # 真正的加速器选择交给 QEMU 命令里的 "-machine ...,accel=kvm:tcg" 自动回退处理，
           # 因为 /dev/kvm 节点存在不代表宿主机真的开放了嵌套虚拟化（GitHub 托管 runner 不保证支持）。
           sudo modprobe kvm 2>/dev/null || true
           if [ -e /dev/kvm ]; then
