@@ -23,7 +23,7 @@ jobs:
             firmware_args: "" # Standard PC / Q35 BIOS or OVMF
           
           - arch: aarch64
-            runner: ubuntu-26.04-arm
+            runner: ubuntu-24.04-arm
             qemu_bin: qemu-system-aarch64
             qemu_args: "-machine virt -accel kvm -cpu host -m 4096 -smp 4"
             qcow2_url: https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2
