@@ -15,7 +15,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             qemu_bin: qemu-system-x86_64
             qemu_args: "-accel kvm -cpu host -m 4096 -smp 4"
             qcow2_url: https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2
@@ -23,10 +23,9 @@ jobs:
             firmware_args: "" # Standard PC / Q35 BIOS or OVMF
           
           - arch: aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             qemu_bin: qemu-system-aarch64
-            # 如果在 ARM 宿主机上可使用 kvm，在 x86 宿主机上回退到 tcg
-            qemu_args: "-machine virt -accel kvm -accel tcg,thread=multi -cpu max -m 4096 -smp 4"
+            qemu_args: "-machine virt -accel kvm -cpu host -m 4096 -smp 4"
             qcow2_url: https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2
             qcow2_file: rocky10-aarch64.qcow2
             firmware_args: "-drive if=pflash,format=raw,unit=0,file=/usr/share/AAVMF/AAVMF_CODE.fd,readonly=on"
@@ -35,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install QEMU & Testing Tools
         shell: bash
@@ -91,9 +90,7 @@ jobs:
       - name: Setup KVM Permissions
         shell: bash
         run: |
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-          fi
+          sudo chmod 666 /dev/kvm
 
       - name: Run DD Test in QEMU via Expect
         shell: bash
