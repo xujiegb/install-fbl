@@ -25,10 +25,12 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
             qemu_bin: qemu-system-aarch64
-            qemu_args: "-machine virt -accel kvm -cpu host -m 4096 -smp 4"
+            # 必须加上 gic-version=max，CPU 恢复为 max
+            qemu_args: "-machine virt,gic-version=max -accel kvm -cpu max -m 4096 -smp 4"
             qcow2_url: https://dl.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-GenericCloud-Base.latest.aarch64.qcow2
             qcow2_file: rocky10-aarch64.qcow2
-            firmware_args: "-drive if=pflash,format=raw,unit=0,file=/usr/share/AAVMF/AAVMF_CODE.fd,readonly=on"
+            # 改用 -bios 直接加载 UEFI 固件，避免 pflash NVRAM 锁死
+            firmware_args: "-bios /usr/share/AAVMF/AAVMF_CODE.fd"
 
     runs-on: ${{ matrix.runner }}
 
