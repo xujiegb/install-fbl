@@ -1729,6 +1729,7 @@ ALPINE_BOOT_DIR_ABS=""
 ALPINE_VMLINUZ_REL=""
 ALPINE_INITRAMFS_REL=""
 ALPINE_MODLOOP_REL=""
+ALPINE_MODLOOP_URL=""
 ALPINE_APKOVL_REL=""
 ALPINE_VMLINUZ_ABS=""
 ALPINE_INITRAMFS_ABS=""
@@ -2447,9 +2448,13 @@ prepare_alpine_paths() {
     ALPINE_FREEBSD_GRUB_CFG_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_FREEBSD_GRUB_CFG_REL"
 
     # Use generic destination names on bootstrap storage so different source flavors/arches can be normalized.
+    ALPINE_KERNEL_FLAVOR="virt"
     ALPINE_VMLINUZ_REL="$ALPINE_BOOT_DIR_REL/vmlinuz"
     ALPINE_INITRAMFS_REL="$ALPINE_BOOT_DIR_REL/initramfs"
+    # Keep the legacy local path only so stale files from older script versions
+    # can be removed. The current bootstrap always fetches modloop over HTTPS.
     ALPINE_MODLOOP_REL="$ALPINE_BOOT_DIR_REL/modloop"
+    ALPINE_MODLOOP_URL="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/${ALPINE_NETBOOT_SUBDIR}/modloop-${ALPINE_KERNEL_FLAVOR}"
     # Keep apkovl at bootstrap filesystem root so Alpine nlplug-findfs can auto-discover it.
     ALPINE_APKOVL_REL="/reinstall.apkovl.tar.gz"
 
@@ -2489,9 +2494,23 @@ download_alpine_ram_files() {
     tmpdir=$(mktemp -d /tmp/reinstall-alpine-netboot.XXXXXX)
 
     base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/${ALPINE_NETBOOT_SUBDIR}"
-    ALPINE_KERNEL_FLAVOR="virt"
+
+    # Older releases of this script copied modloop to the ESP. FreeBSD cloud
+    # images commonly have only a ~32 MiB ESP, so that does not fit alongside
+    # vmlinuz + initramfs + GRUB. Remove any stale/partial local modloop first.
+    rm -f "$ALPINE_MODLOOP_ABS"
+    sync
+
+    local free_kb
+    free_kb=$(df -k "$ALPINE_BOOT_DIR_ABS" 2>/dev/null | awk 'NR==2 {print $4; exit}')
+    if [[ "$free_kb" =~ ^[0-9]+$ ]] && (( free_kb < 22528 )); then
+        rm -rf "$tmpdir"
+        error "Bootstrap filesystem has only ${free_kb} KiB free after removing stale modloop; at least 22 MiB is required for Alpine kernel/initramfs and bootstrap files"
+    fi
 
     info "Using fixed Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}, source=${base}"
+    info "Alpine modloop will be fetched by initramfs over HTTPS at boot:"
+    info "  ${ALPINE_MODLOOP_URL}"
 
     if ! http_download "$base/vmlinuz-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/vmlinuz"; then
         rm -rf "$tmpdir"
@@ -2501,16 +2520,11 @@ download_alpine_ram_files() {
         rm -rf "$tmpdir"
         error "Failed to download Alpine initramfs"
     fi
-    if ! http_download "$base/modloop-${ALPINE_KERNEL_FLAVOR}" "$tmpdir/modloop"; then
-        rm -rf "$tmpdir"
-        error "Failed to download Alpine modloop"
-    fi
 
     mv "$tmpdir/vmlinuz" "$ALPINE_VMLINUZ_ABS"
     mv "$tmpdir/initramfs" "$ALPINE_INITRAMFS_ABS"
-    mv "$tmpdir/modloop" "$ALPINE_MODLOOP_ABS"
 
-    chmod 0644 "$ALPINE_VMLINUZ_ABS" "$ALPINE_INITRAMFS_ABS" "$ALPINE_MODLOOP_ABS"
+    chmod 0644 "$ALPINE_VMLINUZ_ABS" "$ALPINE_INITRAMFS_ABS"
     rm -rf "$tmpdir"
     sync
 
@@ -3030,8 +3044,10 @@ relocate_modloop_to_ram() {
     cp "$backing" "$ram_modloop"
     sync
 
-    # The original loop keeps the boot filesystem busy. Drop that loop mount,
-    # then immediately recreate /.modloop from the RAM-backed copy.
+    # Copy to our dedicated RAM work area and recreate /.modloop from there.
+    # With current netboot the source was normally downloaded by initramfs into
+    # RAM already; this still normalizes the state and guarantees no target-disk
+    # filesystem can remain referenced by the active modloop.
     umount /.modloop || {
         echo "Failed to unmount the original /.modloop."
         exit 1
@@ -3162,7 +3178,7 @@ install_grub_entry_for_alpine() {
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
     search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -3171,7 +3187,7 @@ EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
-    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd /boot${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -3328,7 +3344,7 @@ build_freebsd_grub_efi() {
 set timeout=0
 set default=0
 search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} reinstall_alpine=1 console=ttyS0 console=tty0
+linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1 console=ttyS0 console=tty0
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
