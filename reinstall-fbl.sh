@@ -473,7 +473,6 @@ missing_deps_freebsd_host() {
     command -v tar >/dev/null 2>&1 || missing+=("tar")
     have_any_downloader || missing+=("downloader")
     command -v efibootmgr >/dev/null 2>&1 || missing+=("efibootmgr")
-    command -v grub-mkstandalone >/dev/null 2>&1 || command -v grub2-mkstandalone >/dev/null 2>&1 || missing+=("grub-mkstandalone")
 
     ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
 }
@@ -523,7 +522,6 @@ install_deps_freebsd_host() {
             tar)               : ;;
             downloader)        pkgs+=("curl") ;;
             efibootmgr)        pkgs+=("efibootmgr") ;;
-            grub-mkstandalone) pkgs+=("grub2") ;;
         esac
     done
 
@@ -1606,6 +1604,8 @@ ALPINE_APKOVL_ABS=""
 ALPINE_SCRIPT_COPY_ABS=""
 ALPINE_FREEBSD_GRUB_EFI_REL=""
 ALPINE_FREEBSD_GRUB_EFI_ABS=""
+ALPINE_FREEBSD_GRUB_CFG_REL=""
+ALPINE_FREEBSD_GRUB_CFG_ABS=""
 ALPINE_NETBOOT_ARCH=""
 ALPINE_KERNEL_FLAVOR=""
 GRUB_SCRIPT_PATH=""
@@ -1613,7 +1613,6 @@ GRUB_CFG_PATH=""
 GRUB_MKCONFIG_CMD=""
 GRUB_REBOOT_CMD=""
 GRUB_DEFAULT_CMD=""
-GRUB_MKSTANDALONE_CMD=""
 GRUB_EFI_TARGET=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
@@ -1735,9 +1734,26 @@ get_fs_type_linux() {
 
 get_fs_uuid_freebsd() {
     local dev="$1"
-    if command -v fstyp >/dev/null 2>&1; then
-        fstyp -u "$dev" 2>/dev/null || true
+    local desc="" serial=""
+
+    # FreeBSD fstyp(8) has no filesystem-UUID output mode.  For FAT/MS-DOS
+    # filesystems, file(1) reports the 32-bit volume serial number, which is
+    # the same identifier Linux blkid/GRUB expose as XXXX-XXXX.
+    command -v file >/dev/null 2>&1 || return 0
+    desc=$(file -s "$dev" 2>/dev/null || true)
+
+    if [[ "$desc" =~ serial[[:space:]]number[[:space:]]0x([0-9A-Fa-f]{1,8}) ]]; then
+        serial="${BASH_REMATCH[1]}"
+    else
+        return 0
     fi
+
+    while ((${#serial} < 8)); do
+        serial="0${serial}"
+    done
+    serial="${serial^^}"
+
+    printf '%s-%s\n' "${serial:0:4}" "${serial:4:4}"
 }
 
 get_fs_type_freebsd() {
@@ -2221,13 +2237,12 @@ ensure_grub_tools() {
 ensure_freebsd_boot_tools() {
     [[ "$OS" == "FreeBSD" ]] || error "Automatic FreeBSD BootNext bootstrap only supports FreeBSD host"
     command -v efibootmgr >/dev/null 2>&1 || error "efibootmgr is required on FreeBSD host"
-    if command -v grub-mkstandalone >/dev/null 2>&1; then
-        GRUB_MKSTANDALONE_CMD="grub-mkstandalone"
-    elif command -v grub2-mkstandalone >/dev/null 2>&1; then
-        GRUB_MKSTANDALONE_CMD="grub2-mkstandalone"
-    else
-        error "grub-mkstandalone is required on FreeBSD host"
-    fi
+    command -v tar >/dev/null 2>&1 || error "tar is required on FreeBSD host"
+    command -v file >/dev/null 2>&1 || error "file is required on FreeBSD host"
+    command -v dd >/dev/null 2>&1 || error "dd is required on FreeBSD host"
+    command -v cmp >/dev/null 2>&1 || error "cmp is required on FreeBSD host"
+    command -v grep >/dev/null 2>&1 || error "grep is required on FreeBSD host"
+
     if ! efibootmgr -v >/dev/null 2>&1; then
         error "efibootmgr is present but EFI NVRAM is not accessible; FreeBSD automatic boot requires UEFI boot mode"
     fi
@@ -2260,6 +2275,8 @@ prepare_alpine_paths() {
 
     ALPINE_BOOT_DIR_REL="/$PLAN_DIR_REL/$ALPINE_BOOT_SUBDIR"
     ALPINE_BOOT_DIR_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_BOOT_DIR_REL"
+    ALPINE_FREEBSD_GRUB_CFG_REL="$ALPINE_BOOT_DIR_REL/grub/grub.cfg"
+    ALPINE_FREEBSD_GRUB_CFG_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_FREEBSD_GRUB_CFG_REL"
 
     # Use generic destination names on bootstrap storage so different source flavors/arches can be normalized.
     ALPINE_VMLINUZ_REL="$ALPINE_BOOT_DIR_REL/vmlinuz"
@@ -3003,27 +3020,161 @@ EOF
 build_freebsd_grub_efi() {
     ensure_freebsd_boot_tools
 
-    local tmp cfg
-    tmp=$(mktemp -d /tmp/reinstall-freebsd-grub.XXXXXX)
+    [[ "$PLAN_STORAGE_MODE" == "efi" ]] || \
+        error "FreeBSD automatic bootstrap requires EFI storage"
+    [[ "$PLAN_EFI_UUID" =~ ^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$ ]] || \
+        error "Could not determine FAT EFI filesystem UUID on FreeBSD: ${PLAN_EFI_UUID:-unset}"
 
-    cfg="$tmp/grub.cfg"
-    cat >"$cfg" <<EOF
+    local alpine_release iso_url efi_name
+    local tmp iso member volid marker offset
+    local old_cfg new_cfg old_len new_len pad
+    local expected_file before_file patch_file
+
+    alpine_release="${ALPINE_NETBOOT_SUBDIR#netboot-}"
+
+    case "$ALPINE_NETBOOT_ARCH" in
+        x86_64)
+            efi_name="bootx64.efi"
+            ;;
+        aarch64)
+            efi_name="bootaa64.efi"
+            ;;
+        *)
+            error "Unsupported FreeBSD UEFI bootstrap arch: $ALPINE_NETBOOT_ARCH"
+            ;;
+    esac
+
+    # Alpine's official virt ISO already contains a GRUB EFI image built with
+    # the exact GRUB modules needed to load Linux + initramfs.  FreeBSD does not
+    # ship grub-mkstandalone, so extract that official EFI binary and retarget
+    # its tiny embedded early config from the ISO label to this machine's ESP UUID.
+    iso_url="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/alpine-virt-${alpine_release}-${ALPINE_NETBOOT_ARCH}.iso"
+
+    tmp=$(mktemp -d /tmp/reinstall-alpine-efi.XXXXXX)
+    iso="$tmp/alpine-virt.iso"
+
+    info "Downloading official Alpine virt ISO only for its GRUB EFI bootstrap:"
+    info "  $iso_url"
+    if ! http_download "$iso_url" "$iso"; then
+        rm -rf "$tmp"
+        error "Failed to download Alpine virt ISO for FreeBSD UEFI bootstrap"
+    fi
+
+    member=$(
+        tar -tf "$iso" 2>/dev/null |
+        awk -v want="efi/boot/${efi_name}" '
+            {
+                p=$0
+                sub(/^\\.\\//, "", p)
+                if (tolower(p) == tolower(want)) {
+                    print $0
+                    exit
+                }
+            }
+        '
+    )
+    [[ -n "$member" ]] || {
+        rm -rf "$tmp"
+        error "Could not locate efi/boot/${efi_name} inside Alpine virt ISO"
+    }
+
+    mkdir -p "$(dirname "$ALPINE_FREEBSD_GRUB_EFI_ABS")"
+    if ! tar -xOf "$iso" "$member" >"$ALPINE_FREEBSD_GRUB_EFI_ABS"; then
+        rm -rf "$tmp"
+        error "Failed to extract ${efi_name} from Alpine virt ISO"
+    fi
+    [[ -s "$ALPINE_FREEBSD_GRUB_EFI_ABS" ]] || {
+        rm -rf "$tmp"
+        error "Extracted Alpine GRUB EFI binary is empty"
+    }
+
+    # Alpine mkimg embeds:
+    #   search --no-floppy --set=root --label "alpine-virt VERSION ARCH"
+    #   set prefix=($root)/boot/grub
+    #
+    # That ISO label does not exist after copying the EFI binary to our ESP.
+    # Patch only this embedded ASCII config, preserving its exact byte length,
+    # so GRUB locates this ESP by its FAT UUID and reads our private grub.cfg.
+    volid="alpine-virt ${alpine_release} ${ALPINE_NETBOOT_ARCH}"
+    printf -v old_cfg \
+        'search --no-floppy --set=root --label "%s"\nset prefix=($root)/boot/grub\n' \
+        "$volid"
+    printf -v new_cfg \
+        'search --no-floppy --fs-uuid --set=root %s\nset prefix=($root)%s/grub\n' \
+        "$PLAN_EFI_UUID" "$ALPINE_BOOT_DIR_REL"
+
+    old_len=${#old_cfg}
+    new_len=${#new_cfg}
+    (( new_len <= old_len )) || {
+        rm -rf "$tmp"
+        error "Patched Alpine GRUB early config is larger than the embedded config (${new_len} > ${old_len})"
+    }
+
+    marker="search --no-floppy --set=root --label \"${volid}\""
+    offset=$(
+        LC_ALL=C grep -a -b -F "$marker" "$ALPINE_FREEBSD_GRUB_EFI_ABS" 2>/dev/null |
+        head -n1 | cut -d: -f1
+    )
+    [[ "$offset" =~ ^[0-9]+$ ]] || {
+        rm -rf "$tmp"
+        error "Could not locate Alpine GRUB embedded early config; refusing to patch an unknown EFI binary"
+    }
+
+    expected_file="$tmp/expected.cfg"
+    before_file="$tmp/before.cfg"
+    patch_file="$tmp/patch.cfg"
+
+    printf '%s' "$old_cfg" >"$expected_file"
+    dd if="$ALPINE_FREEBSD_GRUB_EFI_ABS" of="$before_file" \
+        bs=1 skip="$offset" count="$old_len" 2>/dev/null || {
+        rm -rf "$tmp"
+        error "Failed to read Alpine GRUB embedded config before patching"
+    }
+
+    cmp -s "$expected_file" "$before_file" || {
+        rm -rf "$tmp"
+        error "Alpine GRUB embedded config did not exactly match the expected ${alpine_release} virt image; refusing binary patch"
+    }
+
+    printf '%s' "$new_cfg" >"$patch_file"
+    pad=$(( old_len - new_len ))
+    if (( pad > 0 )); then
+        printf '%*s' "$pad" '' >>"$patch_file"
+    fi
+
+    dd if="$patch_file" of="$ALPINE_FREEBSD_GRUB_EFI_ABS" \
+        bs=1 seek="$offset" conv=notrunc 2>/dev/null || {
+        rm -rf "$tmp"
+        error "Failed to patch Alpine GRUB EFI embedded config"
+    }
+
+    if ! LC_ALL=C grep -a -F \
+        "search --no-floppy --fs-uuid --set=root ${PLAN_EFI_UUID}" \
+        "$ALPINE_FREEBSD_GRUB_EFI_ABS" >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        error "Patched Alpine GRUB EFI verification failed"
+    fi
+
+    mkdir -p "$(dirname "$ALPINE_FREEBSD_GRUB_CFG_ABS")"
+    cat >"$ALPINE_FREEBSD_GRUB_CFG_ABS" <<EOF
+set timeout=0
+set default=0
 search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
 linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} reinstall_alpine=1 console=ttyS0 console=tty0
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
 
-    info "Building standalone GRUB EFI binary for FreeBSD BootNext..."
-    "$GRUB_MKSTANDALONE_CMD" \
-        -O "$GRUB_EFI_TARGET" \
-        -o "$ALPINE_FREEBSD_GRUB_EFI_ABS" \
-        "boot/grub/grub.cfg=$cfg" \
-        --modules="part_gpt fat search search_fs_uuid linux normal echo"
-    chmod 0644 "$ALPINE_FREEBSD_GRUB_EFI_ABS"
+    chmod 0644 "$ALPINE_FREEBSD_GRUB_EFI_ABS" "$ALPINE_FREEBSD_GRUB_CFG_ABS"
     rm -rf "$tmp"
     sync
+
+    info "Prepared Alpine official GRUB EFI bootstrap for FreeBSD:"
+    info "  EFI: $ALPINE_FREEBSD_GRUB_EFI_ABS"
+    info "  CFG: $ALPINE_FREEBSD_GRUB_CFG_ABS"
+    info "  ESP UUID: $PLAN_EFI_UUID"
 }
+
 
 install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
@@ -3103,7 +3254,7 @@ prepare_and_boot_alpine_ram_freebsd() {
     build_freebsd_grub_efi
     install_freebsd_bootnext_entry
 
-    info "Alpine RAM installer prepared for FreeBSD UEFI BootNext."
+    info "Alpine RAM installer prepared for FreeBSD UEFI BootNext using Alpine official GRUB EFI."
     info "System will reboot now into one-time UEFI entry: ${ALPINE_ENTRY_TITLE}"
     sync
     sleep 2
