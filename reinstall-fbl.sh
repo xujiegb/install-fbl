@@ -1406,7 +1406,9 @@ EOF
 
             if [[ -n "$PASSWORD_HASH" ]]; then
                 echo "    lock_passwd: false"
-                echo "    passwd: \"${PASSWORD_HASH}\""
+                # root already exists in cloud images; cloud-init's passwd key is
+                # creation-only, while hashed_passwd also applies to existing users.
+                echo "    hashed_passwd: \"${PASSWORD_HASH}\""
             else
                 echo "    lock_passwd: true"
             fi
