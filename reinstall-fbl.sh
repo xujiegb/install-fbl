@@ -2651,7 +2651,7 @@ REPOEOF
 
     # Fail here with a precise message instead of reaching the destructive stage
     # and discovering that a split Alpine subpackage was not installed.
-    for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev; do
+    for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod; do
         command -v "$cmd" >/dev/null 2>&1 || {
             echo "Required Alpine runtime command is missing after apk add: $cmd"
             exit 1
@@ -3114,6 +3114,33 @@ partition_device_for_number() {
     esac
 }
 
+ensure_linux_block_node_from_sysfs() {
+    local devpath="$1" name sysdev maj min
+
+    [[ -n "$devpath" ]] || return 1
+    [[ -b "$devpath" ]] && return 0
+
+    name="${devpath#/dev/}"
+    sysdev="/sys/class/block/$name/dev"
+
+    [[ -r "$sysdev" ]] || return 1
+
+    IFS=: read -r maj min <"$sysdev"
+    [[ "$maj" =~ ^[0-9]+$ && "$min" =~ ^[0-9]+$ ]] || return 1
+
+    # Alpine RAM may have the partition registered in the kernel/sysfs while
+    # mdev has not recreated the corresponding /dev node after partx/rereadpt.
+    # Only create the node when sysfs explicitly exposes the exact block device.
+    if [[ -e "$devpath" && ! -b "$devpath" ]]; then
+        rm -f "$devpath"
+    fi
+
+    mknod "$devpath" b "$maj" "$min" || return 1
+    chmod 0600 "$devpath" 2>/dev/null || true
+
+    [[ -b "$devpath" ]]
+}
+
 prepare_fixed_temp_staging_partition() {
     [[ "$OS" == "Linux" ]] || error "The fixed 1.5 GiB staging partition requires the Linux/Alpine installer environment"
     command -v sgdisk >/dev/null 2>&1 || error "sgdisk is required for the fixed staging partition"
@@ -3162,11 +3189,18 @@ prepare_fixed_temp_staging_partition() {
     local wait_i
     for wait_i in 1 2 3 4 5 6 7 8; do
         [[ -b "$TEMP_STAGE_PART" ]] && break
+
         command -v partx >/dev/null 2>&1 && {
             partx -u "$DISK" >/dev/null 2>&1 || partx -a "$DISK" >/dev/null 2>&1 || true
         }
         command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
         command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+
+        # If the kernel already exposes the partition in sysfs but minimal
+        # Alpine has not populated /dev yet, create that exact block node from
+        # the kernel-provided major:minor instead of guessing.
+        ensure_linux_block_node_from_sysfs "$TEMP_STAGE_PART" && break
+
         sleep 1
     done
 
@@ -3174,11 +3208,18 @@ prepare_fixed_temp_staging_partition() {
         warn "Temporary GPT as reported by sgdisk:"
         sgdisk -p "$DISK" >&2 || true
         warn "Current block-device view:"
-        lsblk -a -o NAME,PATH,TYPE,SIZE,PARTN,PARTLABEL "$DISK" >&2 || true
-        error "Could not locate expected temporary staging partition node: $TEMP_STAGE_PART"
+        lsblk -a -o NAME,PATH,TYPE,SIZE,PARTN,PARTLABEL,MAJ:MIN "$DISK" >&2 || true
+        warn "Relevant sysfs state:"
+        local stage_name
+        stage_name="${TEMP_STAGE_PART#/dev/}"
+        if [[ -d "/sys/class/block/$stage_name" ]]; then
+            ls -la "/sys/class/block/$stage_name" >&2 || true
+            cat "/sys/class/block/$stage_name/dev" >&2 2>/dev/null || true
+        fi
+        error "Could not create/locate expected temporary staging partition node: $TEMP_STAGE_PART"
     fi
 
-    info "Temporary staging partition node appeared: $TEMP_STAGE_PART"
+    info "Temporary staging partition node ready: $TEMP_STAGE_PART"
 
     TEMP_STAGE_SECTOR_SIZE=$(blockdev --getss "$DISK" 2>/dev/null || true)
     [[ "$TEMP_STAGE_SECTOR_SIZE" =~ ^[0-9]+$ && "$TEMP_STAGE_SECTOR_SIZE" -gt 0 ]] || \
