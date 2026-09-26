@@ -9,7 +9,7 @@ curl -O https://raw.githubusercontent.com/xujiegb/install-fbl/main/reinstall-fbl
 bash reinstall-fbl.sh rocky      10
                       almalinux  10
                       fedora     43
-                      freebsd    14
+                      freebsd    14 | 15
                       redhat     --img="http://access.cdn.redhat.com/xxx.qcow2"
 ```
 感谢 @bin456789
