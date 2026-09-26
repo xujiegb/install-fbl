@@ -11,7 +11,7 @@
 #   - root password (--password)
 #   - SSH public key(s) (--ssh-key, multiple)
 #   - SSH port (--ssh-port)
-#   - optional FRPC config (--frpc-toml) stored as EFI:/nocloud/frpc.toml
+#   - optional FRPC config (--frpc-toml) embedded into NoCloud user-data
 #
 # Requirements:
 #   - Run with bash:  bash reinstall-freebsd-linux.sh ...
@@ -33,8 +33,8 @@
 #   - Installer phase reads image from bootstrap storage only (no network).
 #
 # Important compatibility note:
-#   - This script is intended for cloud images that support NoCloud and probe EFI seed data
-#     on first boot. In practice, actual datasource behavior differs across images/releases.
+#   - This script creates a dedicated VFAT partition labeled CIDATA for standard NoCloud discovery.
+#   - Target images must include cloud-init with NoCloud support.
 #   - Validate your target image before relying on unattended deployment.
 
 set -Eeuo pipefail
@@ -52,7 +52,7 @@ warn() {
 }
 
 info() {
-    echo "==> $*"
+    echo "==> $*" >&2
 }
 
 usage() {
@@ -67,7 +67,7 @@ Usage:
 If --disk is not specified, the script will try to auto-detect the main disk:
   - Prefer the disk that backs the current /, /boot, and EFI mountpoints.
   - If those agree, that disk is recommended first.
-  - If they cannot be resolved, fall back to the largest non-removable disk.
+  - If they cannot be resolved confidently, the script refuses to guess; use --disk explicitly.
   - On host phase, a candidate list is shown and explicit confirmation is required.
 
 Options:
@@ -98,10 +98,9 @@ Options:
                        you can consume it later from within the system.
 
   --frpc-toml PATH/URL Add FRPC configuration for tunneling:
-                         - Local path: copy to EFI:/nocloud/frpc.toml
-                         - HTTP(S): download to EFI:/nocloud/frpc.toml
-                       cloud-init will add a runcmd section that tries to copy this to /etc/frp
-                       and start frpc if available.
+                         - Local path: cache during host phase and embed into NoCloud user-data
+                         - HTTP(S): download during host phase and embed into NoCloud user-data
+                       cloud-init writes it to /etc/frp/frpc.toml and tries to start frpc if available.
 
   --post-install-hook PATH
                        Optional explicit post-install hook script to run after image write/injection.
@@ -131,16 +130,30 @@ is_port_valid() {
 }
 
 http_download() {
-    local url="$1" dst="$2"
+    local url="$1" dst="$2" tmp
+    tmp="${dst}.part.$$"
+    rm -f "$tmp"
+
     if command -v curl >/dev/null 2>&1; then
-        curl -L --fail -o "$dst" "$url"
+        if ! curl -L --fail -o "$tmp" "$url"; then
+            rm -f "$tmp"
+            return 1
+        fi
     elif command -v wget >/dev/null 2>&1; then
-        wget -O "$dst" "$url"
+        if ! wget -O "$tmp" "$url"; then
+            rm -f "$tmp"
+            return 1
+        fi
     elif command -v fetch >/dev/null 2>&1; then
-        fetch -o "$dst" "$url"
+        if ! fetch -o "$tmp" "$url"; then
+            rm -f "$tmp"
+            return 1
+        fi
     else
         error "No curl/wget/fetch found, cannot download: $url"
     fi
+
+    mv -f "$tmp" "$dst"
 }
 
 http_content_length() {
@@ -148,14 +161,16 @@ http_content_length() {
 
     if command -v curl >/dev/null 2>&1; then
         curl -fsIL "$url" | awk '
-            /^[Cc]ontent-[Ll]ength:/ { gsub("\r", "", $2); print $2; exit }
+            /^[Cc]ontent-[Ll]ength:/ { gsub("\r", "", $2); n=$2 }
+            END { if (n != "") print n }
         '
         return 0
     fi
 
     if command -v wget >/dev/null 2>&1; then
         wget --server-response --spider "$url" 2>&1 | awk '
-            /^  [Cc]ontent-[Ll]ength:/ { gsub("\r", "", $2); print $2; exit }
+            /^  [Cc]ontent-[Ll]ength:/ { gsub("\r", "", $2); n=$2 }
+            END { if (n != "") print n }
         '
         return 0
     fi
@@ -580,6 +595,217 @@ AUTO_DETECTED_DISK=""
 AUTO_DETECT_REASON=""
 DISK_CANDIDATE_LINES=""
 DISK_AUTO_SELECTED=0
+DISK_ID_WWN=""
+DISK_ID_SERIAL=""
+DISK_ID_SIZE=""
+DISK_ID_MODEL=""
+
+validate_target_disk() {
+    local disk="$1" typ d
+
+    [[ -n "$disk" ]] || error "Target disk is empty"
+
+    if [[ "$OS" == "Linux" ]]; then
+        [[ -b "$disk" ]] || error "Target disk $disk is not a block device"
+        command -v lsblk >/dev/null 2>&1 || error "lsblk is required to validate the target disk on Linux"
+        typ=$(lsblk -ndo TYPE "$disk" 2>/dev/null | head -n1 || true)
+        [[ "$typ" == "disk" ]] || error "Target $disk is not a whole disk (lsblk TYPE=${typ:-unknown})"
+        return 0
+    fi
+
+    [[ -c "$disk" || -b "$disk" ]] || error "Target disk $disk does not exist"
+    d="${disk#/dev/}"
+    command -v sysctl >/dev/null 2>&1 || error "sysctl is required to validate the target disk on FreeBSD"
+    case " $(sysctl -n kern.disks 2>/dev/null || true) " in
+        *" $d "*) ;;
+        *) error "Target $disk is not a whole disk listed by kern.disks" ;;
+    esac
+}
+
+normalize_disk_wwn() {
+    local v="${1:-}"
+    v=$(printf '%s' "$v" | tr 'A-Z' 'a-z' | tr -d '[:space:]:-')
+    v="${v#0x}"
+    v="${v#naa.}"
+    printf '%s\n' "$v"
+}
+
+capture_target_disk_identity() {
+    local disk="$1" line d
+
+    DISK_ID_WWN=""
+    DISK_ID_SERIAL=""
+    DISK_ID_SIZE=""
+    DISK_ID_MODEL=""
+
+    if [[ "$OS" == "Linux" ]]; then
+        line=$(lsblk -b -dn -P -o WWN,SERIAL,SIZE,MODEL "$disk" 2>/dev/null | head -n1 || true)
+        [[ -n "$line" ]] || error "Failed to read target disk identity: $disk"
+        DISK_ID_WWN=$(normalize_disk_wwn "$(lsblk_get_kv "$line" "WWN")")
+        DISK_ID_SERIAL=$(lsblk_get_kv "$line" "SERIAL")
+        DISK_ID_SIZE=$(lsblk_get_kv "$line" "SIZE")
+        DISK_ID_MODEL=$(lsblk_get_kv "$line" "MODEL")
+    else
+        d="${disk#/dev/}"
+        if command -v diskinfo >/dev/null 2>&1; then
+            DISK_ID_SERIAL=$(diskinfo -s "$disk" 2>/dev/null | head -n1 || true)
+            DISK_ID_SIZE=$(diskinfo "$disk" 2>/dev/null | awk 'NR==1 {print $3; exit}' || true)
+        fi
+        if command -v geom >/dev/null 2>&1; then
+            DISK_ID_WWN=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*lunid:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
+            DISK_ID_WWN=$(normalize_disk_wwn "$DISK_ID_WWN")
+            DISK_ID_MODEL=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*descr:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
+        fi
+    fi
+
+    [[ -n "$DISK_ID_SERIAL" || -n "$DISK_ID_WWN" || -n "$DISK_ID_SIZE" ]] || \
+        error "Could not obtain a stable identity for target disk $disk"
+
+    info "Target disk identity: serial=${DISK_ID_SERIAL:-unknown} wwn=${DISK_ID_WWN:-unknown} size=${DISK_ID_SIZE:-unknown}"
+}
+
+resolve_target_disk_from_identity() {
+    local matches=() line path typ wwn serial size model d
+
+    if [[ -z "${DISK_ID_SERIAL:-}" && -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SIZE:-}" ]]; then
+        warn "No saved target disk identity is present; using saved device path: ${DISK:-unset}"
+        return 0
+    fi
+
+    if [[ "$OS" == "Linux" ]]; then
+        while IFS= read -r line; do
+            path=$(lsblk_get_kv "$line" "PATH")
+            typ=$(lsblk_get_kv "$line" "TYPE")
+            wwn=$(normalize_disk_wwn "$(lsblk_get_kv "$line" "WWN")")
+            serial=$(lsblk_get_kv "$line" "SERIAL")
+            size=$(lsblk_get_kv "$line" "SIZE")
+            model=$(lsblk_get_kv "$line" "MODEL")
+            [[ "$typ" == "disk" && -n "$path" ]] || continue
+
+            if [[ -n "${DISK_ID_SERIAL:-}" ]]; then
+                [[ "$serial" == "$DISK_ID_SERIAL" ]] || continue
+                [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
+            elif [[ -n "${DISK_ID_WWN:-}" ]]; then
+                [[ "$wwn" == "$DISK_ID_WWN" ]] || continue
+                [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
+            else
+                [[ "$size" == "$DISK_ID_SIZE" ]] || continue
+                if [[ -n "${DISK_ID_MODEL:-}" ]]; then
+                    [[ "$model" == "$DISK_ID_MODEL" ]] || continue
+                fi
+            fi
+            matches+=("$path")
+        done < <(lsblk -b -dn -P -o PATH,TYPE,WWN,SERIAL,SIZE,MODEL 2>/dev/null || true)
+    else
+        for d in $(sysctl -n kern.disks 2>/dev/null || true); do
+            path="/dev/$d"
+            serial=$(diskinfo -s "$path" 2>/dev/null | head -n1 || true)
+            size=$(diskinfo "$path" 2>/dev/null | awk 'NR==1 {print $3; exit}' || true)
+            wwn=""
+            model=""
+            if command -v geom >/dev/null 2>&1; then
+                wwn=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*lunid:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
+                wwn=$(normalize_disk_wwn "$wwn")
+                model=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*descr:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
+            fi
+
+            if [[ -n "${DISK_ID_SERIAL:-}" ]]; then
+                [[ "$serial" == "$DISK_ID_SERIAL" ]] || continue
+                [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
+            elif [[ -n "${DISK_ID_WWN:-}" ]]; then
+                [[ "$wwn" == "$DISK_ID_WWN" ]] || continue
+                [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
+            else
+                [[ "$size" == "$DISK_ID_SIZE" ]] || continue
+                if [[ -n "${DISK_ID_MODEL:-}" ]]; then
+                    [[ "$model" == "$DISK_ID_MODEL" ]] || continue
+                fi
+            fi
+            matches+=("$path")
+        done
+    fi
+
+    if [[ "${#matches[@]}" -ne 1 ]]; then
+        error "Saved target disk identity matched ${#matches[@]} disks; refusing destructive write. Matches: ${matches[*]:-(none)}"
+    fi
+
+    if [[ -n "${DISK:-}" && "$DISK" != "${matches[0]}" ]]; then
+        info "Target disk device name changed: $DISK -> ${matches[0]}"
+    fi
+    DISK="${matches[0]}"
+}
+
+get_disk_size_bytes() {
+    local disk="$1"
+    if [[ "$OS" == "Linux" ]]; then
+        if command -v blockdev >/dev/null 2>&1; then
+            blockdev --getsize64 "$disk" 2>/dev/null && return 0
+        fi
+        lsblk -b -dn -o SIZE "$disk" 2>/dev/null | head -n1
+        return 0
+    fi
+    diskinfo "$disk" 2>/dev/null | awk 'NR==1 {print $3; exit}'
+}
+
+unmount_target_disk_filesystems() {
+    local disk="$1" dev mnt d sysname holder_found holder
+
+    if [[ "$OS" == "Linux" ]]; then
+        command -v lsblk >/dev/null 2>&1 || error "lsblk is required before destructive write"
+
+        if command -v swapon >/dev/null 2>&1 && command -v swapoff >/dev/null 2>&1; then
+            while IFS= read -r dev; do
+                [[ -n "$dev" ]] || continue
+                if lsblk -nrpo NAME "$disk" 2>/dev/null | grep -Fxq "$dev"; then
+                    info "Disabling swap on target disk: $dev"
+                    swapoff "$dev" || error "Failed to disable target-disk swap: $dev"
+                fi
+            done < <(swapon --show=NAME --noheadings 2>/dev/null || true)
+        fi
+
+        while IFS= read -r dev; do
+            [[ -n "$dev" ]] || continue
+            while IFS= read -r mnt; do
+                [[ -n "$mnt" ]] || continue
+                info "Unmounting target-disk filesystem: $dev from $mnt"
+                umount "$mnt" || error "Failed to unmount target-disk filesystem: $mnt"
+            done < <(findmnt -rn -S "$dev" -o TARGET 2>/dev/null || true)
+        done < <(lsblk -nrpo NAME "$disk" 2>/dev/null | tac)
+
+        while IFS= read -r dev; do
+            [[ -n "$dev" ]] || continue
+            if findmnt -rn -S "$dev" >/dev/null 2>&1; then
+                error "A target-disk filesystem is still mounted on $dev; refusing dd"
+            fi
+        done < <(lsblk -nrpo NAME "$disk" 2>/dev/null)
+
+        while IFS= read -r dev; do
+            [[ -n "$dev" ]] || continue
+            sysname="${dev#/dev/}"
+            sysname="${sysname//\//!}"
+            holder_found=0
+            if [[ -d "/sys/class/block/$sysname/holders" ]]; then
+                for holder in "/sys/class/block/$sysname/holders/"*; do
+                    [[ -e "$holder" ]] || continue
+                    holder_found=1
+                    break
+                done
+            fi
+            [[ "$holder_found" -eq 0 ]] || error "Target-disk device $dev still has active block holders; refusing dd"
+        done < <(lsblk -nrpo NAME "$disk" 2>/dev/null)
+        return 0
+    fi
+
+    d="${disk#/dev/}"
+    while read -r dev _ mnt _; do
+        case "$dev" in
+            /dev/${d}p*|/dev/${d}s*|/dev/${d})
+                info "Unmounting target-disk filesystem: $dev from $mnt"
+                umount "$mnt" || error "Failed to unmount target-disk filesystem: $mnt"
+                ;;
+        esac
+    done < <(mount -p 2>/dev/null || true)
+}
 
 linux_source_to_disk() {
     local src="$1" name pkname typ
@@ -774,12 +1000,7 @@ auto_detect_disk() {
             fi
 
             if [[ -n "$best_name" ]]; then
-                DISK="/dev/$best_name"
-                AUTO_DETECTED_DISK="$DISK"
-                AUTO_DETECT_REASON="fallback to largest non-removable disk because /, /boot, and EFI could not be resolved confidently"
-                DISK_AUTO_SELECTED=1
-                info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
-                return 0
+                warn "Could not resolve the current system disk confidently. Refusing to choose the largest disk automatically."
             fi
         fi
         error "Unable to auto-detect target disk on Linux. Please specify --disk explicitly."
@@ -792,7 +1013,7 @@ auto_detect_disk() {
                     cd*|md*|lo*|ram*) continue ;;
                 esac
                 if command -v diskinfo >/dev/null 2>&1; then
-                    size=$(diskinfo -v "/dev/$d" 2>/dev/null | awk '/^mediasize/ {print $2; exit}')
+                    size=$(diskinfo "/dev/$d" 2>/dev/null | awk 'NR==1 {print $3; exit}')
                 else
                     size=0
                 fi
@@ -810,12 +1031,7 @@ auto_detect_disk() {
                 fi
             done
             if [[ -n "$best_name" ]]; then
-                DISK="/dev/$best_name"
-                AUTO_DETECTED_DISK="$DISK"
-                AUTO_DETECT_REASON="fallback to largest non-cd disk via diskinfo"
-                DISK_AUTO_SELECTED=1
-                info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
-                return 0
+                warn "FreeBSD disk auto-detection is ambiguous. Refusing to choose the largest disk automatically."
             fi
         fi
         error "Unable to auto-detect target disk on FreeBSD. Please specify --disk explicitly."
@@ -1059,15 +1275,8 @@ find_efi_partition() {
             done < <(lsblk -P -o PATH,PKNAME,PARTTYPE,FSTYPE,PARTLABEL,PARTFLAGS "$disk" 2>/dev/null || true)
         fi
 
-        warn "Could not confidently identify EFI partition on $disk from lsblk metadata, falling back to partition 1 guess."
-        case "$disk" in
-            /dev/nvme*|/dev/mmcblk*)
-                echo "${disk}p1"
-                ;;
-            *)
-                echo "${disk}1"
-                ;;
-        esac
+        warn "Could not confidently identify EFI partition on $disk from lsblk metadata."
+        return 1
     else
         if command -v gpart >/dev/null 2>&1; then
             local d p
@@ -1078,13 +1287,14 @@ find_efi_partition() {
                 return 0
             fi
         fi
-        warn "Could not confidently identify EFI partition on $disk from gpart metadata, falling back to partition 1 guess."
-        echo "${disk}p1"
+        warn "Could not confidently identify EFI partition on $disk from gpart metadata."
+        return 1
     fi
 }
 
 write_nocloud_seed() {
     local os="$1" meta_path="$2" user_path="$3"
+    local frpc_b64=""
 
     mkdir -p "$(dirname "$meta_path")"
 
@@ -1092,6 +1302,10 @@ write_nocloud_seed() {
 instance-id: iid-$(date +%s)
 local-hostname: $os
 EOF
+
+    if [[ -n "${FRPC_PRESENT:-}" && -n "${FRPC_TOML:-}" && -f "$FRPC_TOML" ]]; then
+        frpc_b64=$(base64 <"$FRPC_TOML" | tr -d '\n')
+    fi
 
     {
         echo "#cloud-config"
@@ -1122,10 +1336,13 @@ EOF
             fi
         fi
 
+        if [[ -n "$WEB_PORT" || -n "$frpc_b64" ]]; then
+            echo
+            echo "write_files:"
+        fi
+
         if [[ -n "$WEB_PORT" ]]; then
             cat <<EOF
-
-write_files:
   - path: /etc/reinstall-web-port
     permissions: '0644'
     owner: root:root
@@ -1134,7 +1351,17 @@ write_files:
 EOF
         fi
 
-        if [[ -n "$SSH_PORT" ]] || [[ -n "$FRPC_PRESENT" ]]; then
+        if [[ -n "$frpc_b64" ]]; then
+            cat <<EOF
+  - path: /etc/frp/frpc.toml
+    permissions: '0600'
+    owner: root:root
+    encoding: b64
+    content: $frpc_b64
+EOF
+        fi
+
+        if [[ -n "$SSH_PORT" ]] || [[ -n "$frpc_b64" ]]; then
             echo
             echo "runcmd:"
         fi
@@ -1142,37 +1369,40 @@ EOF
         if [[ -n "$SSH_PORT" ]]; then
             cat <<EOF
   - |
-      # Try to change SSH port on Linux / FreeBSD more defensively
       if [ -f /etc/ssh/sshd_config ]; then
         awk '
           /^[[:space:]]*Port[[:space:]]+/ { next }
           { print }
           END { print "Port ${SSH_PORT}" }
-        ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
-        cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
-        rm -f /tmp/sshd_config.reinstall || true
+        ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \\
+        cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \\
+        rm -f /tmp/sshd_config.reinstall
       fi
-      systemctl restart sshd 2>/dev/null || \
-      systemctl restart ssh 2>/dev/null || \
-      service sshd restart 2>/dev/null || \
-      service ssh restart 2>/dev/null || true
+      if command -v semanage >/dev/null 2>&1; then
+        semanage port -a -t ssh_port_t -p tcp ${SSH_PORT} 2>/dev/null || \\
+        semanage port -m -t ssh_port_t -p tcp ${SSH_PORT} 2>/dev/null || true
+      fi
+      if command -v sshd >/dev/null 2>&1; then
+        sshd -t || exit 1
+      fi
+      systemctl restart sshd 2>/dev/null || \\
+      systemctl restart ssh 2>/dev/null || \\
+      service sshd restart 2>/dev/null || \\
+      service ssh restart 2>/dev/null || exit 1
 EOF
         fi
 
-        if [[ -n "$FRPC_PRESENT" ]]; then
+        if [[ -n "$frpc_b64" ]]; then
             cat <<'EOF'
   - |
-      # If EFI nocloud contains frpc.toml, copy to /etc/frp and try to start frpc.
-      # Note: actual mountpoint may vary by distro/image; /boot/efi is the common path only.
-      if [ -f /boot/efi/nocloud/frpc.toml ]; then
-        mkdir -p /etc/frp
-        cp /boot/efi/nocloud/frpc.toml /etc/frp/frpc.toml
+      if [ -f /etc/frp/frpc.toml ]; then
         (frpc -c /etc/frp/frpc.toml || /usr/local/bin/frpc -c /etc/frp/frpc.toml || true) &
       fi
 EOF
         fi
     } >"$user_path"
 }
+
 
 # ----------------- environment + plan handling -----------------
 
@@ -1233,10 +1463,14 @@ BOOTSTRAP_APKREPO_COMMUNITY_ABS=""
 BOOTSTRAP_IMG_REL=""
 BOOTSTRAP_IMG_ABS=""
 BOOTSTRAP_IMG_NAME=""
+BOOTSTRAP_INPUT_DIR_REL=""
+BOOTSTRAP_INPUT_DIR_ABS=""
+FRPC_BOOTSTRAP_REL=""
+POST_INSTALL_HOOK_BOOTSTRAP_REL=""
 
 ALPINE_RUNTIME_PKGS=(
     bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar
-    e2fsprogs dosfstools
+    e2fsprogs dosfstools gptfdisk
 )
 
 detect_env_mode() {
@@ -1474,6 +1708,10 @@ save_plan_to_efi() {
         printf 'TARGET_OS=%q\n' "$TARGET_OS"
         printf 'TARGET_VER=%q\n' "$TARGET_VER"
         printf 'DISK=%q\n' "$DISK"
+        printf 'DISK_ID_WWN=%q\n' "${DISK_ID_WWN:-}"
+        printf 'DISK_ID_SERIAL=%q\n' "${DISK_ID_SERIAL:-}"
+        printf 'DISK_ID_SIZE=%q\n' "${DISK_ID_SIZE:-}"
+        printf 'DISK_ID_MODEL=%q\n' "${DISK_ID_MODEL:-}"
         printf 'IMG_URL=%q\n' "$IMG_URL"
         printf 'PASSWORD_HASH=%q\n' "$PASSWORD_HASH"
         printf 'SSH_KEYS_ALL=%q\n' "$SSH_KEYS_ALL"
@@ -1481,6 +1719,8 @@ save_plan_to_efi() {
         printf 'WEB_PORT=%q\n' "$WEB_PORT"
         printf 'FRPC_TOML=%q\n' "$FRPC_TOML"
         printf 'POST_INSTALL_HOOK=%q\n' "$POST_INSTALL_HOOK"
+        printf 'FRPC_BOOTSTRAP_REL=%q\n' "${FRPC_BOOTSTRAP_REL:-}"
+        printf 'POST_INSTALL_HOOK_BOOTSTRAP_REL=%q\n' "${POST_INSTALL_HOOK_BOOTSTRAP_REL:-}"
         printf 'AUTO_PASSWORD=%q\n' "$AUTO_PASSWORD"
         printf 'HOLD=%q\n' "$HOLD"
         printf 'PLAN_EFI_PART=%q\n' "$PLAN_EFI_PART"
@@ -1712,6 +1952,7 @@ setup_bootstrap_bundle_paths() {
     BOOTSTRAP_APKREPO_DIR_REL="/$PLAN_DIR_REL/apkrepo"
     BOOTSTRAP_APKREPO_MAIN_REL="$BOOTSTRAP_APKREPO_DIR_REL/main"
     BOOTSTRAP_APKREPO_COMMUNITY_REL="$BOOTSTRAP_APKREPO_DIR_REL/community"
+    BOOTSTRAP_INPUT_DIR_REL="/$PLAN_DIR_REL/input"
 
     if [[ "${IMG_URL:-}" == *.xz ]]; then
         BOOTSTRAP_IMG_NAME="image.qcow2.xz"
@@ -1725,6 +1966,7 @@ setup_bootstrap_bundle_paths() {
     BOOTSTRAP_APKREPO_MAIN_ABS="$root_abs$BOOTSTRAP_APKREPO_MAIN_REL"
     BOOTSTRAP_APKREPO_COMMUNITY_ABS="$root_abs$BOOTSTRAP_APKREPO_COMMUNITY_REL"
     BOOTSTRAP_IMG_ABS="$root_abs$BOOTSTRAP_IMG_REL"
+    BOOTSTRAP_INPUT_DIR_ABS="$root_abs$BOOTSTRAP_INPUT_DIR_REL"
 }
 
 detect_current_console_args() {
@@ -1932,10 +2174,10 @@ build_local_apk_repo() {
         local rec name ver deps provides tok norm
 
         while IFS= read -r -d '' rec; do
-            name=$(awk -F': ' '$1=="P"{print $2; exit}' <<<"$rec")
-            ver=$(awk -F': ' '$1=="V"{print $2; exit}' <<<"$rec")
-            deps=$(awk -F': ' '$1=="D"{print $2; exit}' <<<"$rec")
-            provides=$(awk -F': ' '$1=="p"{print $2; exit}' <<<"$rec")
+            name=$(awk '/^P:/{sub(/^P:/, ""); print; exit}' <<<"$rec")
+            ver=$(awk '/^V:/{sub(/^V:/, ""); print; exit}' <<<"$rec")
+            deps=$(awk '/^D:/{sub(/^D:/, ""); print; exit}' <<<"$rec")
+            provides=$(awk '/^p:/{sub(/^p:/, ""); print; exit}' <<<"$rec")
 
             [[ -n "$name" && -n "$ver" ]] || continue
 
@@ -2043,14 +2285,59 @@ download_target_image_to_bootstrap() {
     precheck_bootstrap_space_for_download "$EFI_MOUNT_POINT" "$IMG_URL" 2
 
     if [[ -f "$BOOTSTRAP_IMG_ABS" ]]; then
-        info "Target image already cached on bootstrap storage: $BOOTSTRAP_IMG_ABS"
-        return 0
+        if [[ "$BOOTSTRAP_IMG_ABS" == *.xz ]]; then
+            if xz -t "$BOOTSTRAP_IMG_ABS" >/dev/null 2>&1; then
+                info "Target image already cached on bootstrap storage: $BOOTSTRAP_IMG_ABS"
+                return 0
+            fi
+        elif qemu-img info "$BOOTSTRAP_IMG_ABS" >/dev/null 2>&1; then
+            info "Target image already cached on bootstrap storage: $BOOTSTRAP_IMG_ABS"
+            return 0
+        fi
+        warn "Cached target image failed validation; redownloading: $BOOTSTRAP_IMG_ABS"
+        rm -f "$BOOTSTRAP_IMG_ABS"
     fi
 
     info "Downloading target image to bootstrap storage..."
     http_download "$IMG_URL" "$BOOTSTRAP_IMG_ABS"
+    if [[ "$BOOTSTRAP_IMG_ABS" == *.xz ]]; then
+        xz -t "$BOOTSTRAP_IMG_ABS" || error "Downloaded xz image failed integrity validation"
+    else
+        qemu-img info "$BOOTSTRAP_IMG_ABS" >/dev/null || error "Downloaded image is not a readable qcow2 image"
+    fi
     sync
     info "Cached target image: $BOOTSTRAP_IMG_ABS"
+}
+
+cache_optional_inputs_to_bootstrap() {
+    mkdir -p "$BOOTSTRAP_INPUT_DIR_ABS"
+
+    FRPC_BOOTSTRAP_REL=""
+    POST_INSTALL_HOOK_BOOTSTRAP_REL=""
+
+    if [[ -n "${FRPC_TOML:-}" ]]; then
+        FRPC_BOOTSTRAP_REL="$BOOTSTRAP_INPUT_DIR_REL/frpc.toml"
+        if [[ "$FRPC_TOML" =~ ^https?:// ]]; then
+            info "Caching FRPC config for offline installer: $FRPC_TOML"
+            http_download "$FRPC_TOML" "$BOOTSTRAP_INPUT_DIR_ABS/frpc.toml"
+        elif [[ -f "$FRPC_TOML" ]]; then
+            info "Caching FRPC config for offline installer: $FRPC_TOML"
+            cp "$FRPC_TOML" "$BOOTSTRAP_INPUT_DIR_ABS/frpc.toml"
+        else
+            error "Invalid FRPC config path: $FRPC_TOML"
+        fi
+        chmod 0600 "$BOOTSTRAP_INPUT_DIR_ABS/frpc.toml" 2>/dev/null || true
+    fi
+
+    if [[ -n "${POST_INSTALL_HOOK:-}" ]]; then
+        [[ -f "$POST_INSTALL_HOOK" ]] || error "Post-install hook not found: $POST_INSTALL_HOOK"
+        POST_INSTALL_HOOK_BOOTSTRAP_REL="$BOOTSTRAP_INPUT_DIR_REL/post-install-hook.sh"
+        info "Caching post-install hook for offline installer: $POST_INSTALL_HOOK"
+        cp "$POST_INSTALL_HOOK" "$BOOTSTRAP_INPUT_DIR_ABS/post-install-hook.sh"
+        chmod 0700 "$BOOTSTRAP_INPUT_DIR_ABS/post-install-hook.sh"
+    fi
+
+    sync
 }
 
 build_alpine_apkovl() {
@@ -2086,13 +2373,13 @@ EOF
 
     startfile="$ovl_dir/usr/local/sbin/reinstall-auto.sh"
     cat >"$startfile" <<'EOF'
-#!/bin/bash
+#!/bin/sh
 set -eu
 
 LOG="/var/log/reinstall-auto.log"
 mkdir -p /var/log
 touch "$LOG"
-exec > >(tee -a "$LOG") 2>&1
+exec >>"$LOG" 2>&1
 
 echo "===== reinstall-auto start $(date) ====="
 
@@ -2207,7 +2494,7 @@ REPOEOF
     echo "[stage] apk add (offline local repos)"
     apk add --no-cache --allow-untrusted \
         bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
-        e2fsprogs dosfstools
+        e2fsprogs dosfstools gptfdisk
 }
 
 main() {
@@ -2239,11 +2526,13 @@ main() {
         exit 1
     }
 
-    chmod 0755 "$SCRIPT_FILE" || true
+    RUN_SCRIPT="/run/reinstall-installer.sh"
+    cp "$SCRIPT_FILE" "$RUN_SCRIPT"
+    chmod 0755 "$RUN_SCRIPT"
 
     echo "[stage] launch installer"
     echo "Launching installer phase..."
-    bash "$SCRIPT_FILE" --phase installer --yes
+    bash "$RUN_SCRIPT" --phase installer --yes
 
     rc=$?
     echo "Installer phase finished with rc=$rc"
@@ -2356,18 +2645,15 @@ install_freebsd_bootnext_entry() {
 
     local before after newnum old
 
-    [[ -n "${PLAN_EFI_PART_DISK:-}" ]] || split_freebsd_part_device "$PLAN_EFI_PART"
-    [[ -n "${PLAN_EFI_PART_NUM:-}" ]] || error "Missing FreeBSD EFI partition number"
-
     while read -r old; do
         [[ -n "$old" ]] || continue
-        efibootmgr -b "$old" -B >/dev/null 2>&1 || warn "Failed to delete old EFI boot entry: $old"
+        efibootmgr -B -b "$old" >/dev/null 2>&1 || warn "Failed to delete old EFI boot entry: $old"
     done < <(
         efibootmgr 2>/dev/null | awk -v title="$ALPINE_ENTRY_TITLE" '
             $0 ~ title {
                 n = substr($1, 5, 4)
                 gsub(/\*/, "", n)
-                print n
+                print toupper(n)
             }
         '
     )
@@ -2377,15 +2663,13 @@ install_freebsd_bootnext_entry() {
         awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
             n = substr($1, 5, 4)
             gsub(/\*/, "", n)
-            printf "%d\n", strtonum("0x" n)
-        }' | sort -n -u
+            print toupper(n)
+        }' | sort -u
     )
 
     info "Creating FreeBSD UEFI boot entry: ${ALPINE_ENTRY_TITLE}"
-    efibootmgr -c \
-        --disk "$PLAN_EFI_PART_DISK" \
-        --part "$PLAN_EFI_PART_NUM" \
-        -l "$(printf '%s' "$ALPINE_FREEBSD_GRUB_EFI_REL" | tr '/' '\\')" \
+    efibootmgr -a -c \
+        -l "$ALPINE_FREEBSD_GRUB_EFI_ABS" \
         -L "$ALPINE_ENTRY_TITLE" >/dev/null
 
     after=$(
@@ -2393,26 +2677,23 @@ install_freebsd_bootnext_entry() {
         awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
             n = substr($1, 5, 4)
             gsub(/\*/, "", n)
-            printf "%d\n", strtonum("0x" n)
-        }' | sort -n -u
+            print toupper(n)
+        }' | sort -u
     )
 
-    newnum=$(
-        comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n1
-    )
-
+    newnum=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n1)
     [[ -n "$newnum" ]] || error "Failed to determine new EFI boot entry after creating ${ALPINE_ENTRY_TITLE}"
 
-    printf -v newnum '%04X' "$newnum"
-
     info "Setting BootNext to EFI entry $newnum (${ALPINE_ENTRY_TITLE})"
-    efibootmgr -n "$newnum" >/dev/null
+    efibootmgr -n -b "$newnum" >/dev/null
 }
 
 prepare_and_boot_alpine_ram() {
     [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host in this function"
 
     prepare_alpine_paths
+    cache_optional_inputs_to_bootstrap
+    save_plan_to_efi
     copy_script_to_efi
     download_alpine_ram_files
     download_target_image_to_bootstrap
@@ -2431,6 +2712,8 @@ prepare_and_boot_alpine_ram_freebsd() {
     [[ "$OS" == "FreeBSD" ]] || error "Automatic FreeBSD BootNext bootstrap only supports FreeBSD host in this function"
 
     prepare_alpine_paths
+    cache_optional_inputs_to_bootstrap
+    save_plan_to_efi
     copy_script_to_efi
     download_alpine_ram_files
     download_target_image_to_bootstrap
@@ -2468,6 +2751,41 @@ locate_bootstrap_image() {
     return 1
 }
 
+reread_partition_table_strict() {
+    sync
+    if command -v partprobe >/dev/null 2>&1; then
+        partprobe "$DISK" || error "Failed to reread target partition table with partprobe"
+    elif command -v blockdev >/dev/null 2>&1; then
+        blockdev --rereadpt "$DISK" || error "Failed to reread target partition table with blockdev"
+    else
+        error "No partprobe or blockdev available to reread the target partition table"
+    fi
+    command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+}
+
+create_nocloud_cidata_partition() {
+    [[ "$OS" == "Linux" ]] || error "Creating the standard NoCloud CIDATA partition requires the Linux/Alpine installer environment"
+    command -v sgdisk >/dev/null 2>&1 || error "sgdisk is required to create a standard NoCloud CIDATA partition"
+    command -v mkfs.vfat >/dev/null 2>&1 || error "mkfs.vfat is required to create a standard NoCloud CIDATA partition"
+
+    if ! sgdisk -p "$DISK" >/dev/null 2>&1; then
+        error "Target image does not expose a usable GPT; refusing non-standard EFI:/nocloud injection"
+    fi
+
+    info "Creating dedicated 16 MiB NoCloud CIDATA partition..."
+    sgdisk -e "$DISK" >/dev/null || error "Failed to relocate GPT backup header on $DISK"
+    sgdisk -n 0:0:+16M -t 0:0700 -c 0:CIDATA "$DISK" >/dev/null || \
+        error "Failed to create CIDATA partition; target disk may not have enough unallocated GPT space"
+    reread_partition_table_strict
+    sleep 1
+
+    local seed_part
+    seed_part=$(lsblk -lnpo NAME,PARTLABEL "$DISK" 2>/dev/null | awk '$2=="CIDATA" {print $1; exit}')
+    [[ -n "$seed_part" && -b "$seed_part" ]] || error "Could not locate newly created CIDATA partition"
+    mkfs.vfat -F 32 -n CIDATA "$seed_part" >/dev/null || error "Failed to format CIDATA partition: $seed_part"
+    printf '%s\n' "$seed_part"
+}
+
 do_install() {
     info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
     info "Target: $TARGET_OS ${TARGET_VER:-"(no version)"}"
@@ -2485,7 +2803,7 @@ do_install() {
     IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
     IMG_RAW="$INSTALL_TMPDIR/image.raw"
 
-    local bootstrap_root_abs local_img
+    local bootstrap_root_abs local_img raw_size disk_size staged_frpc staged_hook
     bootstrap_root_abs="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL"
     local_img=$(locate_bootstrap_image "$bootstrap_root_abs" || true)
     [[ -n "$local_img" ]] || error "Offline target image not found on bootstrap storage under $bootstrap_root_abs/$PLAN_DIR_REL/cache"
@@ -2505,8 +2823,34 @@ do_install() {
         cp "$local_img" "$IMG_QCOW"
     fi
 
+    qemu-img info "$IMG_QCOW" >/dev/null || error "Cached image is not a readable qcow2 image"
+
     info "Converting qcow2 to raw with qemu-img (with progress)..."
     qemu-img convert -p -O raw "$IMG_QCOW" "$IMG_RAW"
+
+    raw_size=$(get_file_size_bytes "$IMG_RAW" || true)
+    disk_size=$(get_disk_size_bytes "$DISK" || true)
+    [[ -n "$raw_size" && -n "$disk_size" ]] || error "Could not determine image or target disk size before dd"
+    if [[ "$raw_size" -gt "$disk_size" ]]; then
+        error "Target disk is smaller than the raw image. Raw image: ${raw_size} bytes; target disk: ${disk_size} bytes"
+    fi
+
+    staged_frpc=""
+    staged_hook=""
+    if [[ -n "${FRPC_BOOTSTRAP_REL:-}" && -f "$bootstrap_root_abs$FRPC_BOOTSTRAP_REL" ]]; then
+        staged_frpc="$INSTALL_TMPDIR/frpc.toml"
+        cp "$bootstrap_root_abs$FRPC_BOOTSTRAP_REL" "$staged_frpc"
+        FRPC_TOML="$staged_frpc"
+    fi
+    if [[ -n "${POST_INSTALL_HOOK_BOOTSTRAP_REL:-}" && -f "$bootstrap_root_abs$POST_INSTALL_HOOK_BOOTSTRAP_REL" ]]; then
+        staged_hook="$INSTALL_TMPDIR/post-install-hook.sh"
+        cp "$bootstrap_root_abs$POST_INSTALL_HOOK_BOOTSTRAP_REL" "$staged_hook"
+        chmod 0700 "$staged_hook"
+        POST_INSTALL_HOOK="$staged_hook"
+    fi
+
+    sync
+    unmount_target_disk_filesystems "$DISK"
 
     echo
     echo "WARNING: dd will be run on $DISK. ALL DATA ON THIS DISK WILL BE LOST!"
@@ -2538,64 +2882,28 @@ do_install() {
     sync
     info "dd finished."
 
-    if command -v partprobe >/dev/null 2>&1; then
-        partprobe "$DISK" || true
-    elif command -v blockdev >/dev/null 2>&1; then
-        blockdev --rereadpt "$DISK" || true
-    fi
-
+    reread_partition_table_strict
     sleep 2
 
-    EFI_PART=$(find_efi_partition "$DISK")
-    info "Trying EFI partition: $EFI_PART"
+    local CIDATA_PART MNT_CIDATA
+    CIDATA_PART=$(create_nocloud_cidata_partition)
+    info "Using NoCloud CIDATA partition: $CIDATA_PART"
 
-    MNT_EFI="$INSTALL_TMPDIR/efi"
-    mkdir -p "$MNT_EFI"
+    MNT_CIDATA="$INSTALL_TMPDIR/cidata"
+    mkdir -p "$MNT_CIDATA"
+    mount -t vfat "$CIDATA_PART" "$MNT_CIDATA" || error "Failed to mount CIDATA partition $CIDATA_PART"
 
-    if [[ "$OS" == "FreeBSD" ]]; then
-        if ! mount -t msdosfs "$EFI_PART" "$MNT_EFI" 2>/dev/null; then
-            warn "Failed to mount EFI partition $EFI_PART, skipping cloud-init NoCloud injection."
-            EFI_PART=""
-        fi
+    if [[ -n "$FRPC_TOML" && -f "$FRPC_TOML" ]]; then
+        FRPC_PRESENT=1
     else
-        if ! mount "$EFI_PART" "$MNT_EFI" 2>/dev/null; then
-            if ! mount -t vfat "$EFI_PART" "$MNT_EFI" 2>/dev/null && ! mount -t msdos "$EFI_PART" "$MNT_EFI" 2>/dev/null; then
-                warn "Failed to mount EFI partition $EFI_PART, skipping cloud-init NoCloud injection."
-                EFI_PART=""
-            fi
-        fi
+        FRPC_PRESENT=""
     fi
 
-    if [[ -n "$EFI_PART" ]]; then
-        NOCLOUD_DIR="$MNT_EFI/nocloud"
-        mkdir -p "$NOCLOUD_DIR"
+    info "Writing standard NoCloud seed to CIDATA:/ ..."
+    write_nocloud_seed "$TARGET_OS" "$MNT_CIDATA/meta-data" "$MNT_CIDATA/user-data"
 
-        if [[ -n "$FRPC_TOML" ]]; then
-            FRPC_PRESENT=1
-            if [[ "$FRPC_TOML" =~ ^https?:// ]]; then
-                info "Downloading FRPC config: $FRPC_TOML"
-                if ! http_download "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"; then
-                    warn "Failed to download FRPC config, ignoring"
-                    FRPC_PRESENT=""
-                fi
-            elif [[ -f "$FRPC_TOML" ]]; then
-                info "Copying FRPC config from: $FRPC_TOML"
-                cp "$FRPC_TOML" "$NOCLOUD_DIR/frpc.toml"
-            else
-                warn "Invalid FRPC config path: $FRPC_TOML, ignoring"
-                FRPC_PRESENT=""
-            fi
-        fi
-
-        info "Writing NoCloud seed to EFI:/nocloud/ ..."
-        write_nocloud_seed "$TARGET_OS" "$NOCLOUD_DIR/meta-data" "$NOCLOUD_DIR/user-data"
-
-        sync
-        umount "$MNT_EFI" || true
-    else
-        warn "EFI could not be mounted; target system can still boot, but cloud-init configuration may not be applied."
-        warn "This script assumes a cloud image that supports NoCloud via EFI seed on first boot."
-    fi
+    sync
+    umount "$MNT_CIDATA" || error "Failed to unmount CIDATA partition $CIDATA_PART"
 
     info "Image write and cloud-init NoCloud injection completed."
 
@@ -2699,21 +3007,28 @@ if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" || "$ENV_MODE" == "a
         shift || true
     done
 
-    detect_os_arch
-    ensure_dependencies
+    INSTALLER_HOLD_OVERRIDE="$HOLD"
 
+    detect_os_arch
     load_plan_from_efi
+
+    if [[ "$INSTALLER_HOLD_OVERRIDE" != "0" ]]; then
+        HOLD="$INSTALLER_HOLD_OVERRIDE"
+    fi
+    if [[ "$HOLD" != "1" ]]; then
+        ensure_dependencies
+    fi
 
     if [[ -n "$DISK" && "$DISK" != /dev/* ]]; then
         DISK="/dev/$DISK"
     fi
     if [[ -z "$DISK" ]]; then
         auto_detect_disk
+    else
+        resolve_target_disk_from_identity
     fi
 
-    if [[ ! -b "$DISK" && ! -c "$DISK" ]]; then
-        error "Target disk $DISK does not exist or is not a block/char device"
-    fi
+    validate_target_disk "$DISK"
 
     do_install
     exit 0
@@ -2826,7 +3141,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 detect_os_arch
-ensure_dependencies
+if [[ "$HOLD" != "1" ]]; then
+    ensure_dependencies
+fi
 
 if [[ -n "$DISK" ]]; then
     if [[ "$DISK" != /dev/* ]]; then
@@ -2837,9 +3154,8 @@ else
     confirm_auto_detected_disk_host
 fi
 
-if [[ ! -b "$DISK" ]] && [[ ! -c "$DISK" ]]; then
-    error "Target disk $DISK does not exist or is not a block/char device"
-fi
+validate_target_disk "$DISK"
+capture_target_disk_identity "$DISK"
 
 if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
     echo "No --password or --ssh-key specified."
