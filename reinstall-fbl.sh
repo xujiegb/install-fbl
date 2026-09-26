@@ -25,12 +25,14 @@
 #     build a GRUB EFI binary, add a one-time BootNext entry, reboot into Alpine RAM,
 #     and auto-continue.
 #
-# Offline bootstrap mode:
-#   - Host phase downloads target qcow/qcow.xz to bootstrap storage in advance.
-#   - Host phase downloads required Alpine .apk packages and APKINDEX.tar.gz
-#     into local bootstrap repos.
-#   - Alpine RAM phase installs runtime deps from local repos only (no network).
-#   - Installer phase reads image from bootstrap storage only (no network).
+# Alpine RAM download mode:
+#   - Host phase stores only the reinstall plan, script, optional local inputs,
+#     and Alpine boot assets on bootstrap storage.
+#   - Alpine RAM obtains networking with DHCP and installs runtime packages
+#     directly from the official Alpine repositories.
+#   - Alpine RAM enables zram swap before downloading/converting the target image.
+#   - Target qcow/qcow.xz and URL-based optional files are downloaded by Alpine.
+#   - qcow2 is converted directly onto the target block device; no raw staging file is kept.
 #
 # Important compatibility note:
 #   - This script creates a dedicated VFAT partition labeled CIDATA for standard NoCloud discovery.
@@ -98,8 +100,8 @@ Options:
                        you can consume it later from within the system.
 
   --frpc-toml PATH/URL Add FRPC configuration for tunneling:
-                         - Local path: cache during host phase and embed into NoCloud user-data
-                         - HTTP(S): download during host phase and embed into NoCloud user-data
+                         - Local path: cache the small file during host phase
+                         - HTTP(S): download from Alpine RAM during installer phase
                        cloud-init writes it to /etc/frp/frpc.toml and tries to start frpc if available.
 
   --post-install-hook PATH
@@ -107,7 +109,7 @@ Options:
                        This replaces the old implicit current-directory hook behavior.
 
   --hold 1             Only validate and print planned actions, do not download or write disk.
-  --hold 2             Perform dd + NoCloud injection but do NOT reboot.
+  --hold 2             Perform target-disk write + NoCloud injection but do NOT reboot.
 
 Password / SSH key behaviour:
   - If you specify one or more --ssh-key, you may omit --password (root login via key only).
@@ -1469,8 +1471,8 @@ FRPC_BOOTSTRAP_REL=""
 POST_INSTALL_HOOK_BOOTSTRAP_REL=""
 
 ALPINE_RUNTIME_PKGS=(
-    bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar
-    e2fsprogs dosfstools gptfdisk
+    bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar
+    e2fsprogs dosfstools gptfdisk kmod
 )
 
 detect_env_mode() {
@@ -2114,7 +2116,7 @@ download_alpine_ram_files() {
     tmpdir=$(mktemp -d /tmp/reinstall-alpine-netboot.XXXXXX)
 
     base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/${ALPINE_NETBOOT_SUBDIR}"
-    ALPINE_KERNEL_FLAVOR="lts"
+    ALPINE_KERNEL_FLAVOR="virt"
 
     info "Using fixed Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}, source=${base}"
 
@@ -2316,23 +2318,22 @@ cache_optional_inputs_to_bootstrap() {
     POST_INSTALL_HOOK_BOOTSTRAP_REL=""
 
     if [[ -n "${FRPC_TOML:-}" ]]; then
-        FRPC_BOOTSTRAP_REL="$BOOTSTRAP_INPUT_DIR_REL/frpc.toml"
         if [[ "$FRPC_TOML" =~ ^https?:// ]]; then
-            info "Caching FRPC config for offline installer: $FRPC_TOML"
-            http_download "$FRPC_TOML" "$BOOTSTRAP_INPUT_DIR_ABS/frpc.toml"
+            info "FRPC URL will be downloaded later from Alpine RAM: $FRPC_TOML"
         elif [[ -f "$FRPC_TOML" ]]; then
-            info "Caching FRPC config for offline installer: $FRPC_TOML"
+            FRPC_BOOTSTRAP_REL="$BOOTSTRAP_INPUT_DIR_REL/frpc.toml"
+            info "Caching local FRPC config on bootstrap storage: $FRPC_TOML"
             cp "$FRPC_TOML" "$BOOTSTRAP_INPUT_DIR_ABS/frpc.toml"
+            chmod 0600 "$BOOTSTRAP_INPUT_DIR_ABS/frpc.toml" 2>/dev/null || true
         else
             error "Invalid FRPC config path: $FRPC_TOML"
         fi
-        chmod 0600 "$BOOTSTRAP_INPUT_DIR_ABS/frpc.toml" 2>/dev/null || true
     fi
 
     if [[ -n "${POST_INSTALL_HOOK:-}" ]]; then
         [[ -f "$POST_INSTALL_HOOK" ]] || error "Post-install hook not found: $POST_INSTALL_HOOK"
         POST_INSTALL_HOOK_BOOTSTRAP_REL="$BOOTSTRAP_INPUT_DIR_REL/post-install-hook.sh"
-        info "Caching post-install hook for offline installer: $POST_INSTALL_HOOK"
+        info "Caching local post-install hook on bootstrap storage: $POST_INSTALL_HOOK"
         cp "$POST_INSTALL_HOOK" "$BOOTSTRAP_INPUT_DIR_ABS/post-install-hook.sh"
         chmod 0700 "$BOOTSTRAP_INPUT_DIR_ABS/post-install-hook.sh"
     fi
@@ -2354,8 +2355,9 @@ build_alpine_apkovl() {
         "$ovl_dir/etc/reinstall"
 
     repofile="$ovl_dir/etc/apk/repositories"
-    cat >"$repofile" <<'EOF'
-# repositories will be rewritten at runtime to point at bootstrap local repos
+    cat >"$repofile" <<EOF
+${ALPINE_REPO_BASE}/main/${ALPINE_NETBOOT_ARCH}
+${ALPINE_REPO_BASE}/community/${ALPINE_NETBOOT_ARCH}
 EOF
 
     markerfile="$ovl_dir/etc/reinstall/vars"
@@ -2472,29 +2474,103 @@ mount_bootstrap() {
     return 1
 }
 
-install_runtime_deps_offline() {
-    local bootstrap_prefix="$1"
-    local repo_main="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/apkrepo/main"
-    local repo_community="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/apkrepo/community"
+ensure_network() {
+    local n
 
-    [ -d "$repo_main" ] || {
-        echo "Local APK repo missing: $repo_main"
+    if ip route 2>/dev/null | grep -q '^default '; then
+        echo "Network already configured by Alpine initramfs."
+        return 0
+    fi
+
+    echo "No default route found; retrying DHCP."
+    for n in /sys/class/net/*; do
+        [ -e "$n" ] || continue
+        n="${n##*/}"
+        [ "$n" = "lo" ] && continue
+        ip link set dev "$n" up 2>/dev/null || true
+        if command -v udhcpc >/dev/null 2>&1; then
+            if udhcpc -i "$n" -f -q -n -t 5 2>/dev/null; then
+                break
+            fi
+        fi
+    done
+
+    ip route 2>/dev/null | grep -q '^default ' || {
+        echo "Failed to obtain a default route in Alpine RAM."
         exit 1
     }
-    [ -d "$repo_community" ] || {
-        echo "Local APK repo missing: $repo_community"
-        exit 1
-    }
+}
 
+install_runtime_deps_online() {
     cat > /etc/apk/repositories <<REPOEOF
-$repo_main
-$repo_community
+https://dl-cdn.alpinelinux.org/alpine/v3.22/main
+https://dl-cdn.alpinelinux.org/alpine/v3.22/community
 REPOEOF
 
-    echo "[stage] apk add (offline local repos)"
-    apk add --no-cache --allow-untrusted \
-        bash curl wget xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
-        e2fsprogs dosfstools gptfdisk
+    echo "[stage] apk update (online)"
+    apk update
+    echo "[stage] apk add (online official repos)"
+    apk add --no-cache \
+        bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
+        e2fsprogs dosfstools gptfdisk kmod
+    update-ca-certificates 2>/dev/null || true
+}
+
+setup_zram_swap() {
+    local mem_kb zram_bytes min_bytes max_bytes
+
+    mem_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+    [ -n "$mem_kb" ] || {
+        echo "Could not determine MemTotal; refusing to continue without zram swap."
+        exit 1
+    }
+
+    # Logical zram size = 2x physical RAM, minimum 1 GiB, maximum 8 GiB.
+    zram_bytes=$((mem_kb * 1024 * 2))
+    min_bytes=1073741824
+    max_bytes=8589934592
+    [ "$zram_bytes" -lt "$min_bytes" ] && zram_bytes="$min_bytes"
+    [ "$zram_bytes" -gt "$max_bytes" ] && zram_bytes="$max_bytes"
+
+    modprobe zram || {
+        echo "zram kernel module is unavailable; virtual memory is required for this installer."
+        exit 1
+    }
+    [ -e /dev/zram0 ] || mdev -s 2>/dev/null || true
+    [ -b /dev/zram0 ] || {
+        echo "zram0 block device was not created."
+        exit 1
+    }
+
+    swapoff /dev/zram0 2>/dev/null || true
+    if [ -e /sys/block/zram0/reset ]; then
+        echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+    fi
+    echo "$zram_bytes" > /sys/block/zram0/disksize
+    mkswap /dev/zram0 >/dev/null
+    swapon -p 100 /dev/zram0
+
+    echo "$zram_bytes" > /run/reinstall-zram-bytes
+    echo "Enabled zram swap: $((zram_bytes / 1024 / 1024)) MiB logical size"
+    free -m 2>/dev/null || true
+}
+
+setup_work_tmpfs() {
+    local mem_kb mem_bytes zram_bytes work_bytes reserve
+
+    mem_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
+    mem_bytes=$((mem_kb * 1024))
+    zram_bytes="$(cat /run/reinstall-zram-bytes 2>/dev/null || echo 0)"
+    reserve=268435456
+    work_bytes=$((mem_bytes + zram_bytes - reserve))
+    [ "$work_bytes" -gt 536870912 ] || work_bytes=536870912
+
+    mkdir -p /run/reinstall-work
+    if mountpoint -q /run/reinstall-work 2>/dev/null; then
+        umount /run/reinstall-work 2>/dev/null || true
+    fi
+    mount -t tmpfs -o "size=${work_bytes},mode=0700" tmpfs /run/reinstall-work
+    echo "Created swap-backed tmpfs work area: $((work_bytes / 1024 / 1024)) MiB limit"
 }
 
 main() {
@@ -2511,8 +2587,17 @@ main() {
         exit 1
     fi
 
-    echo "[stage] install_runtime_deps_offline"
-    install_runtime_deps_offline "$bootstrap_prefix"
+    echo "[stage] ensure_network"
+    ensure_network
+
+    echo "[stage] install_runtime_deps_online"
+    install_runtime_deps_online
+
+    echo "[stage] setup_zram_swap"
+    setup_zram_swap
+
+    echo "[stage] setup_work_tmpfs"
+    setup_work_tmpfs
 
     PLAN_FILE="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}"
     SCRIPT_FILE="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/${SCRIPT_NAME}"
@@ -2592,7 +2677,7 @@ install_grub_entry_for_alpine() {
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
     search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=none alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -2601,7 +2686,7 @@ EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
-    linux /boot${ALPINE_VMLINUZ_REL} ip=none alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} apkovl=/boot${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} apkovl=/boot${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd /boot${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -2624,7 +2709,7 @@ build_freebsd_grub_efi() {
     cfg="$tmp/grub.cfg"
     cat >"$cfg" <<EOF
 search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=none alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1 console=ttyS0 console=tty0
+linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1 console=ttyS0 console=tty0
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
@@ -2696,8 +2781,6 @@ prepare_and_boot_alpine_ram() {
     save_plan_to_efi
     copy_script_to_efi
     download_alpine_ram_files
-    download_target_image_to_bootstrap
-    build_local_apk_repo
     build_alpine_apkovl
     install_grub_entry_for_alpine
 
@@ -2716,8 +2799,6 @@ prepare_and_boot_alpine_ram_freebsd() {
     save_plan_to_efi
     copy_script_to_efi
     download_alpine_ram_files
-    download_target_image_to_bootstrap
-    build_local_apk_repo
     build_alpine_apkovl
     build_freebsd_grub_efi
     install_freebsd_bootnext_entry
@@ -2729,7 +2810,7 @@ prepare_and_boot_alpine_ram_freebsd() {
     shutdown -r now
 }
 
-# ----------------- installer execution (download + dd + NoCloud) -----------------
+# ----------------- installer execution (Alpine download + direct write + NoCloud) -----------------
 
 locate_bootstrap_image() {
     local root_abs="$1"
@@ -2786,6 +2867,48 @@ create_nocloud_cidata_partition() {
     printf '%s\n' "$seed_part"
 }
 
+download_target_image_in_alpine() {
+    local dst="$1" tmp="${1}.part.$$"
+
+    rm -f "$tmp"
+    info "Downloading target image from Alpine RAM: $IMG_URL"
+
+    if [[ "$IMG_URL" == *.xz ]]; then
+        if command -v curl >/dev/null 2>&1; then
+            if ! curl -L --fail "$IMG_URL" | xz -dc >"$tmp"; then
+                rm -f "$tmp"
+                error "Failed to download/decompress target xz image: $IMG_URL"
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if ! wget -O - "$IMG_URL" | xz -dc >"$tmp"; then
+                rm -f "$tmp"
+                error "Failed to download/decompress target xz image: $IMG_URL"
+            fi
+        else
+            error "No curl or wget available in Alpine RAM"
+        fi
+    else
+        http_download "$IMG_URL" "$tmp" || {
+            rm -f "$tmp"
+            error "Failed to download target image: $IMG_URL"
+        }
+    fi
+
+    qemu-img info "$tmp" >/dev/null 2>&1 || {
+        rm -f "$tmp"
+        error "Downloaded target image is not a readable qcow2 image"
+    }
+
+    mv -f "$tmp" "$dst"
+    info "Target qcow2 is ready in Alpine RAM: $dst"
+}
+
+get_qcow_virtual_size_bytes() {
+    local path="$1"
+    qemu-img info --output=json "$path" 2>/dev/null | \
+        awk -F': *' '/"virtual-size"/ {v=$2; gsub(/[,[:space:]]/, "", v); print v; exit}'
+}
+
 do_install() {
     info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
     info "Target: $TARGET_OS ${TARGET_VER:-"(no version)"}"
@@ -2797,47 +2920,35 @@ do_install() {
         return 0
     fi
 
-    INSTALL_TMPDIR=$(mktemp -d /tmp/reinstall-cloudinit.XXXXXX)
+    if [[ -d /run/reinstall-work ]] && mountpoint -q /run/reinstall-work 2>/dev/null; then
+        INSTALL_TMPDIR=$(mktemp -d /run/reinstall-work/install.XXXXXX)
+    else
+        error "Swap-backed Alpine work tmpfs is not mounted at /run/reinstall-work"
+    fi
     trap 'rm -rf "$INSTALL_TMPDIR"' EXIT
 
     IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
-    IMG_RAW="$INSTALL_TMPDIR/image.raw"
 
-    local bootstrap_root_abs local_img raw_size disk_size staged_frpc staged_hook
+    local bootstrap_root_abs virtual_size disk_size staged_frpc staged_hook
     bootstrap_root_abs="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL"
-    local_img=$(locate_bootstrap_image "$bootstrap_root_abs" || true)
-    [[ -n "$local_img" ]] || error "Offline target image not found on bootstrap storage under $bootstrap_root_abs/$PLAN_DIR_REL/cache"
 
-    info "Prechecking temporary space..."
-    precheck_tmp_space_for_local_image "$local_img"
+    download_target_image_in_alpine "$IMG_QCOW"
 
-    info "Using offline cached image: $local_img"
-    if file "$local_img" | grep -qi 'xz compressed'; then
-        info "Detected xz compressed cached image, decompressing (progress may be shown)..."
-        if command -v pv >/dev/null 2>&1; then
-            xz -dc "$local_img" | pv >"$IMG_QCOW"
-        else
-            xz -dc "$local_img" >"$IMG_QCOW"
-        fi
-    else
-        cp "$local_img" "$IMG_QCOW"
-    fi
-
-    qemu-img info "$IMG_QCOW" >/dev/null || error "Cached image is not a readable qcow2 image"
-
-    info "Converting qcow2 to raw with qemu-img (with progress)..."
-    qemu-img convert -p -O raw "$IMG_QCOW" "$IMG_RAW"
-
-    raw_size=$(get_file_size_bytes "$IMG_RAW" || true)
+    virtual_size=$(get_qcow_virtual_size_bytes "$IMG_QCOW" || true)
     disk_size=$(get_disk_size_bytes "$DISK" || true)
-    [[ -n "$raw_size" && -n "$disk_size" ]] || error "Could not determine image or target disk size before dd"
-    if [[ "$raw_size" -gt "$disk_size" ]]; then
-        error "Target disk is smaller than the raw image. Raw image: ${raw_size} bytes; target disk: ${disk_size} bytes"
+    [[ -n "$virtual_size" && -n "$disk_size" ]] || error "Could not determine qcow2 virtual size or target disk size before write"
+    if [[ "$virtual_size" -gt "$disk_size" ]]; then
+        error "Target disk is smaller than the qcow2 virtual disk. Image virtual size: ${virtual_size} bytes; target disk: ${disk_size} bytes"
     fi
 
     staged_frpc=""
     staged_hook=""
-    if [[ -n "${FRPC_BOOTSTRAP_REL:-}" && -f "$bootstrap_root_abs$FRPC_BOOTSTRAP_REL" ]]; then
+    if [[ -n "${FRPC_TOML:-}" && "$FRPC_TOML" =~ ^https?:// ]]; then
+        staged_frpc="$INSTALL_TMPDIR/frpc.toml"
+        info "Downloading FRPC config from Alpine RAM: $FRPC_TOML"
+        http_download "$FRPC_TOML" "$staged_frpc" || error "Failed to download FRPC config from Alpine RAM"
+        FRPC_TOML="$staged_frpc"
+    elif [[ -n "${FRPC_BOOTSTRAP_REL:-}" && -f "$bootstrap_root_abs$FRPC_BOOTSTRAP_REL" ]]; then
         staged_frpc="$INSTALL_TMPDIR/frpc.toml"
         cp "$bootstrap_root_abs$FRPC_BOOTSTRAP_REL" "$staged_frpc"
         FRPC_TOML="$staged_frpc"
@@ -2853,7 +2964,7 @@ do_install() {
     unmount_target_disk_filesystems "$DISK"
 
     echo
-    echo "WARNING: dd will be run on $DISK. ALL DATA ON THIS DISK WILL BE LOST!"
+    echo "WARNING: the target image will overwrite $DISK. ALL DATA ON THIS DISK WILL BE LOST!"
 
     if [[ "$AUTO_YES" -eq 1 ]]; then
         info "AUTO_YES=1, skipping interactive confirmation."
@@ -2868,19 +2979,11 @@ do_install() {
         esac
     fi
 
-    info "Writing image to disk with dd, this may take a while..."
-    if [[ "$OS" == "FreeBSD" ]]; then
-        if command -v pv >/dev/null 2>&1; then
-            pv "$IMG_RAW" | dd of="$DISK" bs=4M conv=fsync
-        else
-            echo "TIP: Press Ctrl+T to see dd progress on FreeBSD."
-            dd if="$IMG_RAW" of="$DISK" bs=4M conv=fsync
-        fi
-    else
-        dd if="$IMG_RAW" of="$DISK" bs=4M conv=fsync status=progress
-    fi
+    info "Writing qcow2 directly to target disk with qemu-img; no raw staging file will be created..."
+    qemu-img convert -p -n -f qcow2 -O raw "$IMG_QCOW" "$DISK" || \
+        error "qemu-img failed while writing the target disk"
     sync
-    info "dd finished."
+    info "Target image write finished."
 
     reread_partition_table_strict
     sleep 2
