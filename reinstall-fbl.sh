@@ -3293,7 +3293,10 @@ build_freebsd_grub_efi() {
 
     marker="search --no-floppy --set=root --label \"${volid}\""
     offset=$(
-        LC_ALL=C grep -a -b -F "$marker" "$ALPINE_FREEBSD_GRUB_EFI_ABS" 2>/dev/null |
+        # grep -b alone reports the offset of the output line.  In a PE/EFI
+        # binary the embedded config may begin in the middle of such a "line".
+        # -o makes -b report the byte offset of the matched text itself.
+        LC_ALL=C grep -a -b -o -F "$marker" "$ALPINE_FREEBSD_GRUB_EFI_ABS" 2>/dev/null |
         head -n1 | cut -d: -f1
     )
     [[ "$offset" =~ ^[0-9]+$ ]] || {
@@ -3312,10 +3315,12 @@ build_freebsd_grub_efi() {
         error "Failed to read Alpine GRUB embedded config before patching"
     }
 
-    cmp -s "$expected_file" "$before_file" || {
+    if ! cmp -s "$expected_file" "$before_file"; then
+        warn "Alpine GRUB embedded config verification failed at byte offset $offset."
+        warn "Expected the official Alpine early config beginning with: $marker"
         rm -rf "$tmp"
         error "Alpine GRUB embedded config did not exactly match the expected ${alpine_release} virt image; refusing binary patch"
-    }
+    fi
 
     printf '%s' "$new_cfg" >"$patch_file"
     pad=$(( old_len - new_len ))
