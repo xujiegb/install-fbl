@@ -1771,7 +1771,7 @@ POST_INSTALL_HOOK_BOOTSTRAP_REL=""
 
 ALPINE_RUNTIME_PKGS=(
     bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar
-    e2fsprogs dosfstools sgdisk kmod lvm2
+    e2fsprogs dosfstools sgdisk kmod lvm2 xfsprogs
 )
 
 detect_env_mode() {
@@ -2942,12 +2942,12 @@ REPOEOF
     echo "[stage] apk add (online official repos)"
     apk add --no-cache \
         bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
-        e2fsprogs dosfstools sgdisk kmod lvm2
+        e2fsprogs dosfstools sgdisk kmod lvm2 xfsprogs
     update-ca-certificates 2>/dev/null || true
 
     # Fail here with a precise message instead of reaching the destructive stage
     # and discovering that a split Alpine subpackage was not installed.
-    for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod pvresize; do
+    for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod pvresize xfs_db dumpe2fs resize2fs e2fsck; do
         command -v "$cmd" >/dev/null 2>&1 || {
             echo "Required Alpine runtime command is missing after apk add: $cmd"
             exit 1
@@ -3894,6 +3894,17 @@ inspect_qcow_partition_layout() {
     connect_qcow_readonly_nbd "$img"
     nbd="$QCOW_NBD_DEV"
 
+    # qemu-nbd exposes the actual guest-visible size of the qcow2. This is the
+    # authoritative value for overlap decisions; do not confuse repository file
+    # length/allocated bytes with the virtual block-device size.
+    local nbd_virtual_size
+    nbd_virtual_size=$(blockdev --getsize64 "$nbd" 2>/dev/null || true)
+    [[ "$nbd_virtual_size" =~ ^[0-9]+$ && "$nbd_virtual_size" -gt 0 ]] ||         error "Could not determine qcow2 guest-visible size through qemu-nbd"
+    if [[ "$QCOW_VIRTUAL_SIZE" != "$nbd_virtual_size" ]]; then
+        warn "qemu-img reported ${QCOW_VIRTUAL_SIZE} bytes, but qemu-nbd exposes ${nbd_virtual_size} bytes; using qemu-nbd size."
+    fi
+    QCOW_VIRTUAL_SIZE="$nbd_virtual_size"
+
     if ! table=$(sgdisk -p "$nbd" 2>&1); then
         echo "$table" >&2
         error "Target qcow2 does not expose a usable GPT; cannot safely use an in-disk staging partition"
@@ -4118,15 +4129,10 @@ prepare_sparse_shadow_for_target() {
 
     info "Sparse-shadow final partition $partnum extends to sector $part_end; target-safe end is $target_end."
 
-    # Shrinking a filesystem partition blindly is unsafe. The Rocky EC2-LVM
-    # image uses a Linux LVM PV as the final growable partition. pvresize knows
-    # whether any allocated physical extents would be lost and refuses the
-    # operation if the requested target disk is genuinely too small.
-    if [[ "$part_code" != "8E00" ]]; then
-        cleanup_qcow_nbd
-        error "Final partition type is $part_code, not Linux LVM (8E00); cannot safely shrink it to fit the target disk"
-    fi
-
+    # GPT type codes describe intended use, not necessarily the on-disk content.
+    # Rocky ARM64 images may legitimately use DPS type 8305 (Linux ARM64 root)
+    # even when the payload is an LVM PV or a directly formatted root filesystem.
+    # Probe the content itself before deciding how to make the boundary smaller.
     partdev=$(partition_device_for_number "$nbd" "$partnum")
     for wait_i in 1 2 3 4 5; do
         [[ -b "$partdev" ]] && break
@@ -4146,10 +4152,81 @@ prepare_sparse_shadow_for_target() {
         error "Target disk is smaller than the start of the Rocky LVM partition"
     }
 
-    info "Shrinking LVM PV on $partdev to fit ${new_part_bytes} bytes before changing the GPT boundary..."
-    if ! pvresize --yes --setphysicalvolumesize "${new_part_bytes}B" "$partdev"; then
-        cleanup_qcow_nbd
-        error "Rocky LVM data cannot be safely reduced to fit this target disk. The VPS disk is genuinely too small for the allocated extents."
+    local content_type="" pv_detected=0 fs_block_size="" fs_blocks="" fs_bytes=""
+    local target_fs_blocks="" e2fsck_rc=0
+
+    # Prefer explicit LVM probing. Do not infer LVM from the GPT type code.
+    if pvs --noheadings -o pv_name "$partdev" 2>/dev/null | grep -Fq "$partdev"; then
+        pv_detected=1
+    fi
+
+    if [[ "$pv_detected" -eq 1 ]]; then
+        info "Detected LVM PV inside GPT type $part_code on $partdev."
+        info "Shrinking LVM PV to fit ${new_part_bytes} bytes before changing the GPT boundary..."
+        if ! pvresize --yes --setphysicalvolumesize "${new_part_bytes}B" "$partdev"; then
+            cleanup_qcow_nbd
+            error "LVM allocated extents cannot fit inside ${new_part_bytes} bytes. The target disk is genuinely too small."
+        fi
+    else
+        content_type=$(blkid -p -o value -s TYPE "$partdev" 2>/dev/null || true)
+        info "Final partition GPT type=$part_code; detected content=${content_type:-unknown}"
+
+        case "$content_type" in
+            xfs)
+                fs_block_size=$(xfs_db -r -c 'sb 0' -c 'p blocksize' "$partdev" 2>/dev/null |                     awk -F'= *' '/blocksize =/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+                fs_blocks=$(xfs_db -r -c 'sb 0' -c 'p dblocks' "$partdev" 2>/dev/null |                     awk -F'= *' '/dblocks =/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+                [[ "$fs_block_size" =~ ^[0-9]+$ && "$fs_blocks" =~ ^[0-9]+$ ]] || {
+                    cleanup_qcow_nbd
+                    error "Could not determine XFS filesystem size on $partdev"
+                }
+                fs_bytes=$((fs_block_size * fs_blocks))
+                info "XFS filesystem size: ${fs_bytes} bytes; target partition capacity: ${new_part_bytes} bytes"
+                if (( fs_bytes > new_part_bytes )); then
+                    cleanup_qcow_nbd
+                    error "XFS filesystem is larger than the target-safe partition size and XFS cannot be shrunk offline. Target disk is too small for this image."
+                fi
+                info "XFS filesystem already fits; only the GPT partition boundary needs to be reduced."
+                ;;
+            ext2|ext3|ext4)
+                fs_block_size=$(dumpe2fs -h "$partdev" 2>/dev/null | awk -F': *' '/^Block size:/ {print $2; exit}')
+                fs_blocks=$(dumpe2fs -h "$partdev" 2>/dev/null | awk -F': *' '/^Block count:/ {print $2; exit}')
+                [[ "$fs_block_size" =~ ^[0-9]+$ && "$fs_blocks" =~ ^[0-9]+$ ]] || {
+                    cleanup_qcow_nbd
+                    error "Could not determine ext filesystem size on $partdev"
+                }
+                fs_bytes=$((fs_block_size * fs_blocks))
+                info "ext filesystem size: ${fs_bytes} bytes; target partition capacity: ${new_part_bytes} bytes"
+
+                if (( fs_bytes > new_part_bytes )); then
+                    # Leave a little slack inside the new partition.
+                    target_fs_blocks=$((new_part_bytes / fs_block_size - 256))
+                    (( target_fs_blocks > 0 )) || {
+                        cleanup_qcow_nbd
+                        error "Target partition is too small for a valid ext filesystem"
+                    }
+
+                    e2fsck -f -p "$partdev" >/dev/null 2>&1 || e2fsck_rc=$?
+                    if (( e2fsck_rc > 1 )); then
+                        cleanup_qcow_nbd
+                        error "e2fsck failed before ext filesystem shrink (rc=$e2fsck_rc)"
+                    fi
+
+                    info "Shrinking ext filesystem to ${target_fs_blocks} filesystem blocks..."
+                    resize2fs "$partdev" "$target_fs_blocks" >/dev/null || {
+                        cleanup_qcow_nbd
+                        error "resize2fs failed while shrinking the root filesystem"
+                    }
+                else
+                    info "ext filesystem already fits; only the GPT partition boundary needs to be reduced."
+                fi
+                ;;
+            *)
+                pvs "$partdev" 2>&1 || true
+                blkid -p "$partdev" 2>&1 || true
+                cleanup_qcow_nbd
+                error "Cannot safely shrink final partition content '${content_type:-unknown}' (GPT type $part_code). Refusing to modify its boundary blindly."
+                ;;
+        esac
     fi
 
     info_text=$(sgdisk -i "$partnum" "$nbd" 2>/dev/null) || {
@@ -4191,7 +4268,7 @@ prepare_sparse_shadow_for_target() {
     sync
     cleanup_qcow_nbd
 
-    info "Sparse-shadow Rocky LVM/GPT boundary adjusted successfully."
+    info "Sparse-shadow root/GPT boundary adjusted successfully."
 }
 
 write_sparse_shadow_to_target_after_releasing_stage() {
