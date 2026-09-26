@@ -1795,6 +1795,27 @@ load_plan_from_efi() {
     local vars_loaded=0
     local current_efi_src="" current_boot_src=""
 
+    # Alpine RAM receives a self-contained copy of the install plan via apkovl.
+    # Prefer it so the installer does not depend on remounting the boot ESP.
+    if [[ "$OS" == "Linux" && -f /etc/reinstall/plan.env ]]; then
+        # shellcheck disable=SC1091
+        . /etc/reinstall/plan.env
+        PASSWORD="${PASSWORD:-}"
+        PASSWORD_HASH="${PASSWORD_HASH:-}"
+
+        if [[ -f /etc/reinstall/frpc.toml ]]; then
+            FRPC_TOML="/etc/reinstall/frpc.toml"
+            FRPC_BOOTSTRAP_REL=""
+        fi
+        if [[ -f /etc/reinstall/post-install-hook.sh ]]; then
+            POST_INSTALL_HOOK="/etc/reinstall/post-install-hook.sh"
+            POST_INSTALL_HOOK_BOOTSTRAP_REL=""
+        fi
+
+        info "Loaded reinstall plan from embedded Alpine apkovl: /etc/reinstall/plan.env"
+        return 0
+    fi
+
     if [[ -f /etc/reinstall/vars ]]; then
         # shellcheck disable=SC1091
         . /etc/reinstall/vars
@@ -2377,6 +2398,30 @@ SCRIPT_NAME='${SCRIPT_NAME}'
 HOLD='${HOLD}'
 EOF
 
+    # Make the Alpine RAM environment self-contained after apkovl is loaded.
+    # The boot ESP is only needed to load kernel/initramfs/modloop/apkovl; the
+    # destructive installer must not depend on mounting it again.
+    local embedded_plan embedded_installer
+    embedded_plan="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL/$PLAN_FILE_NAME"
+    embedded_installer="$ALPINE_SCRIPT_COPY_ABS"
+
+    [[ -f "$embedded_plan" ]] || error "Plan file missing while building apkovl: $embedded_plan"
+    [[ -f "$embedded_installer" ]] || error "Installer script missing while building apkovl: $embedded_installer"
+
+    cp "$embedded_plan" "$ovl_dir/etc/reinstall/plan.env"
+    chmod 0600 "$ovl_dir/etc/reinstall/plan.env"
+    cp "$embedded_installer" "$ovl_dir/usr/local/sbin/reinstall-installer.sh"
+    chmod 0755 "$ovl_dir/usr/local/sbin/reinstall-installer.sh"
+
+    if [[ -n "${FRPC_BOOTSTRAP_REL:-}" && -f "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$FRPC_BOOTSTRAP_REL" ]]; then
+        cp "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$FRPC_BOOTSTRAP_REL" "$ovl_dir/etc/reinstall/frpc.toml"
+        chmod 0600 "$ovl_dir/etc/reinstall/frpc.toml"
+    fi
+    if [[ -n "${POST_INSTALL_HOOK_BOOTSTRAP_REL:-}" && -f "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$POST_INSTALL_HOOK_BOOTSTRAP_REL" ]]; then
+        cp "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$POST_INSTALL_HOOK_BOOTSTRAP_REL" "$ovl_dir/etc/reinstall/post-install-hook.sh"
+        chmod 0700 "$ovl_dir/etc/reinstall/post-install-hook.sh"
+    fi
+
     startfile="$ovl_dir/usr/local/sbin/reinstall-auto.sh"
     cat >"$startfile" <<'EOF'
 #!/bin/sh
@@ -2584,18 +2629,19 @@ setup_work_tmpfs() {
 }
 
 main() {
-    local bootstrap_prefix=""
-    echo "[stage] mount_bootstrap"
-    mount_bootstrap
+    PLAN_FILE="/etc/reinstall/plan.env"
+    SCRIPT_FILE="/usr/local/sbin/reinstall-installer.sh"
 
-    if [ -f "/media/bootstrap/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
-        bootstrap_prefix=""
-    elif [ -f "/media/bootstrap/boot/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
-        bootstrap_prefix="/boot"
-    else
-        echo "Plan file not found under /media/bootstrap or /media/bootstrap/boot"
+    [ -f "$PLAN_FILE" ] || {
+        echo "Embedded plan file not found: $PLAN_FILE"
         exit 1
-    fi
+    }
+    [ -f "$SCRIPT_FILE" ] || {
+        echo "Embedded installer script not found: $SCRIPT_FILE"
+        exit 1
+    }
+
+    echo "[stage] using embedded apkovl plan and installer"
 
     echo "[stage] ensure_network"
     ensure_network
@@ -2609,18 +2655,6 @@ main() {
     echo "[stage] setup_work_tmpfs"
     setup_work_tmpfs
 
-    PLAN_FILE="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/${PLAN_FILE_NAME}"
-    SCRIPT_FILE="/media/bootstrap${bootstrap_prefix}/${PLAN_DIR_REL}/${SCRIPT_NAME}"
-
-    [ -f "$PLAN_FILE" ] || {
-        echo "Plan file not found: $PLAN_FILE"
-        exit 1
-    }
-    [ -f "$SCRIPT_FILE" ] || {
-        echo "Script file not found: $SCRIPT_FILE"
-        exit 1
-    }
-
     RUN_SCRIPT="/run/reinstall-installer.sh"
     cp "$SCRIPT_FILE" "$RUN_SCRIPT"
     chmod 0755 "$RUN_SCRIPT"
@@ -2633,7 +2667,7 @@ main() {
     echo "Installer phase finished with rc=$rc"
 
     if [ "$rc" -eq 0 ]; then
-        if grep -q "^HOLD='2'$" /etc/reinstall/vars 2>/dev/null || grep -q '^HOLD=2$' "$PLAN_FILE" 2>/dev/null; then
+        if grep -q '^HOLD=2$' "$PLAN_FILE" 2>/dev/null || grep -q "^HOLD='2'$" "$PLAN_FILE" 2>/dev/null; then
             echo "HOLD=2 detected, not rebooting."
             exit 0
         fi
