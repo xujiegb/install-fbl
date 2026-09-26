@@ -1771,7 +1771,7 @@ POST_INSTALL_HOOK_BOOTSTRAP_REL=""
 
 ALPINE_RUNTIME_PKGS=(
     bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar
-    e2fsprogs dosfstools sgdisk kmod
+    e2fsprogs dosfstools sgdisk kmod lvm2
 )
 
 detect_env_mode() {
@@ -2942,12 +2942,12 @@ REPOEOF
     echo "[stage] apk add (online official repos)"
     apk add --no-cache \
         bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
-        e2fsprogs dosfstools sgdisk kmod
+        e2fsprogs dosfstools sgdisk kmod lvm2
     update-ca-certificates 2>/dev/null || true
 
     # Fail here with a precise message instead of reaching the destructive stage
     # and discovering that a split Alpine subpackage was not installed.
-    for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod; do
+    for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod pvresize; do
         command -v "$cmd" >/dev/null 2>&1 || {
             echo "Required Alpine runtime command is missing after apk add: $cmd"
             exit 1
@@ -3684,12 +3684,14 @@ TEMP_STAGE_SECTOR_SIZE=""
 QCOW_VIRTUAL_SIZE=""
 QCOW_MAX_PART_END_BYTES=""
 QCOW_MAX_PART_END_SECTOR=""
+QCOW_PARTITION_CROSSES_STAGE=0
 QCOW_NBD_DEV=""
+TEMP_STAGE_RELEASED=0
 
 partition_device_for_number() {
     local disk="$1" num="$2"
     case "$disk" in
-        /dev/nvme*|/dev/mmcblk*|/dev/loop*)
+        /dev/nvme*|/dev/mmcblk*|/dev/loop*|/dev/nbd*)
             printf '%sp%s\n' "$disk" "$num"
             ;;
         *)
@@ -3918,9 +3920,27 @@ inspect_qcow_partition_layout() {
     info "qcow2 last partition end:    ${QCOW_MAX_PART_END_BYTES} bytes"
     info "temporary partition begins:  ${TEMP_STAGE_START_BYTES} bytes"
 
-    # Keep 8 MiB of safety space before the live staging partition.
+    QCOW_PARTITION_CROSSES_STAGE=0
+
+    # A cloud image may deliberately describe a GPT/LVM layout much larger than
+    # the qcow2 payload stored on disk. Do not reject it merely because the GPT
+    # last partition reaches the live 3 GiB staging area. Instead, switch to the
+    # sparse-shadow path so the source is first copied into RAM/zram, resized
+    # safely there when possible, and only then written back after staging is
+    # released.
     if [[ "$QCOW_MAX_PART_END_BYTES" -gt $((TEMP_STAGE_START_BYTES - 8 * 1024 * 1024)) ]]; then
-        error "The qcow2 partition layout reaches the mandatory 3 GiB staging area. Refusing a self-overwriting install. Image partition end=${QCOW_MAX_PART_END_BYTES}; staging start=${TEMP_STAGE_START_BYTES}"
+        QCOW_PARTITION_CROSSES_STAGE=1
+        warn "qcow2 GPT layout reaches the mandatory 3 GiB staging area."
+        warn "Using sparse RAM/zram shadow mode to avoid self-overwriting the live staging source."
+    fi
+
+    # A valid disk image cannot have a partition ending beyond its virtual block
+    # device. If qemu-img reported otherwise, treat the GPT extent as the minimum
+    # effective size for safety and force shadow mode.
+    if [[ "$QCOW_VIRTUAL_SIZE" -lt "$QCOW_MAX_PART_END_BYTES" ]]; then
+        warn "qemu-img virtual-size (${QCOW_VIRTUAL_SIZE}) is smaller than GPT partition end (${QCOW_MAX_PART_END_BYTES}); refusing to trust the smaller value for write-safety decisions."
+        QCOW_VIRTUAL_SIZE="$QCOW_MAX_PART_END_BYTES"
+        QCOW_PARTITION_CROSSES_STAGE=1
     fi
 }
 
@@ -3975,14 +3995,241 @@ download_target_image_in_alpine() {
 
 get_qcow_virtual_size_bytes() {
     local path="$1"
+
+    # Match the JSON key exactly. Do not use a loose field parser here:
+    # cloud qcow2 images often have actual-size ~= 500 MiB while virtual-size
+    # is several GiB, and confusing the two would make an in-disk staging
+    # safety decision catastrophically wrong.
     qemu-img info --output=json "$path" 2>/dev/null | \
-        awk -F': *' '/"virtual-size"/ {v=$2; gsub(/[,[:space:]]/, "", v); print v; exit}'
+        sed -n 's/^[[:space:]]*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | \
+        head -n1
+}
+
+connect_raw_rw_nbd() {
+    local img="$1" n dev size
+
+    command -v qemu-nbd >/dev/null 2>&1 || error "qemu-nbd is required for sparse-shadow preparation"
+    modprobe nbd max_part=64 >/dev/null 2>&1 || error "Could not load nbd kernel module"
+    mdev -s 2>/dev/null || true
+
+    for n in $(seq 0 15); do
+        dev="/dev/nbd$n"
+        [[ -b "$dev" ]] || continue
+        size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+        [[ "$size" == "0" ]] || continue
+
+        if qemu-nbd --connect="$dev" --format=raw "$img" >/dev/null 2>&1; then
+            QCOW_NBD_DEV="$dev"
+            sleep 1
+            command -v partx >/dev/null 2>&1 && {
+                partx -u "$dev" >/dev/null 2>&1 || partx -a "$dev" >/dev/null 2>&1 || true
+            }
+            mdev -s 2>/dev/null || true
+            return 0
+        fi
+    done
+
+    error "Could not allocate a free NBD device for sparse-shadow preparation"
+}
+
+prepare_sparse_shadow_for_target() {
+    local img="$1" shadow="$2"
+    local allocated logical_size
+    local nbd table sector_size target_sector_size target_disk_bytes target_total_sectors
+    local reserve_bytes reserve_sectors target_end
+    local line partnum="" part_start="" part_end=0 part_code=""
+    local info_text type_guid unique_guid attrs name new_part_bytes partdev wait_i
+
+    rm -f "$shadow"
+
+    info "Creating sparse raw shadow in RAM/zram because the image GPT overlaps the live 3 GiB staging partition..."
+    info "This file is logically as large as the cloud disk, but sparse holes do not consume tmpfs/zram pages."
+
+    qemu-img convert -p -S 4k -f qcow2 -O raw "$img" "$shadow" || {
+        rm -f "$shadow"
+        error "Failed to create sparse raw shadow from qcow2"
+    }
+
+    logical_size=$(stat -c %s "$shadow" 2>/dev/null || true)
+    allocated=$(du -B1 "$shadow" 2>/dev/null | awk '{print $1; exit}' || true)
+    [[ "$logical_size" =~ ^[0-9]+$ && "$logical_size" -gt 0 ]] || \
+        error "Could not determine sparse-shadow logical size"
+
+    info "Sparse shadow logical size:   ${logical_size} bytes"
+    [[ "$allocated" =~ ^[0-9]+$ ]] && info "Sparse shadow allocated RAM/zram: ${allocated} bytes"
+    df -h /run/reinstall-work || true
+
+    connect_raw_rw_nbd "$shadow"
+    nbd="$QCOW_NBD_DEV"
+
+    table=$(sgdisk -p "$nbd" 2>&1) || {
+        echo "$table" >&2
+        cleanup_qcow_nbd
+        error "Sparse shadow does not expose a usable GPT"
+    }
+
+    sector_size=$(blockdev --getss "$nbd" 2>/dev/null || true)
+    target_sector_size=$(blockdev --getss "$DISK" 2>/dev/null || true)
+    [[ "$sector_size" =~ ^[0-9]+$ && "$sector_size" -gt 0 ]] || {
+        cleanup_qcow_nbd
+        error "Could not determine sparse-shadow sector size"
+    }
+    [[ "$target_sector_size" == "$sector_size" ]] || {
+        cleanup_qcow_nbd
+        error "Sparse-shadow sector size ($sector_size) differs from target disk sector size ($target_sector_size)"
+    }
+
+    target_disk_bytes=$(get_disk_size_bytes "$DISK" || true)
+    [[ "$target_disk_bytes" =~ ^[0-9]+$ && "$target_disk_bytes" -gt 0 ]] || {
+        cleanup_qcow_nbd
+        error "Could not determine target disk size while preparing sparse shadow"
+    }
+
+    target_total_sectors=$((target_disk_bytes / sector_size))
+    reserve_bytes=$((32 * 1024 * 1024))
+    reserve_sectors=$(((reserve_bytes + sector_size - 1) / sector_size))
+    target_end=$((target_total_sectors - 34 - reserve_sectors))
+
+    if (( target_end <= 2048 )); then
+        cleanup_qcow_nbd
+        error "Target disk is too small to reserve GPT metadata and CIDATA"
+    fi
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+.*[[:space:]]+([0-9A-Fa-f]{4})[[:space:]] ]] || continue
+        if (( BASH_REMATCH[3] > part_end )); then
+            partnum="${BASH_REMATCH[1]}"
+            part_start="${BASH_REMATCH[2]}"
+            part_end="${BASH_REMATCH[3]}"
+            part_code="${BASH_REMATCH[4]^^}"
+        fi
+    done <<<"$table"
+
+    [[ -n "$partnum" && "$part_start" =~ ^[0-9]+$ && "$part_end" =~ ^[0-9]+$ ]] || {
+        cleanup_qcow_nbd
+        error "Could not identify the final GPT partition inside sparse shadow"
+    }
+
+    if (( part_end <= target_end )); then
+        info "Sparse-shadow GPT already fits the target disk with 32 MiB reserved for CIDATA."
+        cleanup_qcow_nbd
+        return 0
+    fi
+
+    info "Sparse-shadow final partition $partnum extends to sector $part_end; target-safe end is $target_end."
+
+    # Shrinking a filesystem partition blindly is unsafe. The Rocky EC2-LVM
+    # image uses a Linux LVM PV as the final growable partition. pvresize knows
+    # whether any allocated physical extents would be lost and refuses the
+    # operation if the requested target disk is genuinely too small.
+    if [[ "$part_code" != "8E00" ]]; then
+        cleanup_qcow_nbd
+        error "Final partition type is $part_code, not Linux LVM (8E00); cannot safely shrink it to fit the target disk"
+    fi
+
+    partdev=$(partition_device_for_number "$nbd" "$partnum")
+    for wait_i in 1 2 3 4 5; do
+        [[ -b "$partdev" ]] && break
+        command -v partx >/dev/null 2>&1 && partx -u "$nbd" >/dev/null 2>&1 || true
+        mdev -s 2>/dev/null || true
+        ensure_linux_block_node_from_sysfs "$partdev" && break
+        sleep 1
+    done
+    [[ -b "$partdev" ]] || {
+        cleanup_qcow_nbd
+        error "Could not create sparse-shadow partition node: $partdev"
+    }
+
+    new_part_bytes=$(((target_end - part_start + 1) * sector_size))
+    (( new_part_bytes > 0 )) || {
+        cleanup_qcow_nbd
+        error "Target disk is smaller than the start of the Rocky LVM partition"
+    }
+
+    info "Shrinking LVM PV on $partdev to fit ${new_part_bytes} bytes before changing the GPT boundary..."
+    if ! pvresize --yes --setphysicalvolumesize "${new_part_bytes}B" "$partdev"; then
+        cleanup_qcow_nbd
+        error "Rocky LVM data cannot be safely reduced to fit this target disk. The VPS disk is genuinely too small for the allocated extents."
+    fi
+
+    info_text=$(sgdisk -i "$partnum" "$nbd" 2>/dev/null) || {
+        cleanup_qcow_nbd
+        error "Failed to inspect sparse-shadow partition metadata"
+    }
+    type_guid=$(printf '%s\n' "$info_text" | awk '/Partition GUID code:/ {print $4; exit}')
+    unique_guid=$(printf '%s\n' "$info_text" | awk '/Partition unique GUID:/ {print $4; exit}')
+    attrs=$(printf '%s\n' "$info_text" | awk '/Attribute flags:/ {print $3; exit}')
+    name=$(printf '%s\n' "$info_text" | sed -n "s/^Partition name: '\(.*\)'$/\1/p" | head -n1)
+
+    sgdisk -d "$partnum" "$nbd" >/dev/null || {
+        cleanup_qcow_nbd
+        error "Failed to delete sparse-shadow partition $partnum for resize"
+    }
+    sgdisk -n "${partnum}:${part_start}:${target_end}" "$nbd" >/dev/null || {
+        cleanup_qcow_nbd
+        error "Failed to recreate sparse-shadow partition $partnum at target-safe size"
+    }
+    sgdisk -t "${partnum}:${type_guid}" "$nbd" >/dev/null || {
+        cleanup_qcow_nbd
+        error "Failed to restore sparse-shadow GPT type"
+    }
+    [[ -z "$unique_guid" ]] || sgdisk -u "${partnum}:${unique_guid}" "$nbd" >/dev/null || {
+        cleanup_qcow_nbd
+        error "Failed to restore sparse-shadow PARTUUID"
+    }
+    [[ -z "$name" ]] || sgdisk -c "${partnum}:${name}" "$nbd" >/dev/null || {
+        cleanup_qcow_nbd
+        error "Failed to restore sparse-shadow GPT name"
+    }
+    if [[ -n "$attrs" && "$attrs" != "0000000000000000" ]]; then
+        sgdisk -A "${partnum}:=:${attrs}" "$nbd" >/dev/null || {
+            cleanup_qcow_nbd
+            error "Failed to restore sparse-shadow GPT attributes"
+        }
+    fi
+
+    sync
+    cleanup_qcow_nbd
+
+    info "Sparse-shadow Rocky LVM/GPT boundary adjusted successfully."
+}
+
+write_sparse_shadow_to_target_after_releasing_stage() {
+    local shadow="$1" disk_bytes
+
+    disk_bytes=$(get_disk_size_bytes "$DISK" || true)
+    [[ "$disk_bytes" =~ ^[0-9]+$ && "$disk_bytes" -gt 0 ]] || \
+        error "Could not determine target disk size for sparse-shadow write"
+
+    release_temp_staging_partition
+    TEMP_STAGE_RELEASED=1
+    sync
+
+    info "Writing sparse shadow to the target disk after releasing the 3 GiB staging partition..."
+    info "Copy length: ${disk_bytes} bytes"
+
+    # coreutils dd is installed in Alpine RAM. iflag=count_bytes lets count be
+    # exact bytes rather than blocks, so a 10 GiB cloud image can be safely
+    # truncated to a smaller VPS disk after pvresize/GPT preparation.
+    dd if="$shadow" of="$DISK" bs=16M iflag=count_bytes count="$disk_bytes" \
+        status=progress conv=fsync || error "Failed to write sparse shadow to target disk"
+
+    sync
+    rm -f "$shadow"
 }
 
 write_qcow_without_overwriting_staging() {
-    local img="$1" bs_arg count_arg
+    local img="$1" bs_arg count_arg shadow
 
     [[ -n "$TEMP_STAGE_START_BYTES" ]] || error "Temporary staging boundary is unknown"
+    TEMP_STAGE_RELEASED=0
+
+    if [[ "${QCOW_PARTITION_CROSSES_STAGE:-0}" == "1" ]]; then
+        shadow="/run/reinstall-work/target-shadow.raw"
+        prepare_sparse_shadow_for_target "$img" "$shadow"
+        write_sparse_shadow_to_target_after_releasing_stage "$shadow"
+        return 0
+    fi
 
     if [[ "$QCOW_VIRTUAL_SIZE" -le "$TEMP_STAGE_START_BYTES" ]]; then
         info "qcow2 virtual disk ends before the staging partition; converting the whole image."
@@ -3991,10 +4238,10 @@ write_qcow_without_overwriting_staging() {
         return 0
     fi
 
-    # The image virtual disk extends beyond the staging boundary, but its real GPT
-    # partitions were verified to end before the boundary. Copy only the safe prefix;
-    # this intentionally omits trailing free space and the source backup GPT. The GPT
-    # backup is rebuilt after the staging partition has been released.
+    # The image virtual disk extends beyond the staging boundary, but its GPT
+    # partitions were verified to end before the boundary. Copy only the safe
+    # prefix; trailing free space and the source backup GPT are intentionally
+    # omitted. The backup GPT is rebuilt after staging has been released.
     if (( TEMP_STAGE_START_BYTES % (4 * 1024 * 1024) == 0 )); then
         bs_arg="4M"
         count_arg=$((TEMP_STAGE_START_BYTES / (4 * 1024 * 1024)))
@@ -4011,6 +4258,7 @@ write_qcow_without_overwriting_staging() {
     qemu-img dd -f qcow2 -O raw "bs=$bs_arg" "count=$count_arg" \
         "if=$img" "of=$DISK" || error "qemu-img dd failed while writing the safe image prefix"
 }
+
 
 release_temp_staging_partition() {
     local old_stage="${TEMP_STAGE_PART:-}"
@@ -4101,9 +4349,12 @@ grow_last_partition_reserving_cidata() {
         error "Could not determine free-space end for target partition expansion"
 
     new_end=$((largest_end - reserve_sectors))
-    if [[ "$new_end" -le "$end" ]]; then
-        warn "No useful room remains to expand target partition $partnum before CIDATA reservation."
+    if [[ "$new_end" -eq "$end" ]]; then
+        info "Target partition $partnum already ends at the CIDATA-safe boundary."
         return 0
+    fi
+    if [[ "$new_end" -lt "$end" ]]; then
+        error "Target partition $partnum still extends beyond the CIDATA-safe boundary after image preparation; refusing an unsafe blind shrink"
     fi
 
     info "Expanding target GPT partition $partnum from end sector $end to $new_end; reserving 32 MiB for CIDATA/alignment."
@@ -4206,9 +4457,11 @@ do_install() {
     sync
     info "Safe qcow2 prefix write finished."
 
-    # qemu-img has closed the source file. Release the temporary tail partition,
-    # then make the image GPT authoritative and recover the 3 GiB for the target.
-    release_temp_staging_partition
+    # In sparse-shadow mode the staging partition has already been released
+    # before the final target write. Normal prefix/full-image paths release it here.
+    if [[ "${TEMP_STAGE_RELEASED:-0}" != "1" ]]; then
+        release_temp_staging_partition
+    fi
     sync
 
     # Work directly on the image GPT while no target partitions are mapped in the
