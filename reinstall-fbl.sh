@@ -3365,50 +3365,105 @@ EOF
 install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
 
-    local before after newnum old
+    local before after newnum old bootnext
 
+    # FreeBSD efibootmgr may prefix entries with '+' and suffix the Boot#### token
+    # with '*', e.g.:
+    #   +Boot0001* FreeBSD ...
+    # Never assume Boot#### is the first token/character on the line.
     while read -r old; do
         [[ -n "$old" ]] || continue
-        efibootmgr -B -b "$old" >/dev/null 2>&1 || warn "Failed to delete old EFI boot entry: $old"
+        info "Deleting old EFI boot entry $old (${ALPINE_ENTRY_TITLE})"
+        efibootmgr -B -b "$old" >/dev/null 2>&1 || \
+            warn "Failed to delete old EFI boot entry: $old"
     done < <(
         efibootmgr 2>/dev/null | awk -v title="$ALPINE_ENTRY_TITLE" '
-            $0 ~ title {
-                n = substr($1, 5, 4)
-                gsub(/\*/, "", n)
-                print toupper(n)
+            index($0, title) {
+                if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) {
+                    n = substr($0, RSTART + 4, 4)
+                    print toupper(n)
+                }
             }
-        '
+        ' | sort -u
     )
 
     before=$(
         efibootmgr 2>/dev/null |
-        awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
-            n = substr($1, 5, 4)
-            gsub(/\*/, "", n)
-            print toupper(n)
+        awk '{
+            if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) {
+                n = substr($0, RSTART + 4, 4)
+                print toupper(n)
+            }
         }' | sort -u
     )
 
     info "Creating FreeBSD UEFI boot entry: ${ALPINE_ENTRY_TITLE}"
     efibootmgr -a -c \
         -l "$ALPINE_FREEBSD_GRUB_EFI_ABS" \
-        -L "$ALPINE_ENTRY_TITLE" >/dev/null
+        -L "$ALPINE_ENTRY_TITLE" >/dev/null || \
+        error "efibootmgr failed to create EFI boot entry: ${ALPINE_ENTRY_TITLE}"
 
-    after=$(
-        efibootmgr 2>/dev/null |
-        awk '/^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
-            n = substr($1, 5, 4)
-            gsub(/\*/, "", n)
-            print toupper(n)
-        }' | sort -u
+    # Since all old entries with this label were deleted first, label lookup is
+    # the most direct and reliable way to recover the newly allocated Boot####.
+    newnum=$(
+        efibootmgr 2>/dev/null | awk -v title="$ALPINE_ENTRY_TITLE" '
+            index($0, title) {
+                if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) {
+                    n = substr($0, RSTART + 4, 4)
+                    print toupper(n)
+                    exit
+                }
+            }
+        '
     )
 
-    newnum=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n1)
-    [[ -n "$newnum" ]] || error "Failed to determine new EFI boot entry after creating ${ALPINE_ENTRY_TITLE}"
+    # Fallback: compare the complete Boot#### set before and after creation.
+    if [[ -z "$newnum" ]]; then
+        after=$(
+            efibootmgr 2>/dev/null |
+            awk '{
+                if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) {
+                    n = substr($0, RSTART + 4, 4)
+                    print toupper(n)
+                }
+            }' | sort -u
+        )
+        newnum=$(comm -13 \
+            <(printf '%s\n' "$before") \
+            <(printf '%s\n' "$after") |
+            head -n1)
+    fi
+
+    [[ "$newnum" =~ ^[0-9A-Fa-f]{4}$ ]] || {
+        efibootmgr -v >&2 2>/dev/null || true
+        error "Failed to determine new EFI boot entry after creating ${ALPINE_ENTRY_TITLE}"
+    }
 
     info "Setting BootNext to EFI entry $newnum (${ALPINE_ENTRY_TITLE})"
-    efibootmgr -n -b "$newnum" >/dev/null
+    efibootmgr -n -b "$newnum" >/dev/null || \
+        error "Failed to set BootNext to EFI entry $newnum"
+
+    bootnext=$(
+        efibootmgr 2>/dev/null |
+        awk '
+            /^BootNext[[:space:]]*:/ {
+                v=$0
+                sub(/^[^:]*:[[:space:]]*/, "", v)
+                gsub(/[[:space:]]/, "", v)
+                print toupper(v)
+                exit
+            }
+        '
+    )
+
+    if [[ -n "$bootnext" && "$bootnext" != "${newnum^^}" ]]; then
+        efibootmgr -v >&2 2>/dev/null || true
+        error "BootNext verification failed: expected ${newnum^^}, got $bootnext"
+    fi
+
+    info "BootNext verified: ${newnum^^} (${ALPINE_ENTRY_TITLE})"
 }
+
 
 prepare_and_boot_alpine_ram() {
     [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host in this function"
