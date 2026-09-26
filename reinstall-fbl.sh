@@ -1416,31 +1416,63 @@ EOF
     {
         echo "#cloud-config"
 
-        if [[ -n "$PASSWORD_HASH" || -n "$SSH_KEYS_ALL" ]]; then
+        if [[ "$os" == "freebsd" ]]; then
+            # FreeBSD BASIC-CLOUDINIT images use nuageinit rather than Python
+            # cloud-init. Existing root password changes belong under chpasswd;
+            # SSH authorized keys for root are supplied with the top-level
+            # ssh_authorized_keys key.
+            echo "disable_root: false"
+
             if [[ -n "$PASSWORD_HASH" ]]; then
                 echo "ssh_pwauth: true"
             else
                 echo "ssh_pwauth: false"
             fi
-            echo "disable_root: false"
-            echo "users:"
-            echo "  - name: root"
-
-            if [[ -n "$PASSWORD_HASH" ]]; then
-                echo "    lock_passwd: false"
-                # root already exists in cloud images; cloud-init's passwd key is
-                # creation-only, while hashed_passwd also applies to existing users.
-                echo "    hashed_passwd: \"${PASSWORD_HASH}\""
-            else
-                echo "    lock_passwd: true"
-            fi
 
             if [[ -n "$SSH_KEYS_ALL" ]]; then
-                echo "    ssh_authorized_keys:"
+                echo "ssh_authorized_keys:"
                 while IFS= read -r line; do
                     [[ -n "$line" ]] || continue
-                    printf '      - %s\n' "$line"
+                    printf '  - %s\n' "$line"
                 done <<<"$SSH_KEYS_ALL"
+            fi
+
+            if [[ -n "$PASSWORD_HASH" ]]; then
+                echo
+                echo "chpasswd:"
+                echo "  expire: false"
+                echo "  users:"
+                echo "    - name: root"
+                echo "      password: \"${PASSWORD_HASH}\""
+            fi
+        else
+            # Linux cloud images use Python cloud-init. root already exists in
+            # those images, so hashed_passwd is used rather than creation-only
+            # passwd.
+            if [[ -n "$PASSWORD_HASH" || -n "$SSH_KEYS_ALL" ]]; then
+                if [[ -n "$PASSWORD_HASH" ]]; then
+                    echo "ssh_pwauth: true"
+                else
+                    echo "ssh_pwauth: false"
+                fi
+                echo "disable_root: false"
+                echo "users:"
+                echo "  - name: root"
+
+                if [[ -n "$PASSWORD_HASH" ]]; then
+                    echo "    lock_passwd: false"
+                    echo "    hashed_passwd: \"${PASSWORD_HASH}\""
+                else
+                    echo "    lock_passwd: true"
+                fi
+
+                if [[ -n "$SSH_KEYS_ALL" ]]; then
+                    echo "    ssh_authorized_keys:"
+                    while IFS= read -r line; do
+                        [[ -n "$line" ]] || continue
+                        printf '      - %s\n' "$line"
+                    done <<<"$SSH_KEYS_ALL"
+                fi
             fi
         fi
 
@@ -1469,9 +1501,37 @@ EOF
 EOF
         fi
 
-        if [[ -n "$SSH_PORT" ]] || [[ -n "$frpc_b64" ]]; then
+        # FreeBSD nuageinit and Linux cloud-init both support runcmd. Keep the
+        # existing service-adjustment behavior, but make root SSH policy explicit
+        # on FreeBSD so key-only and password-enabled setups behave predictably.
+        if [[ -n "$SSH_PORT" || -n "$frpc_b64" || "$os" == "freebsd" ]]; then
             echo
             echo "runcmd:"
+        fi
+
+        if [[ "$os" == "freebsd" ]]; then
+            cat <<EOF
+  - |
+      if [ -f /etc/ssh/sshd_config ]; then
+        awk '
+          /^[[:space:]]*PermitRootLogin[[:space:]]+/ { next }
+          /^[[:space:]]*PasswordAuthentication[[:space:]]+/ { next }
+          { print }
+          END {
+            if ("${PASSWORD_HASH}" != "") {
+              print "PermitRootLogin yes"
+              print "PasswordAuthentication yes"
+            } else {
+              print "PermitRootLogin prohibit-password"
+              print "PasswordAuthentication no"
+            }
+          }
+        ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
+        cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
+        rm -f /tmp/sshd_config.reinstall
+      fi
+      service sshd restart 2>/dev/null || true
+EOF
         fi
 
         if [[ -n "$SSH_PORT" ]]; then
@@ -1482,20 +1542,20 @@ EOF
           /^[[:space:]]*Port[[:space:]]+/ { next }
           { print }
           END { print "Port ${SSH_PORT}" }
-        ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \\
-        cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \\
+        ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
+        cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
         rm -f /tmp/sshd_config.reinstall
       fi
       if command -v semanage >/dev/null 2>&1; then
-        semanage port -a -t ssh_port_t -p tcp ${SSH_PORT} 2>/dev/null || \\
+        semanage port -a -t ssh_port_t -p tcp ${SSH_PORT} 2>/dev/null || \
         semanage port -m -t ssh_port_t -p tcp ${SSH_PORT} 2>/dev/null || true
       fi
       if command -v sshd >/dev/null 2>&1; then
         sshd -t || exit 1
       fi
-      systemctl restart sshd 2>/dev/null || \\
-      systemctl restart ssh 2>/dev/null || \\
-      service sshd restart 2>/dev/null || \\
+      systemctl restart sshd 2>/dev/null || \
+      systemctl restart ssh 2>/dev/null || \
+      service sshd restart 2>/dev/null || \
       service ssh restart 2>/dev/null || exit 1
 EOF
         fi
