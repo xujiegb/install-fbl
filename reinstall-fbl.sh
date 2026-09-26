@@ -63,7 +63,7 @@ Usage:
   $SCRIPT_NAME freebsd   14   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME rocky     10   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME almalinux 10   [--disk /dev/sdX] [options...]
-  $SCRIPT_NAME fedora    43   [--disk /dev/sdX] [options...]
+  $SCRIPT_NAME fedora    44   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME redhat         [--disk /dev/sdX] --img URL [options...]
 
 If --disk is not specified, the script will try to auto-detect the main disk:
@@ -3354,7 +3354,7 @@ if [[ -z "$TARGET_VER" ]]; then
         freebsd)   TARGET_VER="14" ;;
         rocky)     TARGET_VER="10" ;;
         almalinux) TARGET_VER="10" ;;
-        fedora)    TARGET_VER="43" ;;
+        fedora)    TARGET_VER="44" ;;
         redhat)    TARGET_VER="" ;;
         *)         ;;
     esac
