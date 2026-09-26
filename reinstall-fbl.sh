@@ -946,6 +946,27 @@ linux_is_partition_of_disk() {
     [[ -n "$pk" && "$pk" == "$disk" ]]
 }
 
+is_mountpoint() {
+    local path="$1"
+
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$path" 2>/dev/null
+        return $?
+    fi
+
+    # FreeBSD base system has no util-linux mountpoint(1). mount -p prints
+    # fstab-style records: device, mountpoint, fstype, options, dump, pass.
+    mount -p 2>/dev/null | awk -v mp="$path" '
+        $2 == mp {
+            found=1
+            exit
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    '
+}
+
 freebsd_mount_source_for() {
     local mountpoint="$1"
 
@@ -1817,8 +1838,22 @@ find_efi_for_plan() {
         fi
     elif [[ "$os" == "FreeBSD" ]]; then
         if command -v sysctl >/dev/null 2>&1 && command -v gpart >/dev/null 2>&1; then
-            local d p
+            local d p preferred=""
+
+            # Bootstrap must be written to the ESP on the same physical disk that
+            # will be reinstalled. Prefer the already selected target disk.
+            if [[ -n "${DISK:-}" ]]; then
+                preferred="${DISK#/dev/}"
+                p=$(gpart show -p "$preferred" 2>/dev/null | awk '$4 == "efi" {print $3; exit}')
+                if [[ -n "$p" ]]; then
+                    echo "/dev/$p"
+                    return 0
+                fi
+            fi
+
+            # Fallback only when no target-disk ESP was found.
             for d in $(sysctl -n kern.disks 2>/dev/null || true); do
+                [[ -n "$preferred" && "$d" == "$preferred" ]] && continue
                 p=$(gpart show -p "$d" 2>/dev/null | awk '$4 == "efi" {print $3; exit}')
                 if [[ -n "$p" ]]; then
                     echo "/dev/$p"
@@ -1896,7 +1931,7 @@ split_freebsd_part_device() {
 mount_efi_for_plan() {
     if [[ "$OS" == "Linux" ]]; then
         # Prefer real EFI/ESP if available.
-        if [[ -d "/boot/efi" ]] && mountpoint -q "/boot/efi" 2>/dev/null; then
+        if [[ -d "/boot/efi" ]] && is_mountpoint "/boot/efi"; then
             EFI_MOUNT_POINT="/boot/efi"
             PLAN_STORAGE_MODE="efi"
             PLAN_PATH_PREFIX_REL=""
@@ -1940,7 +1975,7 @@ mount_efi_for_plan() {
             PLAN_EFI_MOUNTED_BY_SCRIPT=0
 
             if [[ -z "$PLAN_EFI_PART" ]]; then
-                if mountpoint -q "/boot" 2>/dev/null; then
+                if is_mountpoint "/boot"; then
                     PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/boot" 2>/dev/null || true)
                 else
                     PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/" 2>/dev/null || true)
@@ -1957,18 +1992,39 @@ mount_efi_for_plan() {
         error "Could not find EFI partition for plan storage, and /boot fallback is unavailable"
     fi
 
-    if [[ -d "$EFI_MOUNT_POINT" ]] && mountpoint -q "$EFI_MOUNT_POINT" 2>/dev/null; then
+    if [[ -d "$EFI_MOUNT_POINT" ]] && is_mountpoint "$EFI_MOUNT_POINT"; then
+        local mounted_efi_src="" physical_efi_part=""
+
         PLAN_STORAGE_MODE="efi"
         PLAN_PATH_PREFIX_REL=""
         PLAN_EFI_MOUNTED_BY_SCRIPT=0
-        if [[ -z "$PLAN_EFI_PART" ]]; then
-            PLAN_EFI_PART=$(mount | awk -v mnt="$EFI_MOUNT_POINT" '$3 == "on" && $4 == mnt {print $1; exit}' || true)
+
+        mounted_efi_src=$(freebsd_mount_source_for "$EFI_MOUNT_POINT" || true)
+        physical_efi_part=$(find_efi_for_plan 2>/dev/null || true)
+
+        if [[ -n "$physical_efi_part" ]]; then
+            PLAN_EFI_PART="$physical_efi_part"
+        elif [[ -n "$mounted_efi_src" ]]; then
+            PLAN_EFI_PART="$mounted_efi_src"
         fi
-        if [[ -n "$PLAN_EFI_PART" ]]; then
-            PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
-            PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
-            split_freebsd_part_device "$PLAN_EFI_PART"
-        fi
+
+        [[ -n "$PLAN_EFI_PART" ]] || \
+            error "EFI is mounted at $EFI_MOUNT_POINT but its backing partition could not be identified"
+
+        PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
+        PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
+
+        case "${PLAN_EFI_PART#/dev/}" in
+            *p[0-9]*)
+                split_freebsd_part_device "$PLAN_EFI_PART"
+                ;;
+            *)
+                error "EFI is mounted from ${mounted_efi_src:-unknown}, but the physical EFI partition could not be resolved"
+                ;;
+        esac
+
+        info "Using already-mounted FreeBSD EFI partition: ${mounted_efi_src:-$PLAN_EFI_PART} on $EFI_MOUNT_POINT"
+        info "Physical EFI partition for BootNext: $PLAN_EFI_PART"
         return 0
     fi
 
@@ -1977,12 +2033,12 @@ mount_efi_for_plan() {
     efi_part=$(find_efi_for_plan 2>/dev/null || true)
     [[ -n "$efi_part" ]] || error "Could not find EFI partition for plan storage"
 
-    if ! mount "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
-        if ! mount -t vfat "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
-           ! mount -t msdos "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
-           ! mount -t msdosfs "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
-            error "Failed to mount EFI partition $efi_part on $EFI_MOUNT_POINT"
+    if command -v mount_msdosfs >/dev/null 2>&1; then
+        if ! mount_msdosfs "$efi_part" "$EFI_MOUNT_POINT"; then
+            error "Failed to mount FreeBSD EFI partition $efi_part on $EFI_MOUNT_POINT with mount_msdosfs"
         fi
+    elif ! mount -t msdosfs "$efi_part" "$EFI_MOUNT_POINT"; then
+        error "Failed to mount FreeBSD EFI partition $efi_part on $EFI_MOUNT_POINT"
     fi
 
     PLAN_STORAGE_MODE="efi"
@@ -2074,7 +2130,7 @@ try_mount_linux_bootstrap_candidate() {
         mount -t msdosfs "$candidate" "$mountpoint_path" 2>/dev/null || true
     fi
 
-    if ! mountpoint -q "$mountpoint_path" 2>/dev/null; then
+    if ! is_mountpoint "$mountpoint_path"; then
         warn "Mount failed for candidate: $candidate"
         return 1
     fi
@@ -2120,7 +2176,7 @@ load_plan_from_efi() {
         mkdir -p "$boot_mnt"
 
         # 1) 优先按 /etc/reinstall/vars 提供的信息尝试挂载
-        if [[ "$vars_loaded" -eq 1 ]] && ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+        if [[ "$vars_loaded" -eq 1 ]] && ! is_mountpoint "$boot_mnt"; then
             if [[ -n "${PLAN_EFI_PART:-}" && -e "${PLAN_EFI_PART}" ]]; then
                 info "Trying bootstrap mount from PLAN_EFI_PART: ${PLAN_EFI_PART}"
                 if [[ "${PLAN_STORAGE_MODE:-efi}" == "efi" ]]; then
@@ -2129,7 +2185,7 @@ load_plan_from_efi() {
                     try_mount_linux_bootstrap_candidate "${PLAN_EFI_PART}" "$boot_mnt" "boot" || true
                 fi
             fi
-            if ! mountpoint -q "$boot_mnt" 2>/dev/null && [[ -n "${PLAN_EFI_UUID:-}" ]]; then
+            if ! is_mountpoint "$boot_mnt" && [[ -n "${PLAN_EFI_UUID:-}" ]]; then
                 candidate="$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)"
                 if [[ -n "$candidate" && -e "$candidate" ]]; then
                     info "Trying bootstrap mount from PLAN_EFI_UUID: ${PLAN_EFI_UUID} -> ${candidate}"
@@ -2143,7 +2199,7 @@ load_plan_from_efi() {
         fi
 
         # 2) 当前系统已挂载的 EFI/boot 优先
-        if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+        if ! is_mountpoint "$boot_mnt"; then
             current_efi_src=$(findmnt -n -o SOURCE --target /boot/efi 2>/dev/null | head -n1 || true)
             if [[ -n "$current_efi_src" && -e "$current_efi_src" ]]; then
                 info "Trying currently mounted EFI source: $current_efi_src"
@@ -2151,7 +2207,7 @@ load_plan_from_efi() {
             fi
         fi
 
-        if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+        if ! is_mountpoint "$boot_mnt"; then
             current_boot_src=$(findmnt -n -o SOURCE --target /boot 2>/dev/null | head -n1 || true)
             if [[ -n "$current_boot_src" && -e "$current_boot_src" ]]; then
                 info "Trying currently mounted /boot source: $current_boot_src"
@@ -2159,7 +2215,7 @@ load_plan_from_efi() {
             fi
         fi
 
-        if ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+        if ! is_mountpoint "$boot_mnt"; then
             current_boot_src=$(findmnt -n -o SOURCE --target / 2>/dev/null | head -n1 || true)
             if [[ -n "$current_boot_src" && -e "$current_boot_src" ]]; then
                 info "Trying current root source as /boot fallback: $current_boot_src"
@@ -2168,7 +2224,7 @@ load_plan_from_efi() {
         fi
 
         # 3) 如果已挂载，先找 plan
-        if [[ -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
+        if [[ -d "$boot_mnt" ]] && is_mountpoint "$boot_mnt"; then
             if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
                 PLAN_STORAGE_MODE="boot"
                 PLAN_PATH_PREFIX_REL=""
@@ -2185,7 +2241,7 @@ load_plan_from_efi() {
         fi
 
         # 4) 最后才做白名单块设备扫描
-        if [[ -z "$plan_file" ]] && ! mountpoint -q "$boot_mnt" 2>/dev/null; then
+        if [[ -z "$plan_file" ]] && ! is_mountpoint "$boot_mnt"; then
             info "Bootstrap plan not found via explicit hints or current mounts; falling back to conservative device scan."
             while read -r candidate; do
                 try_mount_linux_bootstrap_candidate "$candidate" "$boot_mnt" "auto" || continue
@@ -2209,7 +2265,7 @@ load_plan_from_efi() {
             done < <(linux_bootstrap_scan_devices)
         fi
 
-        if [[ -z "$plan_file" && -d "$boot_mnt" ]] && mountpoint -q "$boot_mnt" 2>/dev/null; then
+        if [[ -z "$plan_file" && -d "$boot_mnt" ]] && is_mountpoint "$boot_mnt"; then
             if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
                 PLAN_STORAGE_MODE="boot"
                 PLAN_PATH_PREFIX_REL=""
@@ -2751,7 +2807,7 @@ mount_bootstrap() {
 
     mkdir -p "$base_mnt"
 
-    if mountpoint -q "$base_mnt" 2>/dev/null; then
+    if is_mountpoint "$base_mnt"; then
         return 0
     fi
 
@@ -2770,7 +2826,7 @@ mount_bootstrap() {
         fi
     fi
 
-    if mountpoint -q "$base_mnt" 2>/dev/null; then
+    if is_mountpoint "$base_mnt"; then
         return 0
     fi
 
@@ -2789,7 +2845,7 @@ mount_bootstrap() {
         fi
     fi
 
-    if mountpoint -q "$base_mnt" 2>/dev/null; then
+    if is_mountpoint "$base_mnt"; then
         return 0
     fi
 
@@ -2925,7 +2981,7 @@ setup_work_tmpfs() {
     [ "$work_bytes" -gt 536870912 ] || work_bytes=536870912
 
     mkdir -p /run/reinstall-work
-    if mountpoint -q /run/reinstall-work 2>/dev/null; then
+    if is_mountpoint /run/reinstall-work; then
         umount /run/reinstall-work 2>/dev/null || true
     fi
     mount -t tmpfs -o "size=${work_bytes},mode=0700" tmpfs /run/reinstall-work
@@ -2937,7 +2993,7 @@ relocate_modloop_to_ram() {
 
     kver="$(uname -r)"
 
-    if ! mountpoint -q /.modloop 2>/dev/null; then
+    if ! is_mountpoint /.modloop; then
         echo "No /.modloop mount is active; no boot-media modloop relocation is needed."
         return 0
     fi
@@ -3801,7 +3857,7 @@ release_temp_staging_partition() {
     sync
     cd /
 
-    if mountpoint -q "$TEMP_STAGE_MNT" 2>/dev/null; then
+    if is_mountpoint "$TEMP_STAGE_MNT"; then
         umount "$TEMP_STAGE_MNT" || error "Failed to unmount temporary staging partition"
     fi
 
@@ -3915,7 +3971,7 @@ do_install() {
         return 0
     fi
 
-    if [[ -d /run/reinstall-work ]] && mountpoint -q /run/reinstall-work 2>/dev/null; then
+    if [[ -d /run/reinstall-work ]] && is_mountpoint /run/reinstall-work; then
         INSTALL_TMPDIR=$(mktemp -d /run/reinstall-work/install.XXXXXX)
     else
         error "Swap-backed Alpine work tmpfs is not mounted at /run/reinstall-work"
@@ -3929,7 +3985,7 @@ do_install() {
 
     cleanup_install_stage() {
         cleanup_qcow_nbd
-        if mountpoint -q "$TEMP_STAGE_MNT" 2>/dev/null; then
+        if is_mountpoint "$TEMP_STAGE_MNT"; then
             umount "$TEMP_STAGE_MNT" 2>/dev/null || true
         fi
         rm -rf "$INSTALL_TMPDIR" 2>/dev/null || true
