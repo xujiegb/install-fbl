@@ -3075,22 +3075,39 @@ locate_bootstrap_image() {
 reread_partition_table_strict() {
     sync
 
-    # Ask the kernel to forget/update cached partition mappings. Alpine RAM normally
-    # uses mdev rather than a full udev daemon, so merely running partprobe is not
-    # enough on every virtio/NVMe setup to create the new /dev node.
+    # Alpine RAM may retain stale partition mappings after an in-place disk-image
+    # write. Do not make partprobe the single point of failure: try the kernel
+    # reread ioctl and partx as well, then refresh /dev through mdev/udev.
+    local reread_ok=0
+
+    if command -v blockdev >/dev/null 2>&1; then
+        if blockdev --rereadpt "$DISK" >/dev/null 2>&1; then
+            reread_ok=1
+        fi
+    fi
+
     if command -v partprobe >/dev/null 2>&1; then
-        partprobe "$DISK" || error "Failed to reread target partition table with partprobe"
-    elif command -v blockdev >/dev/null 2>&1; then
-        blockdev --rereadpt "$DISK" || error "Failed to reread target partition table with blockdev"
-    else
-        error "No partprobe or blockdev available to reread the target partition table"
+        if partprobe "$DISK" >/dev/null 2>&1; then
+            reread_ok=1
+        fi
     fi
 
     if command -v partx >/dev/null 2>&1; then
-        partx -u "$DISK" >/dev/null 2>&1 || partx -a "$DISK" >/dev/null 2>&1 || true
+        if partx -u "$DISK" >/dev/null 2>&1; then
+            reread_ok=1
+        elif partx -a "$DISK" >/dev/null 2>&1; then
+            reread_ok=1
+        fi
     fi
+
     command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
     command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+
+    [[ "$reread_ok" -eq 1 ]] || {
+        warn "Kernel could not reread the target partition table."
+        lsblk -a -o NAME,PATH,TYPE,SIZE,PARTN,PARTLABEL "$DISK" >&2 2>/dev/null || true
+        error "Failed to synchronize the target partition table with the kernel"
+    }
 }
 
 create_nocloud_cidata_partition() {
@@ -3116,7 +3133,7 @@ create_nocloud_cidata_partition() {
     printf '%s\n' "$seed_part"
 }
 
-TEMP_STAGE_SIZE_BYTES=$((1536 * 1024 * 1024))
+TEMP_STAGE_SIZE_BYTES=$((3072 * 1024 * 1024))
 TEMP_STAGE_PART_NUM=1
 TEMP_STAGE_LABEL="REINSTALL_TMP"
 TEMP_STAGE_MNT="/mnt/reinstall-stage"
@@ -3263,7 +3280,7 @@ prepare_fixed_temp_staging_partition() {
     TEMP_STAGE_START_BYTES=$((first_sector * TEMP_STAGE_SECTOR_SIZE))
     actual_bytes=$(((last_sector - first_sector + 1) * TEMP_STAGE_SECTOR_SIZE))
 
-    # The start is normally aligned, so the actual size may differ from exactly 1.5 GiB
+    # The start is normally aligned, so the actual size may differ from exactly 3 GiB
     # by less than one alignment unit. Reject a materially smaller partition.
     if [[ "$actual_bytes" -lt $((TEMP_STAGE_SIZE_BYTES - 2 * 1024 * 1024)) ]]; then
         error "Temporary staging partition is smaller than requested: ${actual_bytes} bytes"
@@ -3456,10 +3473,33 @@ write_qcow_without_overwriting_staging() {
 }
 
 release_temp_staging_partition() {
+    local old_stage="${TEMP_STAGE_PART:-}"
+
     sync
+    cd /
+
     if mountpoint -q "$TEMP_STAGE_MNT" 2>/dev/null; then
         umount "$TEMP_STAGE_MNT" || error "Failed to unmount temporary staging partition"
     fi
+
+    # The on-disk primary GPT has already been replaced by the target image, but
+    # the kernel can still remember the old tail REINSTALL_TMP partition. Drop
+    # those stale mappings before manipulating the target GPT. This avoids
+    # BLKRRPART/partprobe returning EBUSY even though the staging filesystem has
+    # already been unmounted.
+    if command -v partx >/dev/null 2>&1; then
+        if ! partx -d "$DISK" >/dev/null 2>&1; then
+            warn "Could not immediately delete stale staging partition mappings with partx; continuing with GPT repair."
+        fi
+    fi
+
+    command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
+    command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+
+    if [[ -n "$old_stage" ]]; then
+        info "Released temporary staging partition: $old_stage"
+    fi
+
     TEMP_STAGE_PART=""
 }
 
@@ -3591,7 +3631,7 @@ do_install() {
         POST_INSTALL_HOOK="$staged_hook"
     fi
 
-    # A fixed 1.5 GiB tail partition is always used for image staging, even when
+    # A fixed 3 GiB tail partition is always used for image staging, even when
     # there is enough RAM. At this point modloop and the installer itself are in RAM.
     sync
     cd /
@@ -3621,19 +3661,20 @@ do_install() {
 
     inspect_qcow_partition_layout "$IMG_QCOW"
 
-    info "Writing qcow2 from the 1.5 GiB tail staging partition without overwriting its live source..."
+    info "Writing qcow2 from the 3 GiB tail staging partition without overwriting its live source..."
     write_qcow_without_overwriting_staging "$IMG_QCOW"
     sync
     info "Safe qcow2 prefix write finished."
 
     # qemu-img has closed the source file. Release the temporary tail partition,
-    # then make the image GPT authoritative and recover the 1.5 GiB for the target.
+    # then make the image GPT authoritative and recover the 3 GiB for the target.
     release_temp_staging_partition
     sync
 
+    # Work directly on the image GPT while no target partitions are mapped in the
+    # kernel. grow_last_partition_reserving_cidata() repairs the backup GPT,
+    # expands the final data partition, and then performs a single kernel reread.
     sgdisk -e "$DISK" >/dev/null || error "Failed to repair target GPT after releasing staging partition"
-    reread_partition_table_strict
-    sleep 2
 
     grow_last_partition_reserving_cidata
 
