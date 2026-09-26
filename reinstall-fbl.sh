@@ -41,6 +41,9 @@
 # Important compatibility note:
 #   - This script creates a dedicated VFAT partition labeled CIDATA for standard NoCloud discovery.
 #   - Target images must include cloud-init with NoCloud support.
+#   - Installer staging is fixed at 3 GiB on the tail of the target disk.
+#   - Minimum target disk capacity is documented as 9.5 GiB; use a nominal 10G VPS disk or larger.
+#   - The script intentionally does not enforce that minimum with an additional disk-capacity probe.
 #   - Validate your target image before relying on unattended deployment.
 
 set -Eeuo pipefail
@@ -1504,7 +1507,7 @@ POST_INSTALL_HOOK=""
 # Alpine RAM preparation
 ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
 ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/v3.22"
-ALPINE_NETBOOT_SUBDIR="netboot-3.22.3"
+ALPINE_NETBOOT_SUBDIR="netboot-3.22.6"
 ALPINE_BOOT_SUBDIR="alpine"
 ALPINE_BOOT_DIR_REL=""
 ALPINE_BOOT_DIR_ABS=""
@@ -3142,7 +3145,7 @@ ensure_linux_block_node_from_sysfs() {
 }
 
 prepare_fixed_temp_staging_partition() {
-    [[ "$OS" == "Linux" ]] || error "The fixed 1.5 GiB staging partition requires the Linux/Alpine installer environment"
+    [[ "$OS" == "Linux" ]] || error "The fixed 3 GiB staging partition requires the Linux/Alpine installer environment"
     command -v sgdisk >/dev/null 2>&1 || error "sgdisk is required for the fixed staging partition"
     command -v mkfs.ext4 >/dev/null 2>&1 || error "mkfs.ext4 is required for the fixed staging partition"
     command -v blockdev >/dev/null 2>&1 || error "blockdev is required for the fixed staging partition"
@@ -3155,10 +3158,10 @@ prepare_fixed_temp_staging_partition() {
     # check below is stricter and will refuse an image whose partitions cross the boundary.
     min_remaining=$((2 * 1024 * 1024 * 1024))
     if [[ "$disk_size" -le $((TEMP_STAGE_SIZE_BYTES + min_remaining)) ]]; then
-        error "Target disk is too small for the mandatory 1.5 GiB staging partition. Disk=${disk_size} bytes"
+        error "Target disk is too small for the mandatory 3 GiB staging partition. Disk=${disk_size} bytes"
     fi
 
-    info "Preparing mandatory 1.5 GiB staging partition at the end of $DISK ..."
+    info "Preparing mandatory 3 GiB staging partition at the end of $DISK ..."
     info "This step destroys the old partition table; Alpine is already running from RAM."
 
     wipefs -a "$DISK" >/dev/null 2>&1 || true
@@ -3174,10 +3177,10 @@ prepare_fixed_temp_staging_partition() {
     command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
 
     sgdisk -o "$DISK" >/dev/null || error "Failed to create temporary GPT on $DISK"
-    sgdisk -n "${TEMP_STAGE_PART_NUM}:-1536M:0" \
+    sgdisk -n "${TEMP_STAGE_PART_NUM}:-3072M:0" \
            -t "${TEMP_STAGE_PART_NUM}:8300" \
            -c "${TEMP_STAGE_PART_NUM}:${TEMP_STAGE_LABEL}" \
-           "$DISK" >/dev/null || error "Failed to create mandatory 1.5 GiB staging partition"
+           "$DISK" >/dev/null || error "Failed to create mandatory 3 GiB staging partition"
 
     reread_partition_table_strict
 
@@ -3336,7 +3339,7 @@ inspect_qcow_partition_layout() {
 
     # Keep 8 MiB of safety space before the live staging partition.
     if [[ "$QCOW_MAX_PART_END_BYTES" -gt $((TEMP_STAGE_START_BYTES - 8 * 1024 * 1024)) ]]; then
-        error "The qcow2 partition layout reaches the mandatory 1.5 GiB staging area. Refusing a self-overwriting install. Image partition end=${QCOW_MAX_PART_END_BYTES}; staging start=${TEMP_STAGE_START_BYTES}"
+        error "The qcow2 partition layout reaches the mandatory 3 GiB staging area. Refusing a self-overwriting install. Image partition end=${QCOW_MAX_PART_END_BYTES}; staging start=${TEMP_STAGE_START_BYTES}"
     fi
 }
 
@@ -3344,11 +3347,11 @@ download_target_image_in_alpine() {
     local dst="$1" tmp="${1}.part.$$" remote_size allocated
 
     rm -f "$tmp"
-    info "Downloading target image onto the mandatory 1.5 GiB staging partition: $IMG_URL"
+    info "Downloading target image onto the mandatory 3 GiB staging partition: $IMG_URL"
 
     remote_size=$(http_content_length "$IMG_URL" || true)
     if [[ "$remote_size" =~ ^[0-9]+$ && "$remote_size" -gt $((1450 * 1024 * 1024)) ]]; then
-        error "Remote image payload is too large for the fixed 1.5 GiB staging partition: ${remote_size} bytes"
+        error "Remote image payload is too large for the fixed 3 GiB staging partition: ${remote_size} bytes"
     fi
 
     if [[ "$IMG_URL" == *.xz ]]; then
@@ -3571,7 +3574,7 @@ do_install() {
     unmount_target_disk_filesystems "$DISK"
 
     echo
-    echo "WARNING: the target disk will now be repartitioned for a mandatory 1.5 GiB staging area."
+    echo "WARNING: the target disk will now be repartitioned for a mandatory 3 GiB staging area."
     echo "ALL EXISTING DATA ON $DISK WILL BE LOST BEFORE THE IMAGE DOWNLOAD STARTS."
 
     if [[ "$AUTO_YES" -eq 1 ]]; then
