@@ -1152,10 +1152,10 @@ get_default_image_url() {
                 14|14.*)
                     case "$MACHINE_ARCH" in
                         x86_64)
-                            echo "https://download.freebsd.org/releases/VM-IMAGES/14.3-RELEASE/amd64/Latest/FreeBSD-14.3-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+                            echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/amd64/Latest/FreeBSD-14.5-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
                             ;;
                         aarch64)
-                            echo "https://download.freebsd.org/releases/VM-IMAGES/14.3-RELEASE/aarch64/Latest/FreeBSD-14.3-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+                            echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/aarch64/Latest/FreeBSD-14.5-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
                             ;;
                         *)
                             error "Current arch $MACHINE_ARCH is not supported for automatic FreeBSD image selection, please specify --img manually"
@@ -1174,8 +1174,11 @@ get_default_image_url() {
                         x86_64)
                             echo "https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-EC2-LVM.latest.x86_64.qcow2"
                             ;;
+                        aarch64)
+                            echo "https://download.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-EC2-LVM.latest.aarch64.qcow2"
+                            ;;
                         *)
-                            error "Rocky 10 default image is only provided for x86_64; use --img for other arches"
+                            error "Current arch $MACHINE_ARCH is not supported for automatic Rocky image selection, please specify --img manually"
                             ;;
                     esac
                     ;;
@@ -1206,13 +1209,13 @@ get_default_image_url() {
             ;;
         fedora)
             case "$ver" in
-                43)
+                44)
                     case "$MACHINE_ARCH" in
                         x86_64)
-                            echo "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2"
+                            echo "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
                             ;;
                         aarch64)
-                            echo "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-43-1.6.aarch64.qcow2"
+                            echo "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
                             ;;
                         *)
                             error "Current arch $MACHINE_ARCH is not supported for automatic Fedora image selection, please specify --img manually"
