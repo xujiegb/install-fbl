@@ -1538,7 +1538,7 @@ POST_INSTALL_HOOK_BOOTSTRAP_REL=""
 
 ALPINE_RUNTIME_PKGS=(
     bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar
-    e2fsprogs dosfstools gptfdisk kmod
+    e2fsprogs dosfstools sgdisk kmod
 )
 
 detect_env_mode() {
@@ -2633,8 +2633,17 @@ REPOEOF
     echo "[stage] apk add (online official repos)"
     apk add --no-cache \
         bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar \
-        e2fsprogs dosfstools gptfdisk kmod
+        e2fsprogs dosfstools sgdisk kmod
     update-ca-certificates 2>/dev/null || true
+
+    # Fail here with a precise message instead of reaching the destructive stage
+    # and discovering that a split Alpine subpackage was not installed.
+    for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            echo "Required Alpine runtime command is missing after apk add: $cmd"
+            exit 1
+        }
+    done
 }
 
 setup_zram_swap() {
