@@ -64,7 +64,7 @@ info() {
 usage() {
     cat <<EOF
 Usage:
-  $SCRIPT_NAME freebsd   14   [--disk /dev/sdX] [options...]
+  $SCRIPT_NAME freebsd   14|15 [--disk /dev/sdX] [options...]
   $SCRIPT_NAME rocky     10   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME almalinux 10   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME fedora    44   [--disk /dev/sdX] [options...]
@@ -1225,8 +1225,34 @@ get_default_image_url() {
                             ;;
                     esac
                     ;;
+                15.0|15.0.*)
+                    case "$MACHINE_ARCH" in
+                        x86_64)
+                            echo "https://download.freebsd.org/releases/VM-IMAGES/15.0-RELEASE/amd64/Latest/FreeBSD-15.0-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+                            ;;
+                        aarch64)
+                            echo "https://download.freebsd.org/releases/VM-IMAGES/15.0-RELEASE/aarch64/Latest/FreeBSD-15.0-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+                            ;;
+                        *)
+                            error "Current arch $MACHINE_ARCH is not supported for automatic FreeBSD image selection, please specify --img manually"
+                            ;;
+                    esac
+                    ;;
+                15|15.1|15.1.*)
+                    case "$MACHINE_ARCH" in
+                        x86_64)
+                            echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+                            ;;
+                        aarch64)
+                            echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+                            ;;
+                        *)
+                            error "Current arch $MACHINE_ARCH is not supported for automatic FreeBSD image selection, please specify --img manually"
+                            ;;
+                    esac
+                    ;;
                 *)
-                    error "Unsupported FreeBSD version: $ver (only 14.x is baked in; use --img for others)"
+                    error "Unsupported FreeBSD version: $ver (built-in: 14.x -> 14.5, 15 -> 15.1, explicit 15.0/15.1; use --img for others)"
                     ;;
             esac
             ;;
@@ -3034,6 +3060,10 @@ locate_bootstrap_image() {
 
 reread_partition_table_strict() {
     sync
+
+    # Ask the kernel to forget/update cached partition mappings. Alpine RAM normally
+    # uses mdev rather than a full udev daemon, so merely running partprobe is not
+    # enough on every virtio/NVMe setup to create the new /dev node.
     if command -v partprobe >/dev/null 2>&1; then
         partprobe "$DISK" || error "Failed to reread target partition table with partprobe"
     elif command -v blockdev >/dev/null 2>&1; then
@@ -3041,6 +3071,11 @@ reread_partition_table_strict() {
     else
         error "No partprobe or blockdev available to reread the target partition table"
     fi
+
+    if command -v partx >/dev/null 2>&1; then
+        partx -u "$DISK" >/dev/null 2>&1 || partx -a "$DISK" >/dev/null 2>&1 || true
+    fi
+    command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
     command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
 }
 
@@ -3068,7 +3103,7 @@ create_nocloud_cidata_partition() {
 }
 
 TEMP_STAGE_SIZE_BYTES=$((1536 * 1024 * 1024))
-TEMP_STAGE_PART_NUM=128
+TEMP_STAGE_PART_NUM=1
 TEMP_STAGE_LABEL="REINSTALL_TMP"
 TEMP_STAGE_MNT="/mnt/reinstall-stage"
 TEMP_STAGE_PART=""
@@ -3079,6 +3114,18 @@ QCOW_VIRTUAL_SIZE=""
 QCOW_MAX_PART_END_BYTES=""
 QCOW_MAX_PART_END_SECTOR=""
 QCOW_NBD_DEV=""
+
+partition_device_for_number() {
+    local disk="$1" num="$2"
+    case "$disk" in
+        /dev/nvme*|/dev/mmcblk*|/dev/loop*)
+            printf '%sp%s\n' "$disk" "$num"
+            ;;
+        *)
+            printf '%s%s\n' "$disk" "$num"
+            ;;
+    esac
+}
 
 prepare_fixed_temp_staging_partition() {
     [[ "$OS" == "Linux" ]] || error "The fixed 1.5 GiB staging partition requires the Linux/Alpine installer environment"
@@ -3102,6 +3149,16 @@ prepare_fixed_temp_staging_partition() {
 
     wipefs -a "$DISK" >/dev/null 2>&1 || true
     sgdisk -Z "$DISK" >/dev/null 2>&1 || true
+
+    # Remove stale kernel partition mappings before creating the one temporary
+    # partition. This matters on Alpine/mdev and virtio-blk after the original
+    # boot disk partitions have just been removed.
+    if command -v partx >/dev/null 2>&1; then
+        partx -d "$DISK" >/dev/null 2>&1 || true
+    fi
+    command -v blockdev >/dev/null 2>&1 && blockdev --rereadpt "$DISK" >/dev/null 2>&1 || true
+    command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
+
     sgdisk -o "$DISK" >/dev/null || error "Failed to create temporary GPT on $DISK"
     sgdisk -n "${TEMP_STAGE_PART_NUM}:-1536M:0" \
            -t "${TEMP_STAGE_PART_NUM}:8300" \
@@ -3109,12 +3166,32 @@ prepare_fixed_temp_staging_partition() {
            "$DISK" >/dev/null || error "Failed to create mandatory 1.5 GiB staging partition"
 
     reread_partition_table_strict
-    sleep 1
 
-    TEMP_STAGE_PART=$(lsblk -lnpo NAME,PARTLABEL "$DISK" 2>/dev/null | \
-        awk -v label="$TEMP_STAGE_LABEL" '$2==label {print $1; exit}')
-    [[ -n "$TEMP_STAGE_PART" && -b "$TEMP_STAGE_PART" ]] || \
-        error "Could not locate the temporary staging partition after GPT creation"
+    # Do not depend on PARTLABEL appearing in lsblk immediately. On minimal
+    # Alpine with mdev that metadata may lag even though the partition node is
+    # already valid. The partition number is known because the temporary GPT
+    # contains exactly this explicitly numbered partition.
+    TEMP_STAGE_PART=$(partition_device_for_number "$DISK" "$TEMP_STAGE_PART_NUM")
+    local wait_i
+    for wait_i in 1 2 3 4 5 6 7 8; do
+        [[ -b "$TEMP_STAGE_PART" ]] && break
+        command -v partx >/dev/null 2>&1 && {
+            partx -u "$DISK" >/dev/null 2>&1 || partx -a "$DISK" >/dev/null 2>&1 || true
+        }
+        command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
+        command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+        sleep 1
+    done
+
+    if [[ ! -b "$TEMP_STAGE_PART" ]]; then
+        warn "Temporary GPT as reported by sgdisk:"
+        sgdisk -p "$DISK" >&2 || true
+        warn "Current block-device view:"
+        lsblk -a -o NAME,PATH,TYPE,SIZE,PARTN,PARTLABEL "$DISK" >&2 || true
+        error "Could not locate expected temporary staging partition node: $TEMP_STAGE_PART"
+    fi
+
+    info "Temporary staging partition node appeared: $TEMP_STAGE_PART"
 
     TEMP_STAGE_SECTOR_SIZE=$(blockdev --getss "$DISK" 2>/dev/null || true)
     [[ "$TEMP_STAGE_SECTOR_SIZE" =~ ^[0-9]+$ && "$TEMP_STAGE_SECTOR_SIZE" -gt 0 ]] || \
