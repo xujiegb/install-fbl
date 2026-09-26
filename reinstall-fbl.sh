@@ -801,6 +801,8 @@ get_disk_size_bytes() {
 unmount_target_disk_filesystems() {
     local disk="$1" dev mnt d sysname holder_found holder
 
+    cd /
+
     if [[ "$OS" == "Linux" ]]; then
         command -v lsblk >/dev/null 2>&1 || error "lsblk is required before destructive write"
 
@@ -819,7 +821,15 @@ unmount_target_disk_filesystems() {
             while IFS= read -r mnt; do
                 [[ -n "$mnt" ]] || continue
                 info "Unmounting target-disk filesystem: $dev from $mnt"
-                umount "$mnt" || error "Failed to unmount target-disk filesystem: $mnt"
+                if ! umount "$mnt"; then
+                    warn "Failed to unmount $mnt; dumping mount/loop diagnostics before aborting."
+                    findmnt -R "$mnt" 2>/dev/null || true
+                    losetup -a 2>/dev/null || true
+                    if command -v fuser >/dev/null 2>&1; then
+                        fuser -vm "$mnt" 2>/dev/null || true
+                    fi
+                    error "Failed to unmount target-disk filesystem: $mnt"
+                fi
             done < <(findmnt -rn -S "$dev" -o TARGET 2>/dev/null || true)
         done < <(lsblk -nrpo NAME "$disk" 2>/dev/null | tac)
 
@@ -2680,6 +2690,82 @@ setup_work_tmpfs() {
     echo "Created swap-backed tmpfs work area: $((work_bytes / 1024 / 1024)) MiB limit"
 }
 
+relocate_modloop_to_ram() {
+    local loopdev backing ram_modloop kver new_loopdev boot_mnt
+
+    kver="$(uname -r)"
+
+    if ! mountpoint -q /.modloop 2>/dev/null; then
+        echo "No /.modloop mount is active; no boot-media modloop relocation is needed."
+        return 0
+    fi
+
+    loopdev="$(findmnt -rn -o SOURCE --target /.modloop 2>/dev/null | head -n1 || true)"
+    [ -n "$loopdev" ] || {
+        echo "Could not determine the block device backing /.modloop."
+        exit 1
+    }
+
+    backing=""
+    if command -v losetup >/dev/null 2>&1; then
+        backing="$(losetup -n -O BACK-FILE "$loopdev" 2>/dev/null | head -n1 || true)"
+    fi
+    if [ -z "$backing" ]; then
+        case "$loopdev" in
+            /dev/loop*)
+                backing="$(cat "/sys/class/block/${loopdev#/dev/}/loop/backing_file" 2>/dev/null || true)"
+                [ -n "$backing" ] && backing="/${backing#/}"
+                ;;
+        esac
+    fi
+
+    [ -n "$backing" ] && [ -f "$backing" ] || {
+        echo "Could not determine the modloop backing file for $loopdev."
+        echo "Current mounts:"
+        findmnt /.modloop 2>/dev/null || true
+        losetup -a 2>/dev/null || true
+        exit 1
+    }
+
+    ram_modloop="/run/reinstall-work/modloop.ram.squashfs"
+    echo "Relocating Alpine modloop to RAM: $backing -> $ram_modloop"
+    cp "$backing" "$ram_modloop"
+    sync
+
+    # The original loop keeps the boot filesystem busy. Drop that loop mount,
+    # then immediately recreate /.modloop from the RAM-backed copy.
+    umount /.modloop || {
+        echo "Failed to unmount the original /.modloop."
+        exit 1
+    }
+    if command -v losetup >/dev/null 2>&1; then
+        losetup -d "$loopdev" 2>/dev/null || true
+    fi
+
+    mount -o loop,ro "$ram_modloop" /.modloop || {
+        echo "Failed to mount RAM-backed modloop."
+        exit 1
+    }
+
+    [ -d "/.modloop/modules/$kver" ] || {
+        echo "RAM-backed modloop does not contain modules for kernel $kver."
+        exit 1
+    }
+    [ -e "/lib/modules/$kver" ] || {
+        echo "/lib/modules/$kver is unavailable after modloop relocation."
+        exit 1
+    }
+
+    new_loopdev="$(findmnt -rn -o SOURCE --target /.modloop 2>/dev/null | head -n1 || true)"
+    echo "RAM-backed modloop active: ${new_loopdev:-unknown} -> $ram_modloop"
+
+    # Show any remaining boot-media mounts. The installer will unmount the target
+    # disk strictly before qemu-img writes to it.
+    boot_mnt="$(dirname "$backing")"
+    echo "Modloop relocation complete; original boot media is no longer used by /.modloop."
+    findmnt -rn -S "${PLAN_EFI_PART:-}" 2>/dev/null || true
+}
+
 main() {
     PLAN_FILE="/etc/reinstall/plan.env"
     SCRIPT_FILE="/usr/local/sbin/reinstall-installer.sh"
@@ -2706,6 +2792,11 @@ main() {
 
     echo "[stage] setup_work_tmpfs"
     setup_work_tmpfs
+
+    cd /
+
+    echo "[stage] relocate_modloop_to_ram"
+    relocate_modloop_to_ram
 
     RUN_SCRIPT="/run/reinstall-installer.sh"
     cp "$SCRIPT_FILE" "$RUN_SCRIPT"
