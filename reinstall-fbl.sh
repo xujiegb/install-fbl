@@ -1,51 +1,5 @@
 #!/usr/bin/env bash
-# reinstall-freebsd-linux.sh
-# Reinstall system on Linux / FreeBSD using DD + cloud-init (NoCloud) with:
-#   - freebsd
-#   - rocky
-#   - almalinux
-#   - fedora
-#   - debian
-#   - redhat
-#
-# All target systems use cloud-init to inject:
-#   - root password (--password)
-#   - SSH public key(s) (--ssh-key, multiple)
-#   - SSH port (--ssh-port)
-#   - optional FRPC config (--frpc-toml) embedded into NoCloud user-data
-#
-# Requirements:
-#   - Run with bash:  bash reinstall-freebsd-linux.sh ...
-#   - Needs dd, xz, qemu-img, mount, and curl or wget or fetch
-#   - Designed to be executed from a dracut initramfs (via rd.reinstall=1 wrapper).
-#
-# Added:
-#   - On Linux+GRUB+EFI host, automatically prepare Alpine RAM installer,
-#     add a one-time GRUB entry, reboot into Alpine RAM, and auto-continue.
-#   - On FreeBSD+UEFI host, automatically prepare Alpine RAM installer,
-#     build a GRUB EFI binary, add a one-time BootNext entry, reboot into Alpine RAM,
-#     and auto-continue.
-#
-# Alpine RAM download mode:
-#   - Host phase stores only the reinstall plan, script, optional local inputs,
-#     and Alpine boot assets on bootstrap storage.
-#   - Alpine RAM obtains networking with DHCP and installs runtime packages
-#     directly from the official Alpine repositories.
-#   - Alpine RAM enables zram swap for runtime memory pressure.
-#   - After relocating modloop to RAM, Alpine always recreates the target disk with a
-#     dedicated 3 GiB temporary staging partition at the physical end of the disk.
-#   - Target qcow/qcow.xz is downloaded/decompressed as qcow2 onto that staging partition.
-#   - qcow2 is written only to the safe prefix before the staging partition, then the
-#     staging partition is released, GPT is repaired, the last data partition is expanded,
-#     and a dedicated CIDATA partition is created.
-#
-# Important compatibility note:
-#   - This script creates a dedicated VFAT partition labeled CIDATA for standard NoCloud discovery.
-#   - Target images must include cloud-init with NoCloud support.
-#   - Installer staging is fixed at 3 GiB on the tail of the target disk.
-#   - Minimum target disk capacity is documented as 9.5 GiB; use a nominal 10G VPS disk or larger.
-#   - The script intentionally does not enforce that minimum with an additional disk-capacity probe.
-#   - Validate your target image before relying on unattended deployment.
+# Destructive unattended reinstall for Linux/FreeBSD hosts.
 
 set -Eeuo pipefail
 export LC_ALL=C
@@ -189,120 +143,6 @@ http_content_length() {
     return 1
 }
 
-get_available_bytes() {
-    local path="$1"
-    df -Pk "$path" 2>/dev/null | awk 'NR==2 { print $4 * 1024 }'
-}
-
-get_file_size_bytes() {
-    local path="$1"
-
-    if [[ ! -e "$path" ]]; then
-        return 1
-    fi
-
-    if stat -c '%s' "$path" >/dev/null 2>&1; then
-        stat -c '%s' "$path"
-        return 0
-    fi
-
-    if stat -f '%z' "$path" >/dev/null 2>&1; then
-        stat -f '%z' "$path"
-        return 0
-    fi
-
-    return 1
-}
-
-precheck_tmp_space_for_image() {
-    local url="$1"
-    local avail size need
-
-    avail=$(get_available_bytes /tmp)
-    [[ -n "$avail" ]] || {
-        warn "Could not determine available space under /tmp, skipping space precheck."
-        return 0
-    }
-
-    size=$(http_content_length "$url" || true)
-    [[ -n "$size" ]] || {
-        warn "Could not determine remote image size, skipping /tmp space precheck."
-        return 0
-    }
-
-    if [[ "$url" == *.xz ]]; then
-        need=$(( size * 7 ))
-    else
-        need=$(( size * 3 ))
-    fi
-
-    if [[ "$avail" -lt "$need" ]]; then
-        error "Insufficient space under /tmp for installation workflow.
-Available: ${avail} bytes
-Estimated required: ${need} bytes
-Remote image size: ${size} bytes"
-    fi
-}
-
-precheck_tmp_space_for_local_image() {
-    local path="$1"
-    local avail size need
-
-    avail=$(get_available_bytes /tmp)
-    [[ -n "$avail" ]] || {
-        warn "Could not determine available space under /tmp, skipping local image /tmp space precheck."
-        return 0
-    }
-
-    size=$(get_file_size_bytes "$path" || true)
-    [[ -n "$size" ]] || {
-        warn "Could not determine local image size for $path, skipping /tmp space precheck."
-        return 0
-    }
-
-    if [[ "$path" == *.xz ]]; then
-        need=$(( size * 7 ))
-    else
-        need=$(( size * 3 ))
-    fi
-
-    if [[ "$avail" -lt "$need" ]]; then
-        error "Insufficient space under /tmp for offline installation workflow.
-Available: ${avail} bytes
-Estimated required: ${need} bytes
-Local image size: ${size} bytes
-Local image path: ${path}"
-    fi
-}
-
-precheck_bootstrap_space_for_download() {
-    local mount_path="$1" url="$2" multiplier="${3:-2}"
-    local avail size need
-
-    avail=$(get_available_bytes "$mount_path")
-    [[ -n "$avail" ]] || {
-        warn "Could not determine available space under $mount_path, skipping bootstrap space precheck."
-        return 0
-    }
-
-    size=$(http_content_length "$url" || true)
-    [[ -n "$size" ]] || {
-        warn "Could not determine remote size for $url, skipping bootstrap space precheck."
-        return 0
-    }
-
-    need=$(( size * multiplier ))
-
-    if [[ "$avail" -lt "$need" ]]; then
-        error "Insufficient space on bootstrap storage.
-Bootstrap path: ${mount_path}
-Available: ${avail} bytes
-Estimated required: ${need} bytes
-Remote file size: ${size} bytes
-URL: ${url}"
-    fi
-}
-
 lsblk_get_kv() {
     local line="$1" key="$2"
     awk -v want="$key" '
@@ -407,8 +247,6 @@ detect_os_arch() {
     esac
 }
 
-# -------- dependencies (auto-install on Red Hat / FreeBSD only) --------
-
 LINUX_FAMILY=""
 
 detect_linux_family() {
@@ -477,17 +315,6 @@ missing_deps_freebsd_host() {
     ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
 }
 
-missing_deps_freebsd_installer() {
-    local missing=()
-
-    command -v qemu-img >/dev/null 2>&1 || missing+=("qemu-img")
-    command -v xz >/dev/null 2>&1 || missing+=("xz")
-    command -v file >/dev/null 2>&1 || missing+=("file")
-    have_any_downloader || missing+=("downloader")
-
-    ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
-}
-
 install_deps_redhat() {
     local pkgs=()
     local item
@@ -533,72 +360,27 @@ install_deps_freebsd_host() {
     ASSUME_ALWAYS_YES=yes pkg install "${pkgs[@]}"
 }
 
-install_deps_freebsd_installer() {
-    local pkgs=()
-    local item
-
-    for item in "$@"; do
-        case "$item" in
-            qemu-img)   pkgs+=("qemu-tools") ;;
-            xz)         pkgs+=("xz") ;;
-            file)       pkgs+=("file") ;;
-            downloader) pkgs+=("curl") ;;
-        esac
-    done
-
-    [[ "${#pkgs[@]}" -gt 0 ]] || return 0
-
-    command -v pkg >/dev/null 2>&1 || error "Auto-install requires pkg on FreeBSD"
-
-    info "Installing missing dependencies with pkg: ${pkgs[*]}"
-    ASSUME_ALWAYS_YES=yes pkg install "${pkgs[@]}"
-}
-
 ensure_dependencies() {
     local missing=()
 
     if [[ "$OS" == "Linux" ]]; then
-        if [[ "$ENV_MODE" == "alpine-ram" ]] || [[ -f /etc/alpine-release ]]; then
-            return 0
-        fi
-
+        [[ -f /etc/alpine-release ]] && return 0
         detect_linux_family
         mapfile -t missing < <(missing_deps_linux_common)
-
-        [[ "${#missing[@]}" -gt 0 ]] || return 0
-
-        case "${LINUX_FAMILY:-}" in
-            redhat)
-                install_deps_redhat "${missing[@]}"
-                ;;
-            *)
-                error "Unsupported Linux family for auto-install. Only Red Hat family Linux is supported.
-Missing dependencies: ${missing[*]}"
-                ;;
-        esac
-
+        ((${#missing[@]})) || return 0
+        [[ "$LINUX_FAMILY" == "redhat" ]] || \
+            error "Unsupported Linux family for dependency auto-install. Missing: ${missing[*]}"
+        install_deps_redhat "${missing[@]}"
         mapfile -t missing < <(missing_deps_linux_common)
-        [[ "${#missing[@]}" -eq 0 ]] || error "Failed to install required Linux dependencies: ${missing[*]}"
+        ((${#missing[@]} == 0)) || error "Failed to install Linux dependencies: ${missing[*]}"
         return 0
     fi
 
-    if [[ "$OS" == "FreeBSD" ]]; then
-        if [[ "$ENV_MODE" == "host" ]]; then
-            mapfile -t missing < <(missing_deps_freebsd_host)
-            [[ "${#missing[@]}" -gt 0 ]] && install_deps_freebsd_host "${missing[@]}"
-            mapfile -t missing < <(missing_deps_freebsd_host)
-            [[ "${#missing[@]}" -eq 0 ]] || error "Failed to install required FreeBSD host dependencies: ${missing[*]}"
-        else
-            mapfile -t missing < <(missing_deps_freebsd_installer)
-            [[ "${#missing[@]}" -gt 0 ]] && install_deps_freebsd_installer "${missing[@]}"
-            mapfile -t missing < <(missing_deps_freebsd_installer)
-            [[ "${#missing[@]}" -eq 0 ]] || error "Failed to install required FreeBSD installer dependencies: ${missing[*]}"
-        fi
-        return 0
-    fi
+    mapfile -t missing < <(missing_deps_freebsd_host)
+    ((${#missing[@]})) && install_deps_freebsd_host "${missing[@]}"
+    mapfile -t missing < <(missing_deps_freebsd_host)
+    ((${#missing[@]} == 0)) || error "Failed to install FreeBSD dependencies: ${missing[*]}"
 }
-
-# -------- disk detection / confirmation --------
 
 AUTO_DETECTED_DISK=""
 AUTO_DETECT_REASON=""
@@ -678,9 +460,6 @@ resolve_target_disk_from_identity() {
     local bootstrap_part="" bootstrap_disk="" bootstrap_size=""
     local strong_match=0
 
-    # The bootstrap filesystem UUID is a better cross-environment identity than
-    # virtio device names/serials.  QEMU/UTM may expose SERIAL/WWN differently
-    # between the host kernel and Alpine, while the existing filesystem UUID is
     # stored on disk and remains stable until the destructive write begins.
     if [[ "$OS" == "Linux" && -n "${PLAN_EFI_UUID:-}" ]] && command -v blkid >/dev/null 2>&1; then
         bootstrap_part=$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)
@@ -716,7 +495,6 @@ resolve_target_disk_from_identity() {
             model=$(lsblk_get_kv "$line" "MODEL")
             [[ "$typ" == "disk" && -n "$path" ]] || continue
 
-            # Saved disk size is always used as an additional guard when known.
             [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
 
             strong_match=0
@@ -731,8 +509,6 @@ resolve_target_disk_from_identity() {
                 continue
             fi
 
-            # Only fall back to size/model when no stable hardware identifier is
-            # available on either side.  Never silently ignore a conflicting ID.
             if [[ -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SERIAL:-}" ]]; then
                 [[ -n "${DISK_ID_SIZE:-}" && "$size" == "$DISK_ID_SIZE" ]] || continue
                 if [[ -n "${DISK_ID_MODEL:-}" ]]; then
@@ -937,15 +713,6 @@ linux_current_efi_disk() {
     linux_source_to_disk "$src"
 }
 
-linux_is_partition_of_disk() {
-    local part="$1" disk="$2" pk
-    [[ -n "$part" && -n "$disk" ]] || return 1
-    [[ -b "$part" && -b "$disk" ]] || return 1
-
-    pk=$(linux_source_to_disk "$part" || true)
-    [[ -n "$pk" && "$pk" == "$disk" ]]
-}
-
 is_mountpoint() {
     local path="$1"
 
@@ -954,8 +721,6 @@ is_mountpoint() {
         return $?
     fi
 
-    # FreeBSD base system has no util-linux mountpoint(1). mount -p prints
-    # fstab-style records: device, mountpoint, fstype, options, dump, pass.
     mount -p 2>/dev/null | awk -v mp="$path" '
         $2 == mp {
             found=1
@@ -987,9 +752,6 @@ freebsd_provider_to_disk() {
     disks=$(sysctl -n kern.disks 2>/dev/null || true)
     [[ -n "$disks" ]] || return 1
 
-    # Fast path for normal FreeBSD partition names such as:
-    #   nda0p4, ada0p3, da0p2, vtbd0p4
-    # and MBR/BSD forms such as da0s1a.
     for d in $disks; do
         case "$provider" in
             "$d"|"$d"p[0-9]*|"$d"s[0-9]*)
@@ -999,8 +761,6 @@ freebsd_provider_to_disk() {
         esac
     done
 
-    # Labels such as /dev/gpt/rootfs, /dev/ufs/rootfs and similar providers
-    # appear below their backing PART/DISK provider in GEOM's hierarchy.
     if command -v geom >/dev/null 2>&1; then
         resolved=$(
             geom -t 2>/dev/null | awk -v target="$provider" '
@@ -1261,8 +1021,7 @@ show_partition_info() {
     echo "-------------------------------------------------------"
 }
 
-# Explicit post-install hook only.
-run_rhel_freebsd_hook() {
+run_post_install_hook() {
     if [[ -z "${POST_INSTALL_HOOK:-}" ]]; then
         return 0
     fi
@@ -1468,67 +1227,6 @@ get_default_image_url() {
     esac
 }
 
-find_efi_partition() {
-    local disk="$1"
-
-    if [[ "$OS" == "Linux" ]]; then
-        if command -v findmnt >/dev/null 2>&1; then
-            local mounted_efi_src mounted_efi_disk
-            mounted_efi_src=$(findmnt -n -o SOURCE --target /boot/efi 2>/dev/null | head -n1 || true)
-            if [[ -n "$mounted_efi_src" ]]; then
-                mounted_efi_disk=$(linux_source_to_disk "$mounted_efi_src" || true)
-                if [[ -n "$mounted_efi_disk" && "$mounted_efi_disk" == "$disk" ]]; then
-                    echo "$mounted_efi_src"
-                    return 0
-                fi
-            fi
-        fi
-
-        if command -v lsblk >/dev/null 2>&1; then
-            local line part path pkname parttype fstype partlabel partflags
-            while read -r line; do
-                path=$(lsblk_get_kv "$line" "PATH")
-                pkname=$(lsblk_get_kv "$line" "PKNAME")
-                parttype=$(lsblk_get_kv "$line" "PARTTYPE")
-                fstype=$(lsblk_get_kv "$line" "FSTYPE")
-                partlabel=$(lsblk_get_kv "$line" "PARTLABEL")
-                partflags=$(lsblk_get_kv "$line" "PARTFLAGS")
-
-                [[ -n "$path" && -n "$pkname" ]] || continue
-                [[ "/dev/$pkname" == "$disk" ]] || continue
-
-                if [[ "$parttype" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]]; then
-                    echo "$path"
-                    return 0
-                fi
-                if echo "${partlabel:-}" | grep -qiE 'efi|esp'; then
-                    echo "$path"
-                    return 0
-                fi
-                if [[ "$fstype" == "vfat" ]] && echo "${partflags:-}" | grep -qi 'boot,esp'; then
-                    echo "$path"
-                    return 0
-                fi
-            done < <(lsblk -P -o PATH,PKNAME,PARTTYPE,FSTYPE,PARTLABEL,PARTFLAGS "$disk" 2>/dev/null || true)
-        fi
-
-        warn "Could not confidently identify EFI partition on $disk from lsblk metadata."
-        return 1
-    else
-        if command -v gpart >/dev/null 2>&1; then
-            local d p
-            d="${disk#/dev/}"
-            p=$(gpart show -p "$d" 2>/dev/null | awk '$4 == "efi" {print $3; exit}')
-            if [[ -n "$p" ]]; then
-                echo "/dev/$p"
-                return 0
-            fi
-        fi
-        warn "Could not confidently identify EFI partition on $disk from gpart metadata."
-        return 1
-    fi
-}
-
 write_nocloud_seed() {
     local os="$1" meta_path="$2" user_path="$3"
     local frpc_b64=""
@@ -1537,7 +1235,7 @@ write_nocloud_seed() {
 
     cat >"$meta_path" <<EOF
 instance-id: iid-$(date +%s)
-local-hostname: $os
+local-hostname: localhost
 EOF
 
     if [[ -n "${FRPC_PRESENT:-}" && -n "${FRPC_TOML:-}" && -f "$FRPC_TOML" ]]; then
@@ -1548,10 +1246,6 @@ EOF
         echo "#cloud-config"
 
         if [[ "$os" == "freebsd" ]]; then
-            # FreeBSD BASIC-CLOUDINIT images use nuageinit rather than Python
-            # cloud-init. Existing root password changes belong under chpasswd;
-            # SSH authorized keys for root are supplied with the top-level
-            # ssh_authorized_keys key.
             echo "disable_root: false"
 
             if [[ -n "$PASSWORD_HASH" ]]; then
@@ -1577,9 +1271,10 @@ EOF
                 echo "      password: \"${PASSWORD_HASH}\""
             fi
         else
-            # Linux cloud images use Python cloud-init. root already exists in
-            # those images, so hashed_passwd is used rather than creation-only
-            # passwd.
+            echo "preserve_hostname: false"
+            echo "hostname: localhost"
+            echo "prefer_fqdn_over_hostname: false"
+
             if [[ -n "$PASSWORD_HASH" || -n "$SSH_KEYS_ALL" ]]; then
                 if [[ -n "$PASSWORD_HASH" ]]; then
                     echo "ssh_pwauth: true"
@@ -1632,9 +1327,6 @@ EOF
 EOF
         fi
 
-        # FreeBSD nuageinit and Linux cloud-init both support runcmd. Keep the
-        # existing service-adjustment behavior, but make root SSH policy explicit
-        # on FreeBSD so key-only and password-enabled setups behave predictably.
         if [[ -n "$SSH_PORT" || -n "$frpc_b64" || "$os" == "freebsd" ]]; then
             echo
             echo "runcmd:"
@@ -1702,24 +1394,14 @@ EOF
     } >"$user_path"
 }
 
+# ----------------- bootstrap state -----------------
 
-# ----------------- environment + plan handling -----------------
-
-ENV_MODE="host"
 EFI_MOUNT_POINT="/boot/efi"
 PLAN_DIR_REL="REINSTALL"
-PLAN_FILE_NAME="plan.env"
 PLAN_EFI_PART=""
 PLAN_EFI_UUID=""
-PLAN_EFI_FS_TYPE=""
-PLAN_EFI_MOUNTED_BY_SCRIPT=0
 PLAN_STORAGE_MODE="efi"
-PLAN_PATH_PREFIX_REL=""
-PLAN_EFI_PART_DISK=""
-PLAN_EFI_PART_NUM=""
-POST_INSTALL_HOOK=""
 
-# Alpine RAM preparation
 ALPINE_ENTRY_TITLE="Reinstall Alpine RAM"
 ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/v3.22"
 ALPINE_NETBOOT_SUBDIR="netboot-3.22.6"
@@ -1728,77 +1410,25 @@ ALPINE_BOOT_DIR_REL=""
 ALPINE_BOOT_DIR_ABS=""
 ALPINE_VMLINUZ_REL=""
 ALPINE_INITRAMFS_REL=""
-ALPINE_MODLOOP_REL=""
 ALPINE_MODLOOP_URL=""
-ALPINE_APKOVL_REL=""
+ALPINE_APKOVL_REL="/reinstall.apkovl.tar.gz"
 ALPINE_VMLINUZ_ABS=""
 ALPINE_INITRAMFS_ABS=""
-ALPINE_MODLOOP_ABS=""
 ALPINE_APKOVL_ABS=""
-ALPINE_SCRIPT_COPY_ABS=""
 ALPINE_FREEBSD_GRUB_EFI_REL=""
 ALPINE_FREEBSD_GRUB_EFI_ABS=""
 ALPINE_FREEBSD_GRUB_CFG_REL=""
 ALPINE_FREEBSD_GRUB_CFG_ABS=""
 ALPINE_NETBOOT_ARCH=""
-ALPINE_KERNEL_FLAVOR=""
+ALPINE_KERNEL_FLAVOR="virt"
+
 GRUB_SCRIPT_PATH=""
 GRUB_CFG_PATH=""
 GRUB_MKCONFIG_CMD=""
 GRUB_REBOOT_CMD=""
-GRUB_DEFAULT_CMD=""
-GRUB_EFI_TARGET=""
 CURRENT_CONSOLE_ARGS=""
 AUTO_YES=0
 PASSWORD_TO_DISPLAY=""
-
-# Offline bundle paths
-BOOTSTRAP_CACHE_DIR_REL=""
-BOOTSTRAP_CACHE_DIR_ABS=""
-BOOTSTRAP_APKREPO_DIR_REL=""
-BOOTSTRAP_APKREPO_DIR_ABS=""
-BOOTSTRAP_APKREPO_MAIN_REL=""
-BOOTSTRAP_APKREPO_MAIN_ABS=""
-BOOTSTRAP_APKREPO_COMMUNITY_REL=""
-BOOTSTRAP_APKREPO_COMMUNITY_ABS=""
-BOOTSTRAP_IMG_REL=""
-BOOTSTRAP_IMG_ABS=""
-BOOTSTRAP_IMG_NAME=""
-BOOTSTRAP_INPUT_DIR_REL=""
-BOOTSTRAP_INPUT_DIR_ABS=""
-FRPC_BOOTSTRAP_REL=""
-POST_INSTALL_HOOK_BOOTSTRAP_REL=""
-
-ALPINE_RUNTIME_PKGS=(
-    bash curl wget ca-certificates xz qemu-img util-linux coreutils grep sed gawk findutils file tar
-    e2fsprogs e2fsprogs-extra dosfstools sgdisk kmod lvm2 xfsprogs xfsprogs-extra
-)
-
-detect_env_mode() {
-    local os
-    os=$(uname -s)
-    case "$os" in
-        FreeBSD)
-            if [[ -f /etc/mfsbsd.conf ]] || grep -qi 'mfsbsd' /etc/motd 2>/dev/null; then
-                ENV_MODE="mfsbsd"
-            else
-                ENV_MODE="host"
-            fi
-            ;;
-        Linux)
-            if grep -qw 'reinstall_alpine=1' /proc/cmdline 2>/dev/null; then
-                ENV_MODE="alpine-ram"
-            elif grep -qw 'rd.reinstall=1' /proc/cmdline 2>/dev/null || { [[ -d /run/initramfs ]] && [[ ! -f /etc/os-release ]]; }; then
-                ENV_MODE="initramfs"
-            else
-                ENV_MODE="host"
-            fi
-            ;;
-        *)
-            ENV_MODE="host"
-            ;;
-    esac
-}
 
 find_efi_for_plan() {
     local os
@@ -1841,8 +1471,6 @@ find_efi_for_plan() {
         if command -v sysctl >/dev/null 2>&1 && command -v gpart >/dev/null 2>&1; then
             local d p preferred=""
 
-            # Bootstrap must be written to the ESP on the same physical disk that
-            # will be reinstalled. Prefer the already selected target disk.
             if [[ -n "${DISK:-}" ]]; then
                 preferred="${DISK#/dev/}"
                 p=$(gpart show -p "$preferred" 2>/dev/null | awk '$4 == "efi" {print $3; exit}')
@@ -1852,7 +1480,6 @@ find_efi_for_plan() {
                 fi
             fi
 
-            # Fallback only when no target-disk ESP was found.
             for d in $(sysctl -n kern.disks 2>/dev/null || true); do
                 [[ -n "$preferred" && "$d" == "$preferred" ]] && continue
                 p=$(gpart show -p "$d" 2>/dev/null | awk '$4 == "efi" {print $3; exit}')
@@ -1873,20 +1500,10 @@ get_fs_uuid_linux() {
     fi
 }
 
-get_fs_type_linux() {
-    local dev="$1"
-    if command -v blkid >/dev/null 2>&1; then
-        blkid -s TYPE -o value "$dev" 2>/dev/null || true
-    fi
-}
-
 get_fs_uuid_freebsd() {
     local dev="$1"
     local desc="" serial=""
 
-    # FreeBSD fstyp(8) has no filesystem-UUID output mode.  For FAT/MS-DOS
-    # filesystems, file(1) reports the 32-bit volume serial number, which is
-    # the same identifier Linux blkid/GRUB expose as XXXX-XXXX.
     command -v file >/dev/null 2>&1 || return 0
     desc=$(file -s "$dev" 2>/dev/null || true)
 
@@ -1904,159 +1521,66 @@ get_fs_uuid_freebsd() {
     printf '%s-%s\n' "${serial:0:4}" "${serial:4:4}"
 }
 
-get_fs_type_freebsd() {
-    local dev="$1"
-    if command -v fstyp >/dev/null 2>&1; then
-        fstyp "$dev" 2>/dev/null || true
-    fi
-}
-
-split_freebsd_part_device() {
-    local part="$1"
-    local dev="${part#/dev/}"
-
-    case "$dev" in
-        *p[0-9]*)
-            PLAN_EFI_PART_DISK="/dev/${dev%%p[0-9]*}"
-            PLAN_EFI_PART_NUM="${dev##*p}"
-            ;;
-        *)
-            error "Unable to parse FreeBSD EFI partition device: $part"
-            ;;
-    esac
-
-    [[ -n "$PLAN_EFI_PART_DISK" && -n "$PLAN_EFI_PART_NUM" ]] || \
-        error "Failed to derive FreeBSD EFI disk/partition from: $part"
-}
-
 mount_efi_for_plan() {
     if [[ "$OS" == "Linux" ]]; then
-        # Prefer real EFI/ESP if available.
-        if [[ -d "/boot/efi" ]] && is_mountpoint "/boot/efi"; then
+        if [[ -d /boot/efi ]] && is_mountpoint /boot/efi; then
             EFI_MOUNT_POINT="/boot/efi"
             PLAN_STORAGE_MODE="efi"
-            PLAN_PATH_PREFIX_REL=""
-            PLAN_EFI_MOUNTED_BY_SCRIPT=0
-            if [[ -z "$PLAN_EFI_PART" ]]; then
-                PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "$EFI_MOUNT_POINT" 2>/dev/null || true)
-            fi
-            if [[ -n "$PLAN_EFI_PART" ]]; then
-                PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
-                PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
-            fi
-            return 0
-        fi
-
-        local efi_part=""
-        efi_part=$(find_efi_for_plan 2>/dev/null || true)
-        if [[ -n "$efi_part" ]]; then
-            EFI_MOUNT_POINT="/boot/efi"
-            mkdir -p "$EFI_MOUNT_POINT"
-            if ! mount "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
-                if ! mount -t vfat "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
-                   ! mount -t msdos "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null && \
-                   ! mount -t msdosfs "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null; then
-                    error "Failed to mount EFI partition $efi_part on $EFI_MOUNT_POINT"
-                fi
-            fi
-            PLAN_STORAGE_MODE="efi"
-            PLAN_PATH_PREFIX_REL=""
-            PLAN_EFI_PART="$efi_part"
-            PLAN_EFI_MOUNTED_BY_SCRIPT=1
-            PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
-            PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
-            return 0
-        fi
-
-        # Linux fallback: no EFI found, use /boot instead.
-        if [[ -d "/boot" ]]; then
-            EFI_MOUNT_POINT="/boot"
-            PLAN_STORAGE_MODE="boot"
-            PLAN_PATH_PREFIX_REL=""
-            PLAN_EFI_MOUNTED_BY_SCRIPT=0
-
-            if [[ -z "$PLAN_EFI_PART" ]]; then
-                if is_mountpoint "/boot"; then
-                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/boot" 2>/dev/null || true)
+            PLAN_EFI_PART=$(findmnt -n -o SOURCE --target /boot/efi 2>/dev/null | head -n1 || true)
+        else
+            local efi_part
+            efi_part=$(find_efi_for_plan 2>/dev/null || true)
+            if [[ -n "$efi_part" ]]; then
+                EFI_MOUNT_POINT="/boot/efi"
+                mkdir -p "$EFI_MOUNT_POINT"
+                mount "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null || \
+                    mount -t vfat "$efi_part" "$EFI_MOUNT_POINT" 2>/dev/null || \
+                    error "Failed to mount EFI partition $efi_part"
+                PLAN_STORAGE_MODE="efi"
+                PLAN_EFI_PART="$efi_part"
+            else
+                [[ -d /boot ]] || error "No EFI partition and no /boot fallback"
+                EFI_MOUNT_POINT="/boot"
+                PLAN_STORAGE_MODE="boot"
+                if is_mountpoint /boot; then
+                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --target /boot 2>/dev/null | head -n1 || true)
                 else
-                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --target "/" 2>/dev/null || true)
+                    PLAN_EFI_PART=$(findmnt -n -o SOURCE --target / 2>/dev/null | head -n1 || true)
                 fi
             fi
-
-            if [[ -n "$PLAN_EFI_PART" ]]; then
-                PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
-                PLAN_EFI_FS_TYPE=$(get_fs_type_linux "$PLAN_EFI_PART")
-            fi
-            return 0
         fi
-
-        error "Could not find EFI partition for plan storage, and /boot fallback is unavailable"
-    fi
-
-    if [[ -d "$EFI_MOUNT_POINT" ]] && is_mountpoint "$EFI_MOUNT_POINT"; then
-        local mounted_efi_src="" physical_efi_part=""
-
-        PLAN_STORAGE_MODE="efi"
-        PLAN_PATH_PREFIX_REL=""
-        PLAN_EFI_MOUNTED_BY_SCRIPT=0
-
-        mounted_efi_src=$(freebsd_mount_source_for "$EFI_MOUNT_POINT" || true)
-        physical_efi_part=$(find_efi_for_plan 2>/dev/null || true)
-
-        if [[ -n "$physical_efi_part" ]]; then
-            PLAN_EFI_PART="$physical_efi_part"
-        elif [[ -n "$mounted_efi_src" ]]; then
-            PLAN_EFI_PART="$mounted_efi_src"
-        fi
-
-        [[ -n "$PLAN_EFI_PART" ]] || \
-            error "EFI is mounted at $EFI_MOUNT_POINT but its backing partition could not be identified"
-
-        PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
-        PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
-
-        case "${PLAN_EFI_PART#/dev/}" in
-            *p[0-9]*)
-                split_freebsd_part_device "$PLAN_EFI_PART"
-                ;;
-            *)
-                error "EFI is mounted from ${mounted_efi_src:-unknown}, but the physical EFI partition could not be resolved"
-                ;;
-        esac
-
-        info "Using already-mounted FreeBSD EFI partition: ${mounted_efi_src:-$PLAN_EFI_PART} on $EFI_MOUNT_POINT"
-        info "Physical EFI partition for BootNext: $PLAN_EFI_PART"
+        [[ -n "$PLAN_EFI_PART" ]] && PLAN_EFI_UUID=$(get_fs_uuid_linux "$PLAN_EFI_PART")
         return 0
     fi
 
-    mkdir -p "$EFI_MOUNT_POINT"
-    local efi_part
-    efi_part=$(find_efi_for_plan 2>/dev/null || true)
-    [[ -n "$efi_part" ]] || error "Could not find EFI partition for plan storage"
-
-    if command -v mount_msdosfs >/dev/null 2>&1; then
-        if ! mount_msdosfs "$efi_part" "$EFI_MOUNT_POINT"; then
-            error "Failed to mount FreeBSD EFI partition $efi_part on $EFI_MOUNT_POINT with mount_msdosfs"
-        fi
-    elif ! mount -t msdosfs "$efi_part" "$EFI_MOUNT_POINT"; then
-        error "Failed to mount FreeBSD EFI partition $efi_part on $EFI_MOUNT_POINT"
+    local mounted_src="" efi_part=""
+    if [[ -d "$EFI_MOUNT_POINT" ]] && is_mountpoint "$EFI_MOUNT_POINT"; then
+        mounted_src=$(freebsd_mount_source_for "$EFI_MOUNT_POINT" || true)
+        efi_part=$(find_efi_for_plan 2>/dev/null || true)
+        PLAN_EFI_PART="${efi_part:-$mounted_src}"
+        [[ "$PLAN_EFI_PART" == /dev/*p[0-9]* ]] || error "Could not resolve the physical FreeBSD EFI partition"
+        PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
+        PLAN_STORAGE_MODE="efi"
+        info "Using FreeBSD EFI: ${mounted_src:-$PLAN_EFI_PART} -> $PLAN_EFI_PART"
+        return 0
     fi
 
+    efi_part=$(find_efi_for_plan 2>/dev/null || true)
+    [[ -n "$efi_part" ]] || error "Could not find FreeBSD EFI partition"
+    mkdir -p "$EFI_MOUNT_POINT"
+    if command -v mount_msdosfs >/dev/null 2>&1; then
+        mount_msdosfs "$efi_part" "$EFI_MOUNT_POINT" || error "Failed to mount $efi_part"
+    else
+        mount -t msdosfs "$efi_part" "$EFI_MOUNT_POINT" || error "Failed to mount $efi_part"
+    fi
     PLAN_STORAGE_MODE="efi"
-    PLAN_PATH_PREFIX_REL=""
     PLAN_EFI_PART="$efi_part"
-    PLAN_EFI_MOUNTED_BY_SCRIPT=1
     PLAN_EFI_UUID=$(get_fs_uuid_freebsd "$PLAN_EFI_PART")
-    PLAN_EFI_FS_TYPE=$(get_fs_type_freebsd "$PLAN_EFI_PART")
-    split_freebsd_part_device "$PLAN_EFI_PART"
 }
 
-save_plan_to_efi() {
-    mount_efi_for_plan
-    local plan_dir="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL"
-    local plan_file="$plan_dir/$PLAN_FILE_NAME"
-    mkdir -p "$plan_dir"
-
+write_install_plan() {
+    local path="$1"
+    mkdir -p "$(dirname "$path")"
     {
         printf 'TARGET_OS=%q\n' "$TARGET_OS"
         printf 'TARGET_VER=%q\n' "$TARGET_VER"
@@ -2072,276 +1596,26 @@ save_plan_to_efi() {
         printf 'WEB_PORT=%q\n' "$WEB_PORT"
         printf 'FRPC_TOML=%q\n' "$FRPC_TOML"
         printf 'POST_INSTALL_HOOK=%q\n' "$POST_INSTALL_HOOK"
-        printf 'FRPC_BOOTSTRAP_REL=%q\n' "${FRPC_BOOTSTRAP_REL:-}"
-        printf 'POST_INSTALL_HOOK_BOOTSTRAP_REL=%q\n' "${POST_INSTALL_HOOK_BOOTSTRAP_REL:-}"
         printf 'AUTO_PASSWORD=%q\n' "$AUTO_PASSWORD"
         printf 'HOLD=%q\n' "$HOLD"
-        printf 'PLAN_EFI_PART=%q\n' "$PLAN_EFI_PART"
         printf 'PLAN_EFI_UUID=%q\n' "$PLAN_EFI_UUID"
-        printf 'PLAN_EFI_FS_TYPE=%q\n' "$PLAN_EFI_FS_TYPE"
-        printf 'PLAN_STORAGE_MODE=%q\n' "$PLAN_STORAGE_MODE"
-        printf 'PLAN_PATH_PREFIX_REL=%q\n' "$PLAN_PATH_PREFIX_REL"
-        printf 'PLAN_EFI_PART_DISK=%q\n' "${PLAN_EFI_PART_DISK:-}"
-        printf 'PLAN_EFI_PART_NUM=%q\n' "${PLAN_EFI_PART_NUM:-}"
-        printf 'PLAN_DIR_REL=%q\n' "$PLAN_DIR_REL"
-        printf 'PLAN_FILE_NAME=%q\n' "$PLAN_FILE_NAME"
-        printf 'SCRIPT_NAME=%q\n' "$SCRIPT_NAME"
-    } >"$plan_file"
-
-    chmod 0600 "$plan_file" 2>/dev/null || true
-    sync
-    info "Saved reinstall plan to $plan_file"
+    } >"$path"
+    chmod 0600 "$path" 2>/dev/null || true
 }
 
-linux_bootstrap_scan_devices() {
-    local dev
-    for dev in \
-        /dev/sd[a-z][0-9]* \
-        /dev/vd[a-z][0-9]* \
-        /dev/xvd[a-z][0-9]* \
-        /dev/nvme*n*p[0-9]* \
-        /dev/mmcblk*p[0-9]*; do
-        [[ -e "$dev" ]] || continue
-        printf '%s\n' "$dev"
-    done
-}
-
-try_mount_linux_bootstrap_candidate() {
-    local candidate="$1" mountpoint_path="$2" mode="${3:-auto}"
-
-    info "Trying bootstrap candidate: $candidate"
-
-    if [[ "$mode" == "efi" ]]; then
-        mount "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t vfat "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t msdos "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t msdosfs "$candidate" "$mountpoint_path" 2>/dev/null || true
-    elif [[ "$mode" == "boot" ]]; then
-        mount "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t ext4 "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t xfs "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t btrfs "$candidate" "$mountpoint_path" 2>/dev/null || true
-    else
-        mount "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t ext4 "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t xfs "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t btrfs "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t vfat "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t msdos "$candidate" "$mountpoint_path" 2>/dev/null || \
-        mount -t msdosfs "$candidate" "$mountpoint_path" 2>/dev/null || true
-    fi
-
-    if ! is_mountpoint "$mountpoint_path"; then
-        warn "Mount failed for candidate: $candidate"
-        return 1
-    fi
-
-    return 0
-}
-
-load_plan_from_efi() {
-    local boot_mnt="/media/bootstrap"
-    local plan_file=""
-    local candidate=""
-    local vars_loaded=0
-    local current_efi_src="" current_boot_src=""
-
-    # Alpine RAM receives a self-contained copy of the install plan via apkovl.
-    # Prefer it so the installer does not depend on remounting the boot ESP.
-    if [[ "$OS" == "Linux" && -f /etc/reinstall/plan.env ]]; then
-        # shellcheck disable=SC1091
-        . /etc/reinstall/plan.env
-        PASSWORD="${PASSWORD:-}"
-        PASSWORD_HASH="${PASSWORD_HASH:-}"
-
-        if [[ -f /etc/reinstall/frpc.toml ]]; then
-            FRPC_TOML="/etc/reinstall/frpc.toml"
-            FRPC_BOOTSTRAP_REL=""
-        fi
-        if [[ -f /etc/reinstall/post-install-hook.sh ]]; then
-            POST_INSTALL_HOOK="/etc/reinstall/post-install-hook.sh"
-            POST_INSTALL_HOOK_BOOTSTRAP_REL=""
-        fi
-
-        info "Loaded reinstall plan from embedded Alpine apkovl: /etc/reinstall/plan.env"
-        return 0
-    fi
-
-    if [[ -f /etc/reinstall/vars ]]; then
-        # shellcheck disable=SC1091
-        . /etc/reinstall/vars
-        vars_loaded=1
-    fi
-
-    if [[ "$OS" == "Linux" ]]; then
-        mkdir -p "$boot_mnt"
-
-        # 1) 优先按 /etc/reinstall/vars 提供的信息尝试挂载
-        if [[ "$vars_loaded" -eq 1 ]] && ! is_mountpoint "$boot_mnt"; then
-            if [[ -n "${PLAN_EFI_PART:-}" && -e "${PLAN_EFI_PART}" ]]; then
-                info "Trying bootstrap mount from PLAN_EFI_PART: ${PLAN_EFI_PART}"
-                if [[ "${PLAN_STORAGE_MODE:-efi}" == "efi" ]]; then
-                    try_mount_linux_bootstrap_candidate "${PLAN_EFI_PART}" "$boot_mnt" "efi" || true
-                else
-                    try_mount_linux_bootstrap_candidate "${PLAN_EFI_PART}" "$boot_mnt" "boot" || true
-                fi
-            fi
-            if ! is_mountpoint "$boot_mnt" && [[ -n "${PLAN_EFI_UUID:-}" ]]; then
-                candidate="$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)"
-                if [[ -n "$candidate" && -e "$candidate" ]]; then
-                    info "Trying bootstrap mount from PLAN_EFI_UUID: ${PLAN_EFI_UUID} -> ${candidate}"
-                    if [[ "${PLAN_STORAGE_MODE:-efi}" == "efi" ]]; then
-                        try_mount_linux_bootstrap_candidate "$candidate" "$boot_mnt" "efi" || true
-                    else
-                        try_mount_linux_bootstrap_candidate "$candidate" "$boot_mnt" "boot" || true
-                    fi
-                fi
-            fi
-        fi
-
-        # 2) 当前系统已挂载的 EFI/boot 优先
-        if ! is_mountpoint "$boot_mnt"; then
-            current_efi_src=$(findmnt -n -o SOURCE --target /boot/efi 2>/dev/null | head -n1 || true)
-            if [[ -n "$current_efi_src" && -e "$current_efi_src" ]]; then
-                info "Trying currently mounted EFI source: $current_efi_src"
-                try_mount_linux_bootstrap_candidate "$current_efi_src" "$boot_mnt" "efi" || true
-            fi
-        fi
-
-        if ! is_mountpoint "$boot_mnt"; then
-            current_boot_src=$(findmnt -n -o SOURCE --target /boot 2>/dev/null | head -n1 || true)
-            if [[ -n "$current_boot_src" && -e "$current_boot_src" ]]; then
-                info "Trying currently mounted /boot source: $current_boot_src"
-                try_mount_linux_bootstrap_candidate "$current_boot_src" "$boot_mnt" "boot" || true
-            fi
-        fi
-
-        if ! is_mountpoint "$boot_mnt"; then
-            current_boot_src=$(findmnt -n -o SOURCE --target / 2>/dev/null | head -n1 || true)
-            if [[ -n "$current_boot_src" && -e "$current_boot_src" ]]; then
-                info "Trying current root source as /boot fallback: $current_boot_src"
-                try_mount_linux_bootstrap_candidate "$current_boot_src" "$boot_mnt" "boot" || true
-            fi
-        fi
-
-        # 3) 如果已挂载，先找 plan
-        if [[ -d "$boot_mnt" ]] && is_mountpoint "$boot_mnt"; then
-            if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                PLAN_STORAGE_MODE="boot"
-                PLAN_PATH_PREFIX_REL=""
-                plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-                EFI_MOUNT_POINT="$boot_mnt"
-            elif [[ -f "$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                PLAN_STORAGE_MODE="boot"
-                PLAN_PATH_PREFIX_REL="/boot"
-                plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-                EFI_MOUNT_POINT="$boot_mnt"
-            elif [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-            fi
-        fi
-
-        # 4) 最后才做白名单块设备扫描
-        if [[ -z "$plan_file" ]] && ! is_mountpoint "$boot_mnt"; then
-            info "Bootstrap plan not found via explicit hints or current mounts; falling back to conservative device scan."
-            while read -r candidate; do
-                try_mount_linux_bootstrap_candidate "$candidate" "$boot_mnt" "auto" || continue
-
-                if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                    PLAN_STORAGE_MODE="boot"
-                    PLAN_PATH_PREFIX_REL=""
-                    plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-                    EFI_MOUNT_POINT="$boot_mnt"
-                    PLAN_EFI_PART="$candidate"
-                    break
-                elif [[ -f "$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                    PLAN_STORAGE_MODE="boot"
-                    PLAN_PATH_PREFIX_REL="/boot"
-                    plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-                    EFI_MOUNT_POINT="$boot_mnt"
-                    PLAN_EFI_PART="$candidate"
-                    break
-                fi
-                umount "$boot_mnt" 2>/dev/null || true
-            done < <(linux_bootstrap_scan_devices)
-        fi
-
-        if [[ -z "$plan_file" && -d "$boot_mnt" ]] && is_mountpoint "$boot_mnt"; then
-            if [[ -f "$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                PLAN_STORAGE_MODE="boot"
-                PLAN_PATH_PREFIX_REL=""
-                plan_file="$boot_mnt/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-                EFI_MOUNT_POINT="$boot_mnt"
-            elif [[ -f "$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME" ]]; then
-                PLAN_STORAGE_MODE="boot"
-                PLAN_PATH_PREFIX_REL="/boot"
-                plan_file="$boot_mnt/boot/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-                EFI_MOUNT_POINT="$boot_mnt"
-            fi
-        fi
-
-        [[ -n "$plan_file" && -f "$plan_file" ]] || error "Plan file not found on Linux bootstrap storage"
-
-        # shellcheck disable=SC1090
-        . "$plan_file"
-        PASSWORD="${PASSWORD:-}"
-        PASSWORD_HASH="${PASSWORD_HASH:-}"
-        info "Loaded reinstall plan from $plan_file"
-        return 0
-    fi
-
-    mount_efi_for_plan
-    plan_file="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-    [[ -f "$plan_file" ]] || error "Plan file not found on bootstrap storage: $plan_file"
+load_install_plan() {
+    local plan="/etc/reinstall/plan.env"
+    [[ -f "$plan" ]] || error "Embedded install plan not found: $plan"
     # shellcheck disable=SC1090
-    . "$plan_file"
-    PASSWORD="${PASSWORD:-}"
+    . "$plan"
+    PASSWORD=""
     PASSWORD_HASH="${PASSWORD_HASH:-}"
-    info "Loaded reinstall plan from $plan_file"
+    [[ ! -f /etc/reinstall/frpc.toml ]] || FRPC_TOML="/etc/reinstall/frpc.toml"
+    [[ ! -f /etc/reinstall/post-install-hook.sh ]] || POST_INSTALL_HOOK="/etc/reinstall/post-install-hook.sh"
+    info "Loaded embedded install plan"
 }
 
 # ----------------- Alpine RAM / boot bootstrap -----------------
-
-normalize_dep_token() {
-    local tok="$1"
-
-    tok="${tok%%[*}"
-    tok="${tok%%~*}"
-    tok="${tok%%<*}"
-    tok="${tok%%>*}"
-    tok="${tok%%=*}"
-
-    if [[ "$tok" == \!* ]]; then
-        echo ""
-        return 0
-    fi
-
-    printf '%s\n' "$tok"
-}
-
-setup_bootstrap_bundle_paths() {
-    local root_abs="$1"
-
-    BOOTSTRAP_CACHE_DIR_REL="/$PLAN_DIR_REL/cache"
-    BOOTSTRAP_APKREPO_DIR_REL="/$PLAN_DIR_REL/apkrepo"
-    BOOTSTRAP_APKREPO_MAIN_REL="$BOOTSTRAP_APKREPO_DIR_REL/main"
-    BOOTSTRAP_APKREPO_COMMUNITY_REL="$BOOTSTRAP_APKREPO_DIR_REL/community"
-    BOOTSTRAP_INPUT_DIR_REL="/$PLAN_DIR_REL/input"
-
-    if [[ "${IMG_URL:-}" == *.xz ]]; then
-        BOOTSTRAP_IMG_NAME="image.qcow2.xz"
-    else
-        BOOTSTRAP_IMG_NAME="image.qcow2"
-    fi
-    BOOTSTRAP_IMG_REL="$BOOTSTRAP_CACHE_DIR_REL/$BOOTSTRAP_IMG_NAME"
-
-    BOOTSTRAP_CACHE_DIR_ABS="$root_abs$BOOTSTRAP_CACHE_DIR_REL"
-    BOOTSTRAP_APKREPO_DIR_ABS="$root_abs$BOOTSTRAP_APKREPO_DIR_REL"
-    BOOTSTRAP_APKREPO_MAIN_ABS="$root_abs$BOOTSTRAP_APKREPO_MAIN_REL"
-    BOOTSTRAP_APKREPO_COMMUNITY_ABS="$root_abs$BOOTSTRAP_APKREPO_COMMUNITY_REL"
-    BOOTSTRAP_IMG_ABS="$root_abs$BOOTSTRAP_IMG_REL"
-    BOOTSTRAP_INPUT_DIR_ABS="$root_abs$BOOTSTRAP_INPUT_DIR_REL"
-}
 
 detect_current_console_args() {
     CURRENT_CONSOLE_ARGS=""
@@ -2362,14 +1636,14 @@ detect_current_console_args() {
 }
 
 ensure_grub_tools() {
-    [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host in this function"
+    [[ "$OS" == "Linux" ]] || error "GRUB bootstrap requires Linux host"
 
     if command -v grub2-mkconfig >/dev/null 2>&1; then
         GRUB_MKCONFIG_CMD="grub2-mkconfig"
     elif command -v grub-mkconfig >/dev/null 2>&1; then
         GRUB_MKCONFIG_CMD="grub-mkconfig"
     else
-        error "Could not find grub2-mkconfig or grub-mkconfig"
+        error "grub-mkconfig not found"
     fi
 
     if command -v grub2-reboot >/dev/null 2>&1; then
@@ -2377,29 +1651,18 @@ ensure_grub_tools() {
     elif command -v grub-reboot >/dev/null 2>&1; then
         GRUB_REBOOT_CMD="grub-reboot"
     else
-        error "Could not find grub2-reboot or grub-reboot"
+        error "grub-reboot not found"
     fi
 
-    if command -v grub2-set-default >/dev/null 2>&1; then
-        GRUB_DEFAULT_CMD="grub2-set-default"
-    elif command -v grub-set-default >/dev/null 2>&1; then
-        GRUB_DEFAULT_CMD="grub-set-default"
-    else
-        GRUB_DEFAULT_CMD=""
-    fi
-
-    if [[ -d /etc/grub.d ]]; then
-        GRUB_SCRIPT_PATH="/etc/grub.d/09_reinstall_alpine"
-    else
-        error "/etc/grub.d not found; unsupported GRUB layout"
-    fi
+    [[ -d /etc/grub.d ]] || error "/etc/grub.d not found"
+    GRUB_SCRIPT_PATH="/etc/grub.d/09_reinstall_alpine"
 
     if [[ -f /boot/grub2/grub.cfg ]]; then
         GRUB_CFG_PATH="/boot/grub2/grub.cfg"
     elif [[ -f /boot/grub/grub.cfg ]]; then
         GRUB_CFG_PATH="/boot/grub/grub.cfg"
     else
-        error "Could not find GRUB config file under /boot/grub2/grub.cfg or /boot/grub/grub.cfg"
+        error "GRUB config not found"
     fi
 }
 
@@ -2422,69 +1685,31 @@ prepare_alpine_paths() {
 
     case "$MACHINE_ARCH" in
         x86_64)
-            GRUB_EFI_TARGET="x86_64-efi"
             ALPINE_NETBOOT_ARCH="x86_64"
             ALPINE_FREEBSD_GRUB_EFI_REL="/$PLAN_DIR_REL/$ALPINE_BOOT_SUBDIR/reinstall-grubx64.efi"
             ;;
         aarch64)
-            GRUB_EFI_TARGET="arm64-efi"
             ALPINE_NETBOOT_ARCH="aarch64"
             ALPINE_FREEBSD_GRUB_EFI_REL="/$PLAN_DIR_REL/$ALPINE_BOOT_SUBDIR/reinstall-grubaa64.efi"
             ;;
         *)
-            error "Automatic Alpine RAM bootstrap currently supports host arch x86_64 and aarch64 only"
+            error "Alpine RAM bootstrap supports only x86_64 and aarch64"
             ;;
     esac
 
-    if [[ "$PLAN_STORAGE_MODE" == "efi" ]]; then
-        [[ -n "$PLAN_EFI_UUID" ]] || error "Could not determine EFI filesystem UUID"
-    else
-        [[ -n "$PLAN_EFI_PART" || -n "$PLAN_EFI_UUID" ]] || error "Could not determine Linux /boot fallback source"
-    fi
+    [[ "$PLAN_STORAGE_MODE" != "efi" || -n "$PLAN_EFI_UUID" ]] || error "Bootstrap filesystem UUID unavailable"
 
     ALPINE_BOOT_DIR_REL="/$PLAN_DIR_REL/$ALPINE_BOOT_SUBDIR"
-    ALPINE_BOOT_DIR_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_BOOT_DIR_REL"
+    ALPINE_BOOT_DIR_ABS="$EFI_MOUNT_POINT$ALPINE_BOOT_DIR_REL"
     ALPINE_FREEBSD_GRUB_CFG_REL="$ALPINE_BOOT_DIR_REL/grub/grub.cfg"
-    ALPINE_FREEBSD_GRUB_CFG_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_FREEBSD_GRUB_CFG_REL"
-
-    # Use generic destination names on bootstrap storage so different source flavors/arches can be normalized.
-    ALPINE_KERNEL_FLAVOR="virt"
+    ALPINE_FREEBSD_GRUB_CFG_ABS="$EFI_MOUNT_POINT$ALPINE_FREEBSD_GRUB_CFG_REL"
     ALPINE_VMLINUZ_REL="$ALPINE_BOOT_DIR_REL/vmlinuz"
     ALPINE_INITRAMFS_REL="$ALPINE_BOOT_DIR_REL/initramfs"
-    # Keep the legacy local path only so stale files from older script versions
-    # can be removed. The current bootstrap always fetches modloop over HTTPS.
-    ALPINE_MODLOOP_REL="$ALPINE_BOOT_DIR_REL/modloop"
     ALPINE_MODLOOP_URL="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/${ALPINE_NETBOOT_SUBDIR}/modloop-${ALPINE_KERNEL_FLAVOR}"
-    # Keep apkovl at bootstrap filesystem root so Alpine nlplug-findfs can auto-discover it.
-    ALPINE_APKOVL_REL="/reinstall.apkovl.tar.gz"
-
-    ALPINE_VMLINUZ_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_VMLINUZ_REL"
-    ALPINE_INITRAMFS_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_INITRAMFS_REL"
-    ALPINE_MODLOOP_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_MODLOOP_REL"
-    ALPINE_APKOVL_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_APKOVL_REL"
-
-    ALPINE_SCRIPT_COPY_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL/$SCRIPT_NAME"
-    ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_FREEBSD_GRUB_EFI_REL"
-
-    setup_bootstrap_bundle_paths "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL"
-}
-
-copy_script_to_efi() {
-    local self
-    self="$0"
-
-    if command -v readlink >/dev/null 2>&1; then
-        self=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
-    elif command -v realpath >/dev/null 2>&1; then
-        self=$(realpath "$0" 2>/dev/null || echo "$0")
-    fi
-
-    [[ -f "$self" ]] || error "Cannot locate current script file: $self"
-
-    cp "$self" "$ALPINE_SCRIPT_COPY_ABS"
-    chmod 0755 "$ALPINE_SCRIPT_COPY_ABS"
-    sync
-    info "Copied script to bootstrap storage: $ALPINE_SCRIPT_COPY_ABS"
+    ALPINE_VMLINUZ_ABS="$EFI_MOUNT_POINT$ALPINE_VMLINUZ_REL"
+    ALPINE_INITRAMFS_ABS="$EFI_MOUNT_POINT$ALPINE_INITRAMFS_REL"
+    ALPINE_APKOVL_ABS="$EFI_MOUNT_POINT$ALPINE_APKOVL_REL"
+    ALPINE_FREEBSD_GRUB_EFI_ABS="$EFI_MOUNT_POINT$ALPINE_FREEBSD_GRUB_EFI_REL"
 }
 
 download_alpine_ram_files() {
@@ -2495,10 +1720,7 @@ download_alpine_ram_files() {
 
     base="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/${ALPINE_NETBOOT_SUBDIR}"
 
-    # Older releases of this script copied modloop to the ESP. FreeBSD cloud
-    # images commonly have only a ~32 MiB ESP, so that does not fit alongside
-    # vmlinuz + initramfs + GRUB. Remove any stale/partial local modloop first.
-    rm -f "$ALPINE_MODLOOP_ABS"
+    rm -f "$ALPINE_BOOT_DIR_ABS/modloop"
     sync
 
     local free_kb
@@ -2531,258 +1753,38 @@ download_alpine_ram_files() {
     info "Selected Alpine RAM assets: arch=${ALPINE_NETBOOT_ARCH}, flavor=${ALPINE_KERNEL_FLAVOR}"
 }
 
-build_local_apk_repo() {
-    local root_main_url root_community_url tmpdir
-    local main_index community_index selected_list
-    declare -A PKG_VER PKG_REPO PKG_DEPS PROVIDE_TO_PKG RESOLVED SEEN
-
-    mkdir -p "$BOOTSTRAP_APKREPO_MAIN_ABS" "$BOOTSTRAP_APKREPO_COMMUNITY_ABS"
-
-    root_main_url="${ALPINE_REPO_BASE}/main/${ALPINE_NETBOOT_ARCH}"
-    root_community_url="${ALPINE_REPO_BASE}/community/${ALPINE_NETBOOT_ARCH}"
-
-    tmpdir=$(mktemp -d /tmp/reinstall-apkrepo.XXXXXX)
-    trap 'rm -rf "$tmpdir"' RETURN
-
-    main_index="$tmpdir/main.APKINDEX.tar.gz"
-    community_index="$tmpdir/community.APKINDEX.tar.gz"
-
-    info "Downloading Alpine APKINDEX (main)..."
-    http_download "$root_main_url/APKINDEX.tar.gz" "$main_index"
-    info "Downloading Alpine APKINDEX (community)..."
-    http_download "$root_community_url/APKINDEX.tar.gz" "$community_index"
-
-    cp "$main_index" "$BOOTSTRAP_APKREPO_MAIN_ABS/APKINDEX.tar.gz"
-    cp "$community_index" "$BOOTSTRAP_APKREPO_COMMUNITY_ABS/APKINDEX.tar.gz"
-
-    tar -xOzf "$main_index" APKINDEX >"$tmpdir/main.APKINDEX"
-    tar -xOzf "$community_index" APKINDEX >"$tmpdir/community.APKINDEX"
-
-    parse_apkindex_file() {
-        local file="$1" repo="$2"
-        local rec name ver deps provides tok norm
-
-        while IFS= read -r -d '' rec; do
-            name=$(awk '/^P:/{sub(/^P:/, ""); print; exit}' <<<"$rec")
-            ver=$(awk '/^V:/{sub(/^V:/, ""); print; exit}' <<<"$rec")
-            deps=$(awk '/^D:/{sub(/^D:/, ""); print; exit}' <<<"$rec")
-            provides=$(awk '/^p:/{sub(/^p:/, ""); print; exit}' <<<"$rec")
-
-            [[ -n "$name" && -n "$ver" ]] || continue
-
-            if [[ -z "${PKG_VER[$name]:-}" ]]; then
-                PKG_VER["$name"]="$ver"
-                PKG_REPO["$name"]="$repo"
-                PKG_DEPS["$name"]="$deps"
-            fi
-
-            for tok in $provides; do
-                norm=$(normalize_dep_token "$tok")
-                [[ -n "$norm" ]] || continue
-                if [[ -z "${PROVIDE_TO_PKG[$norm]:-}" ]]; then
-                    PROVIDE_TO_PKG["$norm"]="$name"
-                fi
-            done
-        done < <(
-            awk 'BEGIN { RS=""; ORS="" } { if (length($0) > 0) printf "%s\0", $0 }' "$file"
-        )
-    }
-
-    parse_apkindex_file "$tmpdir/main.APKINDEX" "main"
-    parse_apkindex_file "$tmpdir/community.APKINDEX" "community"
-
-    selected_list="$tmpdir/selected.list"
-
-    resolve_pkg() {
-        local want="$1"
-        local tok norm deps dep real
-
-        [[ -n "$want" ]] || return 0
-        [[ -z "${RESOLVED[$want]:-}" ]] || return 0
-        [[ -z "${SEEN[$want]:-}" ]] || return 0
-        SEEN["$want"]=1
-
-        real="$want"
-        if [[ -z "${PKG_VER[$real]:-}" ]]; then
-            real="${PROVIDE_TO_PKG[$want]:-}"
-        fi
-
-        [[ -n "$real" ]] || return 0
-        [[ -n "${PKG_VER[$real]:-}" ]] || return 0
-        [[ -z "${RESOLVED[$real]:-}" ]] || return 0
-
-        RESOLVED["$real"]=1
-        printf '%s\n' "$real" >>"$selected_list"
-
-        deps="${PKG_DEPS[$real]:-}"
-        for tok in $deps; do
-            norm=$(normalize_dep_token "$tok")
-            [[ -n "$norm" ]] || continue
-            case "$norm" in
-                so:*|cmd:*|/bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*)
-                    dep="${PROVIDE_TO_PKG[$norm]:-}"
-                    ;;
-                *)
-                    dep="$norm"
-                    if [[ -z "${PKG_VER[$dep]:-}" ]]; then
-                        dep="${PROVIDE_TO_PKG[$dep]:-}"
-                    fi
-                    ;;
-            esac
-            [[ -n "$dep" ]] || continue
-            resolve_pkg "$dep"
-        done
-    }
-
-    : >"$selected_list"
-    for pkg in "${ALPINE_RUNTIME_PKGS[@]}"; do
-        resolve_pkg "$pkg"
-    done
-
-    sort -u "$selected_list" -o "$selected_list"
-
-    while IFS= read -r pkg; do
-        [[ -n "$pkg" ]] || continue
-        local ver repo url dst_dir
-        ver="${PKG_VER[$pkg]}"
-        repo="${PKG_REPO[$pkg]}"
-        if [[ "$repo" == "main" ]]; then
-            url="$root_main_url/${pkg}-${ver}.apk"
-            dst_dir="$BOOTSTRAP_APKREPO_MAIN_ABS"
-        else
-            url="$root_community_url/${pkg}-${ver}.apk"
-            dst_dir="$BOOTSTRAP_APKREPO_COMMUNITY_ABS"
-        fi
-        if [[ -f "$dst_dir/${pkg}-${ver}.apk" ]]; then
-            info "APK already cached: ${pkg}-${ver}.apk"
-            continue
-        fi
-        info "Downloading APK: ${pkg}-${ver}.apk ($repo)"
-        http_download "$url" "$dst_dir/${pkg}-${ver}.apk"
-    done <"$selected_list"
-
-    sync
-    rm -rf "$tmpdir"
-    trap - RETURN
-
-    info "Built local Alpine APK repos under: $BOOTSTRAP_APKREPO_DIR_ABS"
-}
-
-download_target_image_to_bootstrap() {
-    mkdir -p "$BOOTSTRAP_CACHE_DIR_ABS"
-
-    precheck_bootstrap_space_for_download "$EFI_MOUNT_POINT" "$IMG_URL" 2
-
-    if [[ -f "$BOOTSTRAP_IMG_ABS" ]]; then
-        if [[ "$BOOTSTRAP_IMG_ABS" == *.xz ]]; then
-            if xz -t "$BOOTSTRAP_IMG_ABS" >/dev/null 2>&1; then
-                info "Target image already cached on bootstrap storage: $BOOTSTRAP_IMG_ABS"
-                return 0
-            fi
-        elif qemu-img info "$BOOTSTRAP_IMG_ABS" >/dev/null 2>&1; then
-            info "Target image already cached on bootstrap storage: $BOOTSTRAP_IMG_ABS"
-            return 0
-        fi
-        warn "Cached target image failed validation; redownloading: $BOOTSTRAP_IMG_ABS"
-        rm -f "$BOOTSTRAP_IMG_ABS"
-    fi
-
-    info "Downloading target image to bootstrap storage..."
-    http_download "$IMG_URL" "$BOOTSTRAP_IMG_ABS"
-    if [[ "$BOOTSTRAP_IMG_ABS" == *.xz ]]; then
-        xz -t "$BOOTSTRAP_IMG_ABS" || error "Downloaded xz image failed integrity validation"
-    else
-        qemu-img info "$BOOTSTRAP_IMG_ABS" >/dev/null || error "Downloaded image is not a readable qcow2 image"
-    fi
-    sync
-    info "Cached target image: $BOOTSTRAP_IMG_ABS"
-}
-
-cache_optional_inputs_to_bootstrap() {
-    mkdir -p "$BOOTSTRAP_INPUT_DIR_ABS"
-
-    FRPC_BOOTSTRAP_REL=""
-    POST_INSTALL_HOOK_BOOTSTRAP_REL=""
-
-    if [[ -n "${FRPC_TOML:-}" ]]; then
-        if [[ "$FRPC_TOML" =~ ^https?:// ]]; then
-            info "FRPC URL will be downloaded later from Alpine RAM: $FRPC_TOML"
-        elif [[ -f "$FRPC_TOML" ]]; then
-            FRPC_BOOTSTRAP_REL="$BOOTSTRAP_INPUT_DIR_REL/frpc.toml"
-            info "Caching local FRPC config on bootstrap storage: $FRPC_TOML"
-            cp "$FRPC_TOML" "$BOOTSTRAP_INPUT_DIR_ABS/frpc.toml"
-            chmod 0600 "$BOOTSTRAP_INPUT_DIR_ABS/frpc.toml" 2>/dev/null || true
-        else
-            error "Invalid FRPC config path: $FRPC_TOML"
-        fi
-    fi
-
-    if [[ -n "${POST_INSTALL_HOOK:-}" ]]; then
-        [[ -f "$POST_INSTALL_HOOK" ]] || error "Post-install hook not found: $POST_INSTALL_HOOK"
-        POST_INSTALL_HOOK_BOOTSTRAP_REL="$BOOTSTRAP_INPUT_DIR_REL/post-install-hook.sh"
-        info "Caching local post-install hook on bootstrap storage: $POST_INSTALL_HOOK"
-        cp "$POST_INSTALL_HOOK" "$BOOTSTRAP_INPUT_DIR_ABS/post-install-hook.sh"
-        chmod 0700 "$BOOTSTRAP_INPUT_DIR_ABS/post-install-hook.sh"
-    fi
-
-    sync
-}
-
 build_alpine_apkovl() {
-    local tmp ovl_dir startfile initfile repofile markerfile
+    local tmp ovl_dir startfile initfile self
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
-
     ovl_dir="$tmp/ovl"
 
-    mkdir -p \
-        "$ovl_dir/etc/apk" \
-        "$ovl_dir/usr/local/sbin" \
-        "$ovl_dir/etc/reinstall"
-
-    # Tell Alpine initramfs to add the normal sysinit/boot services even with an apkovl.
-    # reinstall-init.sh runs those stages directly before launching the installer.
+    mkdir -p "$ovl_dir/etc/apk" "$ovl_dir/etc/reinstall" "$ovl_dir/usr/local/sbin"
     : >"$ovl_dir/etc/.default_boot_services"
 
-    repofile="$ovl_dir/etc/apk/repositories"
-    cat >"$repofile" <<EOF
+    cat >"$ovl_dir/etc/apk/repositories" <<EOF
 ${ALPINE_REPO_BASE}/main/${ALPINE_NETBOOT_ARCH}
 ${ALPINE_REPO_BASE}/community/${ALPINE_NETBOOT_ARCH}
 EOF
 
-    markerfile="$ovl_dir/etc/reinstall/vars"
-    cat >"$markerfile" <<EOF
-PLAN_EFI_PART='${PLAN_EFI_PART}'
-PLAN_EFI_UUID='${PLAN_EFI_UUID}'
-PLAN_EFI_FS_TYPE='${PLAN_EFI_FS_TYPE}'
-PLAN_STORAGE_MODE='${PLAN_STORAGE_MODE}'
-PLAN_PATH_PREFIX_REL='${PLAN_PATH_PREFIX_REL}'
-PLAN_DIR_REL='${PLAN_DIR_REL}'
-PLAN_FILE_NAME='${PLAN_FILE_NAME}'
-SCRIPT_NAME='${SCRIPT_NAME}'
-HOLD='${HOLD}'
-EOF
+    write_install_plan "$ovl_dir/etc/reinstall/plan.env"
 
-    # Make the Alpine RAM environment self-contained after apkovl is loaded.
-    # The boot ESP is only needed to load kernel/initramfs/modloop/apkovl; the
-    # destructive installer must not depend on mounting it again.
-    local embedded_plan embedded_installer
-    embedded_plan="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL/$PLAN_DIR_REL/$PLAN_FILE_NAME"
-    embedded_installer="$ALPINE_SCRIPT_COPY_ABS"
-
-    [[ -f "$embedded_plan" ]] || error "Plan file missing while building apkovl: $embedded_plan"
-    [[ -f "$embedded_installer" ]] || error "Installer script missing while building apkovl: $embedded_installer"
-
-    cp "$embedded_plan" "$ovl_dir/etc/reinstall/plan.env"
-    chmod 0600 "$ovl_dir/etc/reinstall/plan.env"
-    cp "$embedded_installer" "$ovl_dir/usr/local/sbin/reinstall-installer.sh"
+    self="$0"
+    if command -v readlink >/dev/null 2>&1; then
+        self=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s' "$0")
+    elif command -v realpath >/dev/null 2>&1; then
+        self=$(realpath "$0" 2>/dev/null || printf '%s' "$0")
+    fi
+    [[ -f "$self" ]] || error "Cannot locate current script: $self"
+    cp "$self" "$ovl_dir/usr/local/sbin/reinstall-installer.sh"
     chmod 0755 "$ovl_dir/usr/local/sbin/reinstall-installer.sh"
 
-    if [[ -n "${FRPC_BOOTSTRAP_REL:-}" && -f "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$FRPC_BOOTSTRAP_REL" ]]; then
-        cp "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$FRPC_BOOTSTRAP_REL" "$ovl_dir/etc/reinstall/frpc.toml"
+    if [[ -n "${FRPC_TOML:-}" && ! "$FRPC_TOML" =~ ^https?:// && -f "$FRPC_TOML" ]]; then
+        cp "$FRPC_TOML" "$ovl_dir/etc/reinstall/frpc.toml"
         chmod 0600 "$ovl_dir/etc/reinstall/frpc.toml"
     fi
-    if [[ -n "${POST_INSTALL_HOOK_BOOTSTRAP_REL:-}" && -f "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$POST_INSTALL_HOOK_BOOTSTRAP_REL" ]]; then
-        cp "$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$POST_INSTALL_HOOK_BOOTSTRAP_REL" "$ovl_dir/etc/reinstall/post-install-hook.sh"
+    if [[ -n "${POST_INSTALL_HOOK:-}" ]]; then
+        [[ -f "$POST_INSTALL_HOOK" ]] || error "Post-install hook not found: $POST_INSTALL_HOOK"
+        cp "$POST_INSTALL_HOOK" "$ovl_dir/etc/reinstall/post-install-hook.sh"
         chmod 0700 "$ovl_dir/etc/reinstall/post-install-hook.sh"
     fi
 
@@ -2794,7 +1796,6 @@ set -eu
 LOG="/var/log/reinstall-auto.log"
 mkdir -p /var/log
 touch "$LOG"
-# Keep output visible on the serial/system console. A diskless reinstall must not
 # look idle at a login prompt while destructive work is running.
 if [ -w /dev/console ]; then
     exec >/dev/console 2>&1
@@ -2816,92 +1817,6 @@ is_mountpoint() {
     fi
 
     awk -v p="$p" '$2 == p { found=1; exit } END { exit(found ? 0 : 1) }' /proc/mounts 2>/dev/null
-}
-
-[ -f /etc/reinstall/vars ] || {
-    echo "Missing /etc/reinstall/vars"
-    exit 1
-}
-# shellcheck disable=SC1091
-. /etc/reinstall/vars
-
-mount_bootstrap() {
-    local base_mnt dev
-    base_mnt=/media/bootstrap
-
-    mkdir -p "$base_mnt"
-
-    if is_mountpoint "$base_mnt"; then
-        return 0
-    fi
-
-    if [ "${PLAN_STORAGE_MODE:-efi}" = "efi" ]; then
-        if [ -n "${PLAN_EFI_PART:-}" ] && [ -e "${PLAN_EFI_PART}" ]; then
-            echo "Trying bootstrap mount from PLAN_EFI_PART: ${PLAN_EFI_PART}"
-            mount "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || \
-            mount -t vfat "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || \
-            mount -t msdos "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || \
-            mount -t msdosfs "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || true
-        fi
-    else
-        if [ -n "${PLAN_EFI_PART:-}" ] && [ -e "${PLAN_EFI_PART}" ]; then
-            echo "Trying bootstrap mount from PLAN_EFI_PART: ${PLAN_EFI_PART}"
-            mount "${PLAN_EFI_PART}" "$base_mnt" 2>/dev/null || true
-        fi
-    fi
-
-    if is_mountpoint "$base_mnt"; then
-        return 0
-    fi
-
-    if [ -n "${PLAN_EFI_UUID:-}" ]; then
-        dev="$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)"
-        if [ -n "$dev" ] && [ -e "$dev" ]; then
-            echo "Trying bootstrap mount from PLAN_EFI_UUID: ${PLAN_EFI_UUID} -> ${dev}"
-            if [ "${PLAN_STORAGE_MODE:-efi}" = "efi" ]; then
-                mount "$dev" "$base_mnt" 2>/dev/null || \
-                mount -t vfat "$dev" "$base_mnt" 2>/dev/null || \
-                mount -t msdos "$dev" "$base_mnt" 2>/dev/null || \
-                mount -t msdosfs "$dev" "$base_mnt" 2>/dev/null || true
-            else
-                mount "$dev" "$base_mnt" 2>/dev/null || true
-            fi
-        fi
-    fi
-
-    if is_mountpoint "$base_mnt"; then
-        return 0
-    fi
-
-    echo "Falling back to conservative block-device scan for bootstrap storage"
-    if [ "${PLAN_STORAGE_MODE:-efi}" = "efi" ]; then
-        for dev in /dev/sd[a-z][0-9]* /dev/vd[a-z][0-9]* /dev/xvd[a-z][0-9]* /dev/nvme*n*p[0-9]* /dev/mmcblk*p[0-9]*; do
-            [ -e "$dev" ] || continue
-            echo "Trying candidate: $dev"
-            mount "$dev" "$base_mnt" 2>/dev/null || \
-            mount -t vfat "$dev" "$base_mnt" 2>/dev/null || \
-            mount -t msdos "$dev" "$base_mnt" 2>/dev/null || \
-            mount -t msdosfs "$dev" "$base_mnt" 2>/dev/null || true
-            if [ -f "$base_mnt/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
-                return 0
-            fi
-            umount "$base_mnt" 2>/dev/null || true
-        done
-    else
-        for dev in /dev/sd[a-z][0-9]* /dev/vd[a-z][0-9]* /dev/xvd[a-z][0-9]* /dev/nvme*n*p[0-9]* /dev/mmcblk*p[0-9]*; do
-            [ -e "$dev" ] || continue
-            echo "Trying candidate: $dev"
-            mount "$dev" "$base_mnt" 2>/dev/null || true
-            if [ -f "$base_mnt/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ] || \
-               [ -f "$base_mnt/boot/${PLAN_DIR_REL}/${PLAN_FILE_NAME}" ]; then
-                return 0
-            fi
-            umount "$base_mnt" 2>/dev/null || true
-        done
-    fi
-
-    echo "Failed to mount bootstrap storage"
-    return 1
 }
 
 ensure_network() {
@@ -2946,7 +1861,6 @@ REPOEOF
     update-ca-certificates 2>/dev/null || true
 
     # Fail here with a precise message instead of reaching the destructive stage
-    # and discovering that a split Alpine subpackage was not installed.
     for cmd in sgdisk mkfs.ext4 qemu-img qemu-nbd xz curl lsblk blkid mount umount blockdev mknod pvresize xfs_db dumpe2fs resize2fs e2fsck; do
         command -v "$cmd" >/dev/null 2>&1 || {
             echo "Required Alpine runtime command is missing after apk add: $cmd"
@@ -2971,9 +1885,6 @@ ensure_modloop_ready() {
     echo "[stage] ensuring Alpine modloop for kernel $kver"
     echo "Remote modloop: ${ALPINE_MODLOOP_URL:-from-kernel-cmdline}"
 
-    # The early OpenRC attempt may have left a truncated /lib/modloop-virt.
-    # Alpine's modloop service intentionally skips downloading when that file
-    # already exists, so remove it before every retry.
     for attempt in 1 2 3 4 5; do
         echo "Starting Alpine modloop service (attempt $attempt/5)..."
 
@@ -3018,7 +1929,6 @@ setup_zram_swap() {
         exit 1
     }
 
-    # Logical zram size = 2x physical RAM, minimum 1 GiB, maximum 8 GiB.
     zram_bytes=$((mem_kb * 1024 * 2))
     min_bytes=1073741824
     max_bytes=8589934592
@@ -3111,10 +2021,6 @@ relocate_modloop_to_ram() {
     cp "$backing" "$ram_modloop"
     sync
 
-    # Copy to our dedicated RAM work area and recreate /.modloop from there.
-    # With current netboot the source was normally downloaded by initramfs into
-    # RAM already; this still normalizes the state and guarantees no target-disk
-    # filesystem can remain referenced by the active modloop.
     umount /.modloop || {
         echo "Failed to unmount the original /.modloop."
         exit 1
@@ -3140,11 +2046,7 @@ relocate_modloop_to_ram() {
     new_loopdev="$(findmnt -rn -o SOURCE --target /.modloop 2>/dev/null | head -n1 || true)"
     echo "RAM-backed modloop active: ${new_loopdev:-unknown} -> $ram_modloop"
 
-    # Show any remaining boot-media mounts. The installer will unmount the target
-    # disk strictly before qemu-img writes to it.
-    boot_mnt="$(dirname "$backing")"
-    echo "Modloop relocation complete; original boot media is no longer used by /.modloop."
-    findmnt -rn -S "${PLAN_EFI_PART:-}" 2>/dev/null || true
+    echo "Modloop relocation complete."
 }
 
 main() {
@@ -3318,10 +2220,6 @@ build_freebsd_grub_efi() {
             ;;
     esac
 
-    # Alpine's official virt ISO already contains a GRUB EFI image built with
-    # the exact GRUB modules needed to load Linux + initramfs.  FreeBSD does not
-    # ship grub-mkstandalone, so extract that official EFI binary and retarget
-    # its tiny embedded early config from the ISO label to this machine's ESP UUID.
     iso_url="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/alpine-virt-${alpine_release}-${ALPINE_NETBOOT_ARCH}.iso"
 
     tmp=$(mktemp -d /tmp/reinstall-alpine-efi.XXXXXX)
@@ -3359,13 +2257,6 @@ build_freebsd_grub_efi() {
         error "Extracted Alpine GRUB EFI binary is empty"
     }
 
-    # Alpine mkimg embeds:
-    #   search --no-floppy --set=root --label "alpine-virt VERSION ARCH"
-    #   set prefix=($root)/boot/grub
-    #
-    # That ISO label does not exist after copying the EFI binary to our ESP.
-    # Patch only this embedded ASCII config, preserving its exact byte length,
-    # so GRUB locates this ESP by its FAT UUID and reads our private grub.cfg.
     volid="alpine-virt ${alpine_release} ${ALPINE_NETBOOT_ARCH}"
     printf -v old_cfg \
         'search --no-floppy --set=root --label "%s"\nset prefix=($root)/boot/grub\n' \
@@ -3383,9 +2274,6 @@ build_freebsd_grub_efi() {
 
     marker="search --no-floppy --set=root --label \"${volid}\""
     offset=$(
-        # grep -b alone reports the offset of the output line.  In a PE/EFI
-        # binary the embedded config may begin in the middle of such a "line".
-        # -o makes -b report the byte offset of the matched text itself.
         LC_ALL=C grep -a -b -o -F "$marker" "$ALPINE_FREEBSD_GRUB_EFI_ABS" 2>/dev/null |
         head -n1 | cut -d: -f1
     )
@@ -3451,16 +2339,11 @@ EOF
     info "  ESP UUID: $PLAN_EFI_UUID"
 }
 
-
 install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
 
     local before after newnum old bootnext
 
-    # FreeBSD efibootmgr may prefix entries with '+' and suffix the Boot#### token
-    # with '*', e.g.:
-    #   +Boot0001* FreeBSD ...
-    # Never assume Boot#### is the first token/character on the line.
     while read -r old; do
         [[ -n "$old" ]] || continue
         info "Deleting old EFI boot entry $old (${ALPINE_ENTRY_TITLE})"
@@ -3493,8 +2376,6 @@ install_freebsd_bootnext_entry() {
         -L "$ALPINE_ENTRY_TITLE" >/dev/null || \
         error "efibootmgr failed to create EFI boot entry: ${ALPINE_ENTRY_TITLE}"
 
-    # Since all old entries with this label were deleted first, label lookup is
-    # the most direct and reliable way to recover the newly allocated Boot####.
     newnum=$(
         efibootmgr 2>/dev/null | awk -v title="$ALPINE_ENTRY_TITLE" '
             index($0, title) {
@@ -3507,7 +2388,6 @@ install_freebsd_bootnext_entry() {
         '
     )
 
-    # Fallback: compare the complete Boot#### set before and after creation.
     if [[ -z "$newnum" ]]; then
         after=$(
             efibootmgr 2>/dev/null |
@@ -3554,72 +2434,38 @@ install_freebsd_bootnext_entry() {
     info "BootNext verified: ${newnum^^} (${ALPINE_ENTRY_TITLE})"
 }
 
-
 prepare_and_boot_alpine_ram() {
-    [[ "$OS" == "Linux" ]] || error "Automatic Alpine RAM bootstrap only supports Linux host in this function"
-
     prepare_alpine_paths
-    cache_optional_inputs_to_bootstrap
-    save_plan_to_efi
-    copy_script_to_efi
     download_alpine_ram_files
     build_alpine_apkovl
-    install_grub_entry_for_alpine
 
-    info "Alpine RAM installer prepared."
-    info "System will reboot now into one-time GRUB entry: ${ALPINE_ENTRY_TITLE}"
-    sync
-    sleep 2
-    reboot
+    case "$OS" in
+        Linux)
+            install_grub_entry_for_alpine
+            info "Rebooting into one-time GRUB entry: $ALPINE_ENTRY_TITLE"
+            sync
+            sleep 2
+            reboot
+            ;;
+        FreeBSD)
+            build_freebsd_grub_efi
+            install_freebsd_bootnext_entry
+            info "Rebooting into one-time UEFI entry: $ALPINE_ENTRY_TITLE"
+            sync
+            sleep 2
+            shutdown -r now
+            ;;
+        *)
+            error "Unsupported bootstrap host: $OS"
+            ;;
+    esac
 }
 
-prepare_and_boot_alpine_ram_freebsd() {
-    [[ "$OS" == "FreeBSD" ]] || error "Automatic FreeBSD BootNext bootstrap only supports FreeBSD host in this function"
-
-    prepare_alpine_paths
-    cache_optional_inputs_to_bootstrap
-    save_plan_to_efi
-    copy_script_to_efi
-    download_alpine_ram_files
-    build_alpine_apkovl
-    build_freebsd_grub_efi
-    install_freebsd_bootnext_entry
-
-    info "Alpine RAM installer prepared for FreeBSD UEFI BootNext using Alpine official GRUB EFI."
-    info "System will reboot now into one-time UEFI entry: ${ALPINE_ENTRY_TITLE}"
-    sync
-    sleep 2
-    shutdown -r now
-}
-
-# ----------------- installer execution (Alpine download + direct write + NoCloud) -----------------
-
-locate_bootstrap_image() {
-    local root_abs="$1"
-    local p1 p2
-
-    p1="$root_abs/$PLAN_DIR_REL/cache/image.qcow2"
-    p2="$root_abs/$PLAN_DIR_REL/cache/image.qcow2.xz"
-
-    if [[ -f "$p1" ]]; then
-        echo "$p1"
-        return 0
-    fi
-
-    if [[ -f "$p2" ]]; then
-        echo "$p2"
-        return 0
-    fi
-
-    return 1
-}
+# ----------------- installer execution -----------------
 
 reread_partition_table_strict() {
     sync
 
-    # Alpine RAM may retain stale partition mappings after an in-place disk-image
-    # write. Do not make partprobe the single point of failure: try the kernel
-    # reread ioctl and partx as well, then refresh /dev through mdev/udev.
     local reread_ok=0
 
     if command -v blockdev >/dev/null 2>&1; then
@@ -3716,9 +2562,6 @@ ensure_linux_block_node_from_sysfs() {
     IFS=: read -r maj min <"$sysdev"
     [[ "$maj" =~ ^[0-9]+$ && "$min" =~ ^[0-9]+$ ]] || return 1
 
-    # Alpine RAM may have the partition registered in the kernel/sysfs while
-    # mdev has not recreated the corresponding /dev node after partx/rereadpt.
-    # Only create the node when sysfs explicitly exposes the exact block device.
     if [[ -e "$devpath" && ! -b "$devpath" ]]; then
         rm -f "$devpath"
     fi
@@ -3739,8 +2582,6 @@ prepare_fixed_temp_staging_partition() {
     disk_size=$(get_disk_size_bytes "$DISK" || true)
     [[ -n "$disk_size" ]] || error "Could not determine target disk size before creating staging partition"
 
-    # Keep at least 2 GiB in front of the staging partition. The actual image-layout
-    # check below is stricter and will refuse an image whose partitions cross the boundary.
     min_remaining=$((2 * 1024 * 1024 * 1024))
     if [[ "$disk_size" -le $((TEMP_STAGE_SIZE_BYTES + min_remaining)) ]]; then
         error "Target disk is too small for the mandatory 3 GiB staging partition. Disk=${disk_size} bytes"
@@ -3752,9 +2593,6 @@ prepare_fixed_temp_staging_partition() {
     wipefs -a "$DISK" >/dev/null 2>&1 || true
     sgdisk -Z "$DISK" >/dev/null 2>&1 || true
 
-    # Remove stale kernel partition mappings before creating the one temporary
-    # partition. This matters on Alpine/mdev and virtio-blk after the original
-    # boot disk partitions have just been removed.
     if command -v partx >/dev/null 2>&1; then
         partx -d "$DISK" >/dev/null 2>&1 || true
     fi
@@ -3769,10 +2607,7 @@ prepare_fixed_temp_staging_partition() {
 
     reread_partition_table_strict
 
-    # Do not depend on PARTLABEL appearing in lsblk immediately. On minimal
-    # Alpine with mdev that metadata may lag even though the partition node is
     # already valid. The partition number is known because the temporary GPT
-    # contains exactly this explicitly numbered partition.
     TEMP_STAGE_PART=$(partition_device_for_number "$DISK" "$TEMP_STAGE_PART_NUM")
     local wait_i
     for wait_i in 1 2 3 4 5 6 7 8; do
@@ -3784,9 +2619,6 @@ prepare_fixed_temp_staging_partition() {
         command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
         command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
 
-        # If the kernel already exposes the partition in sysfs but minimal
-        # Alpine has not populated /dev yet, create that exact block node from
-        # the kernel-provided major:minor instead of guessing.
         ensure_linux_block_node_from_sysfs "$TEMP_STAGE_PART" && break
 
         sleep 1
@@ -3824,8 +2656,6 @@ prepare_fixed_temp_staging_partition() {
     TEMP_STAGE_START_BYTES=$((first_sector * TEMP_STAGE_SECTOR_SIZE))
     actual_bytes=$(((last_sector - first_sector + 1) * TEMP_STAGE_SECTOR_SIZE))
 
-    # The start is normally aligned, so the actual size may differ from exactly 3 GiB
-    # by less than one alignment unit. Reject a materially smaller partition.
     if [[ "$actual_bytes" -lt $((TEMP_STAGE_SIZE_BYTES - 2 * 1024 * 1024)) ]]; then
         error "Temporary staging partition is smaller than requested: ${actual_bytes} bytes"
     fi
@@ -3839,7 +2669,6 @@ prepare_fixed_temp_staging_partition() {
     # Deliberately invalidate the temporary GPT backup header after the kernel has
     # learned the partition mapping. Later the image primary GPT will replace the
     # temporary primary GPT, and sgdisk -e can rebuild a clean backup GPT without
-    # accidentally preferring the stale temporary backup table.
     local disk_bytes total_sectors tail_start
     disk_bytes=$(blockdev --getsize64 "$DISK")
     total_sectors=$((disk_bytes / TEMP_STAGE_SECTOR_SIZE))
@@ -3896,9 +2725,6 @@ inspect_qcow_partition_layout() {
     connect_qcow_readonly_nbd "$img"
     nbd="$QCOW_NBD_DEV"
 
-    # qemu-nbd exposes the actual guest-visible size of the qcow2. This is the
-    # authoritative value for overlap decisions; do not confuse repository file
-    # length/allocated bytes with the virtual block-device size.
     local nbd_virtual_size
     nbd_virtual_size=$(blockdev --getsize64 "$nbd" 2>/dev/null || true)
     [[ "$nbd_virtual_size" =~ ^[0-9]+$ && "$nbd_virtual_size" -gt 0 ]] ||         error "Could not determine qcow2 guest-visible size through qemu-nbd"
@@ -3937,19 +2763,14 @@ inspect_qcow_partition_layout() {
 
     # A cloud image may deliberately describe a GPT/LVM layout much larger than
     # the qcow2 payload stored on disk. Do not reject it merely because the GPT
-    # last partition reaches the live 3 GiB staging area. Instead, switch to the
     # sparse-shadow path so the source is first copied into RAM/zram, resized
-    # safely there when possible, and only then written back after staging is
-    # released.
     if [[ "$QCOW_MAX_PART_END_BYTES" -gt $((TEMP_STAGE_START_BYTES - 8 * 1024 * 1024)) ]]; then
         QCOW_PARTITION_CROSSES_STAGE=1
         warn "qcow2 GPT layout reaches the mandatory 3 GiB staging area."
         warn "Using sparse RAM/zram shadow mode to avoid self-overwriting the live staging source."
     fi
 
-    # A valid disk image cannot have a partition ending beyond its virtual block
     # device. If qemu-img reported otherwise, treat the GPT extent as the minimum
-    # effective size for safety and force shadow mode.
     if [[ "$QCOW_VIRTUAL_SIZE" -lt "$QCOW_MAX_PART_END_BYTES" ]]; then
         warn "qemu-img virtual-size (${QCOW_VIRTUAL_SIZE}) is smaller than GPT partition end (${QCOW_MAX_PART_END_BYTES}); refusing to trust the smaller value for write-safety decisions."
         QCOW_VIRTUAL_SIZE="$QCOW_MAX_PART_END_BYTES"
@@ -3969,10 +2790,7 @@ download_target_image_in_alpine() {
     fi
 
     if [[ "$IMG_URL" == *.xz ]]; then
-        # Keep FreeBSD and other xz-wrapped qcow2 images as qcow2. We do not store
-        # the compressed .xz separately: the network stream is decompressed directly
         # into a regular qcow2 file on the staging filesystem. xz recreates sparse
-        # regions when the output is a seekable regular file.
         if command -v curl >/dev/null 2>&1; then
             if ! curl -L --fail "$IMG_URL" | xz -dc >"$tmp"; then
                 rm -f "$tmp"
@@ -4009,10 +2827,6 @@ download_target_image_in_alpine() {
 get_qcow_virtual_size_bytes() {
     local path="$1"
 
-    # Match the JSON key exactly. Do not use a loose field parser here:
-    # cloud qcow2 images often have actual-size ~= 500 MiB while virtual-size
-    # is several GiB, and confusing the two would make an in-disk staging
-    # safety decision catastrophically wrong.
     qemu-img info --output=json "$path" 2>/dev/null | \
         sed -n 's/^[[:space:]]*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | \
         head -n1
@@ -4132,9 +2946,7 @@ prepare_sparse_shadow_for_target() {
     info "Sparse-shadow final partition $partnum extends to sector $part_end; target-safe end is $target_end."
 
     # GPT type codes describe intended use, not necessarily the on-disk content.
-    # Rocky ARM64 images may legitimately use DPS type 8305 (Linux ARM64 root)
     # even when the payload is an LVM PV or a directly formatted root filesystem.
-    # Probe the content itself before deciding how to make the boundary smaller.
     partdev=$(partition_device_for_number "$nbd" "$partnum")
     for wait_i in 1 2 3 4 5; do
         [[ -b "$partdev" ]] && break
@@ -4200,7 +3012,6 @@ prepare_sparse_shadow_for_target() {
                 info "ext filesystem size: ${fs_bytes} bytes; target partition capacity: ${new_part_bytes} bytes"
 
                 if (( fs_bytes > new_part_bytes )); then
-                    # Leave a little slack inside the new partition.
                     target_fs_blocks=$((new_part_bytes / fs_block_size - 256))
                     (( target_fs_blocks > 0 )) || {
                         cleanup_qcow_nbd
@@ -4287,8 +3098,6 @@ write_sparse_shadow_to_target_after_releasing_stage() {
     info "Writing sparse shadow to the target disk after releasing the 3 GiB staging partition..."
     info "Copy length: ${disk_bytes} bytes"
 
-    # coreutils dd is installed in Alpine RAM. iflag=count_bytes lets count be
-    # exact bytes rather than blocks, so a 10 GiB cloud image can be safely
     # truncated to a smaller VPS disk after pvresize/GPT preparation.
     dd if="$shadow" of="$DISK" bs=16M iflag=count_bytes count="$disk_bytes" \
         status=progress conv=fsync || error "Failed to write sparse shadow to target disk"
@@ -4318,7 +3127,6 @@ write_qcow_without_overwriting_staging() {
     fi
 
     # The image virtual disk extends beyond the staging boundary, but its GPT
-    # partitions were verified to end before the boundary. Copy only the safe
     # prefix; trailing free space and the source backup GPT are intentionally
     # omitted. The backup GPT is rebuilt after staging has been released.
     if (( TEMP_STAGE_START_BYTES % (4 * 1024 * 1024) == 0 )); then
@@ -4338,7 +3146,6 @@ write_qcow_without_overwriting_staging() {
         "if=$img" "of=$DISK" || error "qemu-img dd failed while writing the safe image prefix"
 }
 
-
 release_temp_staging_partition() {
     local old_stage="${TEMP_STAGE_PART:-}"
 
@@ -4350,10 +3157,7 @@ release_temp_staging_partition() {
     fi
 
     # The on-disk primary GPT has already been replaced by the target image, but
-    # the kernel can still remember the old tail REINSTALL_TMP partition. Drop
     # those stale mappings before manipulating the target GPT. This avoids
-    # BLKRRPART/partprobe returning EBUSY even though the staging filesystem has
-    # already been unmounted.
     if command -v partx >/dev/null 2>&1; then
         if ! partx -d "$DISK" >/dev/null 2>&1; then
             warn "Could not immediately delete stale staging partition mappings with partx; continuing with GPT repair."
@@ -4468,11 +3272,9 @@ do_install() {
         error "Swap-backed Alpine work tmpfs is not mounted at /run/reinstall-work"
     fi
 
-    local bootstrap_root_abs virtual_size disk_size staged_frpc staged_hook
+    local staged_frpc
     local CIDATA_PART MNT_CIDATA
-    bootstrap_root_abs="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL"
     staged_frpc=""
-    staged_hook=""
 
     cleanup_install_stage() {
         cleanup_qcow_nbd
@@ -4483,26 +3285,13 @@ do_install() {
     }
     trap cleanup_install_stage EXIT
 
-    # Small optional inputs are staged in RAM before the old disk layout is destroyed.
     if [[ -n "${FRPC_TOML:-}" && "$FRPC_TOML" =~ ^https?:// ]]; then
         staged_frpc="$INSTALL_TMPDIR/frpc.toml"
-        info "Downloading FRPC config from Alpine RAM: $FRPC_TOML"
-        http_download "$FRPC_TOML" "$staged_frpc" || error "Failed to download FRPC config from Alpine RAM"
+        info "Downloading FRPC config: $FRPC_TOML"
+        http_download "$FRPC_TOML" "$staged_frpc" || error "Failed to download FRPC config"
         FRPC_TOML="$staged_frpc"
-    elif [[ -n "${FRPC_BOOTSTRAP_REL:-}" && -f "$bootstrap_root_abs$FRPC_BOOTSTRAP_REL" ]]; then
-        staged_frpc="$INSTALL_TMPDIR/frpc.toml"
-        cp "$bootstrap_root_abs$FRPC_BOOTSTRAP_REL" "$staged_frpc"
-        FRPC_TOML="$staged_frpc"
-    fi
-    if [[ -n "${POST_INSTALL_HOOK_BOOTSTRAP_REL:-}" && -f "$bootstrap_root_abs$POST_INSTALL_HOOK_BOOTSTRAP_REL" ]]; then
-        staged_hook="$INSTALL_TMPDIR/post-install-hook.sh"
-        cp "$bootstrap_root_abs$POST_INSTALL_HOOK_BOOTSTRAP_REL" "$staged_hook"
-        chmod 0700 "$staged_hook"
-        POST_INSTALL_HOOK="$staged_hook"
     fi
 
-    # A fixed 3 GiB tail partition is always used for image staging, even when
-    # there is enough RAM. At this point modloop and the installer itself are in RAM.
     sync
     cd /
     unmount_target_disk_filesystems "$DISK"
@@ -4525,10 +3314,6 @@ do_install() {
     IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
     download_target_image_in_alpine "$IMG_QCOW"
 
-    virtual_size=$(get_qcow_virtual_size_bytes "$IMG_QCOW" || true)
-    disk_size=$(get_disk_size_bytes "$DISK" || true)
-    [[ -n "$virtual_size" && -n "$disk_size" ]] || error "Could not determine qcow2 virtual size or target disk size before write"
-
     inspect_qcow_partition_layout "$IMG_QCOW"
 
     info "Writing qcow2 from the 3 GiB tail staging partition without overwriting its live source..."
@@ -4537,7 +3322,6 @@ do_install() {
     info "Safe qcow2 prefix write finished."
 
     # In sparse-shadow mode the staging partition has already been released
-    # before the final target write. Normal prefix/full-image paths release it here.
     if [[ "${TEMP_STAGE_RELEASED:-0}" != "1" ]]; then
         release_temp_staging_partition
     fi
@@ -4545,7 +3329,6 @@ do_install() {
 
     # Work directly on the image GPT while no target partitions are mapped in the
     # kernel. grow_last_partition_reserving_cidata() repairs the backup GPT,
-    # expands the final data partition, and then performs a single kernel reread.
     sgdisk -e "$DISK" >/dev/null || error "Failed to repair target GPT after releasing staging partition"
 
     grow_last_partition_reserving_cidata
@@ -4571,7 +3354,7 @@ do_install() {
 
     info "Image write, target-partition expansion, and cloud-init NoCloud injection completed."
 
-    run_rhel_freebsd_hook
+    run_post_install_hook
     show_partition_info
 
     FINAL_SSH_PORT="${SSH_PORT:-22}"
@@ -4625,24 +3408,15 @@ do_install() {
 
 # ----------------- main -----------------
 
-detect_env_mode
-
-PHASE="auto"
+PHASE="host"
 if [[ "${1:-}" == "--phase" ]]; then
     shift
     [[ -n "${1:-}" ]] || error "Need value for --phase"
     PHASE="$1"
-    shift || true
+    shift
 fi
 
-if [[ "$PHASE" == "host" ]]; then
-    ENV_MODE="host"
-elif [[ "$PHASE" == "installer" ]]; then
-    ENV_MODE="initramfs"
-fi
-
-# Installer phase: mfsBSD / initramfs / Alpine RAM / explicit --phase installer
-if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" || "$ENV_MODE" == "alpine-ram" ]]; then
+if [[ "$PHASE" == "installer" ]]; then
     TARGET_OS=""
     TARGET_VER=""
     DISK=""
@@ -4662,49 +3436,38 @@ if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" || "$ENV_MODE" == "a
         case "$1" in
             --hold)
                 shift
-                [[ -n "${1:-}" ]] || error "Need value for --hold"
-                [[ "$1" == "1" || "$1" == "2" ]] || error "Invalid --hold: $1 (must be 1 or 2)"
+                [[ "${1:-}" == "1" || "${1:-}" == "2" ]] || error "Invalid --hold"
                 HOLD="$1"
                 ;;
             --yes|--force)
                 AUTO_YES=1
                 ;;
             *)
-                warn "Ignoring argument in installer mode: $1"
+                error "Unknown installer argument: $1"
                 ;;
         esac
-        shift || true
+        shift
     done
 
     INSTALLER_HOLD_OVERRIDE="$HOLD"
-
     detect_os_arch
-    load_plan_from_efi
+    load_install_plan
+    [[ "$INSTALLER_HOLD_OVERRIDE" == "0" ]] || HOLD="$INSTALLER_HOLD_OVERRIDE"
+    [[ "$HOLD" == "1" ]] || ensure_dependencies
 
-    if [[ "$INSTALLER_HOLD_OVERRIDE" != "0" ]]; then
-        HOLD="$INSTALLER_HOLD_OVERRIDE"
-    fi
-    if [[ "$HOLD" != "1" ]]; then
-        ensure_dependencies
-    fi
-
-    if [[ -n "$DISK" && "$DISK" != /dev/* ]]; then
-        DISK="/dev/$DISK"
-    fi
+    [[ -z "$DISK" || "$DISK" == /dev/* ]] || DISK="/dev/$DISK"
     if [[ -z "$DISK" ]]; then
         auto_detect_disk
     else
         resolve_target_disk_from_identity
     fi
-
     validate_target_disk "$DISK"
-
     do_install
     exit 0
 fi
 
-# Host phase: validate the command line prefix before doing anything that can
-# install packages, inspect/select disks, prompt for credentials, or modify state.
+[[ "$PHASE" == "host" ]] || error "Unsupported phase: $PHASE"
+
 if [[ $# -lt 1 ]]; then
     error "Missing target OS. Supported targets: freebsd, rocky, almalinux, fedora, debian, redhat"
 fi
@@ -4930,8 +3693,6 @@ if [[ "$HOLD" == "1" ]]; then
     exit 0
 fi
 
-save_plan_to_efi
-
 echo
 echo "==================== Host stage summary ====================="
 echo "Disk device:  $DISK"
@@ -4964,20 +3725,5 @@ fi
 unset PASSWORD_TO_DISPLAY
 PASSWORD_TO_DISPLAY=""
 
-if [[ "$OS" == "Linux" ]]; then
-    prepare_and_boot_alpine_ram
-    exit 0
-fi
-
-if [[ "$OS" == "FreeBSD" ]]; then
-    prepare_and_boot_alpine_ram_freebsd
-    exit 0
-fi
-
-echo
-echo "Reinstall plan has been saved to EFI."
-echo "Automatic installer bootstrap is not implemented on this host."
-echo "Now configure your system to boot into the installer environment (mfsBSD or initramfs)"
-echo "and reboot manually. When the installer environment starts, this script will"
-echo "automatically load the saved plan and perform the DD + cloud-init NoCloud installation."
+prepare_and_boot_alpine_ram
 exit 0
