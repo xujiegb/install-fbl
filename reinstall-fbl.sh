@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Destructive unattended reinstall for Linux/FreeBSD hosts.
 
 set -Eeuo pipefail
 export LC_ALL=C
@@ -22,66 +21,26 @@ info() {
 usage() {
     cat <<EOF
 Usage:
-  $SCRIPT_NAME freebsd   14|15 [--disk /dev/sdX] [options...]  # major version only
-  $SCRIPT_NAME rocky     10   [--disk /dev/sdX] [options...]
-  $SCRIPT_NAME almalinux 10   [--disk /dev/sdX] [options...]
-  $SCRIPT_NAME fedora    44   [--disk /dev/sdX] [options...]
-  $SCRIPT_NAME debian    13   [--disk /dev/sdX] [options...]
-  $SCRIPT_NAME redhat         [--disk /dev/sdX] --img URL [options...]
-
-If --disk is not specified, the script will try to auto-detect the main disk:
-  - Prefer the disk that backs the current /, /boot, and EFI mountpoints.
-  - If those agree, that disk is recommended first.
-  - If they cannot be resolved confidently, the script refuses to guess; use --disk explicitly.
-  - On host phase, a candidate list is shown and explicit confirmation is required.
+  $SCRIPT_NAME freebsd 14|15 [options]
+  $SCRIPT_NAME rocky 10 [options]
+  $SCRIPT_NAME almalinux 10 [options]
+  $SCRIPT_NAME fedora 44 [options]
+  $SCRIPT_NAME debian 13 [options]
+  $SCRIPT_NAME redhat --img URL [options]
 
 Options:
-  --disk DISK          Target disk, e.g. /dev/sda, /dev/vda, /dev/nvme0n1, /dev/ada0
-                       If you omit /dev/, the script will automatically prefix /dev/.
+  --disk DEVICE          Target disk; auto-detected when omitted
+  --img URL              Override qcow2/qcow2.xz image URL
+  --password PASSWORD    Root password
+  --ssh-key KEY          Public key, file, URL, github:user or gitlab:user; repeatable
+  --ssh-port PORT        SSH port (default 22)
+  --web-port PORT        Write /etc/reinstall-web-port through NoCloud
+  --frpc-toml PATH|URL   Embed/download FRPC config
+  --post-install-hook P  Run hook after image/NoCloud write
+  --hold 1               Validate only
+  --hold 2               Install but do not reboot
 
-  --img URL            Override default image URL (redhat requires this).
-                       Supports http:// and https://
-
-  --password PASSWORD  Set root password.
-                       When using --ssh-key only, password can be empty (SSH key login only).
-
-  --ssh-key KEY        Set SSH public key, can be specified multiple times. Supported forms:
-                         --ssh-key "ssh-rsa AAAA... comment"
-                         --ssh-key "ssh-ed25519 AAAA... comment"
-                         --ssh-key "ecdsa-sha2-nistp256/384/521 AAAA... comment"
-                         --ssh-key http://path/to/public_key
-                         --ssh-key https://path/to/public_key
-                         --ssh-key github:your_username
-                         --ssh-key gitlab:your_username
-                         --ssh-key /path/to/public_key
-                         --ssh-key C:\\path\\to\\public_key   (not supported directly, copy to local file first)
-
-  --ssh-port PORT      Change SSH port in the new system. cloud-init will try to modify
-                       sshd_config and restart sshd. Default is 22 if not specified.
-
-  --web-port PORT      Reserved for web log port. This script only writes it into cloud-init,
-                       you can consume it later from within the system.
-
-  --frpc-toml PATH/URL Add FRPC configuration for tunneling:
-                         - Local path: cache the small file during host phase
-                         - HTTP(S): download from Alpine RAM during installer phase
-                       cloud-init writes it to /etc/frp/frpc.toml and tries to start frpc if available.
-
-  --post-install-hook PATH
-                       Optional explicit post-install hook script to run after image write/injection.
-                       This replaces the old implicit current-directory hook behavior.
-
-  --hold 1             Only validate and print planned actions, do not download or write disk.
-  --hold 2             Perform target-disk write + NoCloud injection but do NOT reboot.
-
-Password / SSH key behaviour:
-  - If you specify one or more --ssh-key, you may omit --password (root login via key only).
-  - If you specify --password, you may omit --ssh-key.
-  - If you specify neither password nor ssh-key:
-      * The script will prompt for a root password.
-      * If you leave it empty, a random 20-character password (A–Z, a–z, 0–9) will be generated.
-      * The generated password will be printed before reboot.
-  - Username is always: root
+If neither password nor SSH key is given, an empty password prompt generates a random password.
 EOF
     exit 1
 }
@@ -186,6 +145,8 @@ lsblk_get_kv() {
         }
     ' <<<"$line"
 }
+
+# ----------------- host preparation -----------------
 
 hash_password() {
     local plain="$1"
@@ -455,117 +416,82 @@ capture_target_disk_identity() {
     info "Target disk identity: serial=${DISK_ID_SERIAL:-unknown} wwn=${DISK_ID_WWN:-unknown} size=${DISK_ID_SIZE:-unknown}"
 }
 
-resolve_target_disk_from_identity() {
-    local matches=() line path typ wwn serial size model d
-    local bootstrap_part="" bootstrap_disk="" bootstrap_size=""
-    local strong_match=0
+list_disk_identities() {
+    local line path type wwn serial size model d
 
-    # stored on disk and remains stable until the destructive write begins.
-    if [[ "$OS" == "Linux" && -n "${PLAN_EFI_UUID:-}" ]] && command -v blkid >/dev/null 2>&1; then
-        bootstrap_part=$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)
-        if [[ -n "$bootstrap_part" && -b "$bootstrap_part" ]]; then
-            bootstrap_disk=$(linux_source_to_disk "$bootstrap_part" || true)
-            if [[ -n "$bootstrap_disk" && -b "$bootstrap_disk" ]]; then
-                bootstrap_size=$(lsblk -b -dn -o SIZE "$bootstrap_disk" 2>/dev/null | head -n1 || true)
-                if [[ -z "${DISK_ID_SIZE:-}" || -z "$bootstrap_size" || "$bootstrap_size" == "$DISK_ID_SIZE" ]]; then
-                    if [[ -n "${DISK:-}" && "$DISK" != "$bootstrap_disk" ]]; then
-                        info "Target disk device name changed: $DISK -> $bootstrap_disk"
-                    fi
-                    info "Resolved target disk from bootstrap filesystem UUID ${PLAN_EFI_UUID}: ${bootstrap_part} -> ${bootstrap_disk}"
-                    DISK="$bootstrap_disk"
-                    return 0
-                fi
-                warn "Bootstrap UUID ${PLAN_EFI_UUID} resolved to ${bootstrap_disk}, but disk size changed (${bootstrap_size} != ${DISK_ID_SIZE}); not trusting it."
-            fi
-        fi
-    fi
-
-    if [[ -z "${DISK_ID_SERIAL:-}" && -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SIZE:-}" ]]; then
-        warn "No saved target disk identity is present; using saved device path: ${DISK:-unset}"
-        return 0
-    fi
-
-    if [[ "$OS" == "Linux" ]]; then
+    if [[ "$OS" == Linux ]]; then
         while IFS= read -r line; do
-            path=$(lsblk_get_kv "$line" "PATH")
-            typ=$(lsblk_get_kv "$line" "TYPE")
-            wwn=$(normalize_disk_wwn "$(lsblk_get_kv "$line" "WWN")")
-            serial=$(lsblk_get_kv "$line" "SERIAL")
-            size=$(lsblk_get_kv "$line" "SIZE")
-            model=$(lsblk_get_kv "$line" "MODEL")
-            [[ "$typ" == "disk" && -n "$path" ]] || continue
-
-            [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
-
-            strong_match=0
-            if [[ -n "${DISK_ID_WWN:-}" && -n "$wwn" && "$wwn" == "$DISK_ID_WWN" ]]; then
-                strong_match=1
-            elif [[ -n "${DISK_ID_SERIAL:-}" && -n "$serial" && "$serial" == "$DISK_ID_SERIAL" ]]; then
-                strong_match=1
-            fi
-
-            if [[ "$strong_match" -eq 1 ]]; then
-                matches+=("$path")
-                continue
-            fi
-
-            if [[ -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SERIAL:-}" ]]; then
-                [[ -n "${DISK_ID_SIZE:-}" && "$size" == "$DISK_ID_SIZE" ]] || continue
-                if [[ -n "${DISK_ID_MODEL:-}" ]]; then
-                    [[ "$model" == "$DISK_ID_MODEL" ]] || continue
-                fi
-                matches+=("$path")
-            fi
-        done < <(lsblk -b -dn -P -o PATH,TYPE,WWN,SERIAL,SIZE,MODEL 2>/dev/null || true)
-    else
-        for d in $(sysctl -n kern.disks 2>/dev/null || true); do
-            path="/dev/$d"
-            serial=$(diskinfo -s "$path" 2>/dev/null | head -n1 || true)
-            size=$(diskinfo "$path" 2>/dev/null | awk 'NR==1 {print $3; exit}' || true)
-            wwn=""
-            model=""
-            if command -v geom >/dev/null 2>&1; then
-                wwn=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*lunid:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
-                wwn=$(normalize_disk_wwn "$wwn")
-                model=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*descr:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
-            fi
-
-            [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
-
-            strong_match=0
-            if [[ -n "${DISK_ID_WWN:-}" && -n "$wwn" && "$wwn" == "$DISK_ID_WWN" ]]; then
-                strong_match=1
-            elif [[ -n "${DISK_ID_SERIAL:-}" && -n "$serial" && "$serial" == "$DISK_ID_SERIAL" ]]; then
-                strong_match=1
-            fi
-
-            if [[ "$strong_match" -eq 1 ]]; then
-                matches+=("$path")
-                continue
-            fi
-
-            if [[ -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SERIAL:-}" ]]; then
-                [[ -n "${DISK_ID_SIZE:-}" && "$size" == "$DISK_ID_SIZE" ]] || continue
-                if [[ -n "${DISK_ID_MODEL:-}" ]]; then
-                    [[ "$model" == "$DISK_ID_MODEL" ]] || continue
-                fi
-                matches+=("$path")
-            fi
-        done
+            type=$(lsblk_get_kv "$line" TYPE)
+            [[ "$type" == disk ]] || continue
+            path=$(lsblk_get_kv "$line" PATH)
+            wwn=$(normalize_disk_wwn "$(lsblk_get_kv "$line" WWN)")
+            serial=$(lsblk_get_kv "$line" SERIAL)
+            size=$(lsblk_get_kv "$line" SIZE)
+            model=$(lsblk_get_kv "$line" MODEL)
+            printf '%s|%s|%s|%s|%s\n' "$path" "$wwn" "$serial" "$size" "$model"
+        done < <(lsblk -b -dn -P -o PATH,TYPE,WWN,SERIAL,SIZE,MODEL 2>/dev/null)
+        return
     fi
 
-    if [[ "${#matches[@]}" -ne 1 ]]; then
-        warn "Saved target identity: path=${DISK:-unset} wwn=${DISK_ID_WWN:-none} serial=${DISK_ID_SERIAL:-none} size=${DISK_ID_SIZE:-none} model=${DISK_ID_MODEL:-none} bootstrap_uuid=${PLAN_EFI_UUID:-none}"
-        if [[ "$OS" == "Linux" ]]; then
-            warn "Disks visible in installer environment:"
-            lsblk -b -dn -o PATH,TYPE,WWN,SERIAL,SIZE,MODEL 2>/dev/null >&2 || true
-        fi
-        error "Saved target disk identity matched ${#matches[@]} disks; refusing destructive write. Matches: ${matches[*]:-(none)}"
+    for d in $(sysctl -n kern.disks 2>/dev/null || true); do
+        path="/dev/$d"
+        serial=$(diskinfo -s "$path" 2>/dev/null | head -n1 || true)
+        size=$(diskinfo "$path" 2>/dev/null | awk 'NR==1 {print $3; exit}')
+        wwn=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*lunid:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
+        model=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*descr:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
+        printf '%s|%s|%s|%s|%s\n' "$path" "$(normalize_disk_wwn "$wwn")" "$serial" "$size" "$model"
+    done
+}
+
+disk_identity_matches() {
+    local wwn="$1" serial="$2" size="$3" model="$4"
+    [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || return 1
+
+    if [[ -n "${DISK_ID_WWN:-}" && -n "$wwn" ]]; then
+        [[ "$wwn" == "$DISK_ID_WWN" ]] && return 0
+    fi
+    if [[ -n "${DISK_ID_SERIAL:-}" && -n "$serial" ]]; then
+        [[ "$serial" == "$DISK_ID_SERIAL" ]] && return 0
     fi
 
-    if [[ -n "${DISK:-}" && "$DISK" != "${matches[0]}" ]]; then
-        info "Target disk device name changed: $DISK -> ${matches[0]}"
+    [[ -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SERIAL:-}" ]] || return 1
+    [[ -n "${DISK_ID_SIZE:-}" ]] || return 1
+    [[ -z "${DISK_ID_MODEL:-}" || "$model" == "$DISK_ID_MODEL" ]]
+}
+
+resolve_bootstrap_disk_by_uuid() {
+    [[ "$OS" == Linux && -n "${PLAN_EFI_UUID:-}" ]] || return 1
+    command -v blkid >/dev/null 2>&1 || return 1
+
+    local part disk size
+    part=$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)
+    [[ -b "$part" ]] || return 1
+    disk=$(linux_source_to_disk "$part" || true)
+    [[ -b "$disk" ]] || return 1
+    size=$(lsblk -b -dn -o SIZE "$disk" 2>/dev/null | head -n1)
+    [[ -z "${DISK_ID_SIZE:-}" || -z "$size" || "$size" == "$DISK_ID_SIZE" ]] || return 1
+
+    [[ -z "${DISK:-}" || "$DISK" == "$disk" ]] || info "Target disk device changed: $DISK -> $disk"
+    info "Resolved target disk from bootstrap UUID $PLAN_EFI_UUID: $part -> $disk"
+    DISK="$disk"
+}
+
+resolve_target_disk_from_identity() {
+    local row path wwn serial size model matches=()
+
+    resolve_bootstrap_disk_by_uuid && return 0
+    [[ -n "${DISK_ID_SERIAL:-}${DISK_ID_WWN:-}${DISK_ID_SIZE:-}" ]] || return 0
+
+    while IFS='|' read -r path wwn serial size model; do
+        disk_identity_matches "$wwn" "$serial" "$size" "$model" && matches+=("$path")
+    done < <(list_disk_identities)
+
+    if ((${#matches[@]} != 1)); then
+        warn "Saved disk: path=${DISK:-unset} wwn=${DISK_ID_WWN:-none} serial=${DISK_ID_SERIAL:-none} size=${DISK_ID_SIZE:-none}"
+        error "Saved target identity matched ${#matches[@]} disks; refusing destructive write"
     fi
+
+    [[ -z "${DISK:-}" || "$DISK" == "${matches[0]}" ]] || info "Target disk device changed: $DISK -> ${matches[0]}"
     DISK="${matches[0]}"
 }
 
@@ -816,187 +742,103 @@ confirm_auto_detected_disk_host() {
     done
 }
 
+candidate_add() {
+    local path="$1" size="$2" tags="${3:-}" note="${4:-}" line
+    DISK_CANDIDATE_COUNT=$((DISK_CANDIDATE_COUNT + 1))
+    line=$(printf '  [%d] %-16s size=%s bytes' "$DISK_CANDIDATE_COUNT" "$path" "$size")
+    [[ -z "$tags" ]] || line+=" markers:$tags"
+    [[ -z "$note" ]] || line+=" ($note)"
+    DISK_CANDIDATE_LINES+="${DISK_CANDIDATE_LINES:+$'\n'}$line"
+}
+
+select_detected_disk() {
+    DISK="$1"
+    AUTO_DETECTED_DISK="$1"
+    AUTO_DETECT_REASON="$2"
+    DISK_AUTO_SELECTED=1
+    info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
+}
+
+auto_detect_linux_disk() {
+    local root boot efi preferred reason="" name type rm size path tags
+
+    command -v lsblk >/dev/null 2>&1 || error "lsblk is required for Linux disk auto-detection"
+
+    root=$(linux_current_root_disk || true)
+    boot=$(linux_current_boot_disk || true)
+    efi=$(linux_current_efi_disk || true)
+
+    [[ -z "$root" ]] || info "Current /: $root"
+    [[ -z "$boot" ]] || info "Current /boot: $boot"
+    [[ -z "$efi" ]] || info "Current EFI: $efi"
+
+    if [[ -n "$root" && "$root" == "$boot" && "$root" == "$efi" ]]; then
+        preferred="$root"; reason="/, /boot and EFI resolve to this disk"
+    elif [[ -n "$root" ]]; then
+        preferred="$root"; reason="current / resolves to this disk"
+    elif [[ -n "$boot" ]]; then
+        preferred="$boot"; reason="current /boot resolves to this disk"
+    else
+        preferred="$efi"; reason="current EFI resolves to this disk"
+    fi
+
+    while read -r name type rm size; do
+        [[ "$type" == disk && "$rm" == 0 ]] || continue
+        path="/dev/$name"
+        tags=""
+        [[ "$path" != "$root" ]] || tags+=" root"
+        [[ "$path" != "$boot" ]] || tags+=" boot"
+        [[ "$path" != "$efi" ]] || tags+=" efi"
+        [[ "$path" != "$preferred" ]] || tags+=" recommended"
+        candidate_add "$path" "$size" "$tags" "$([[ "$path" == "$preferred" ]] && echo "$reason")"
+    done < <(lsblk -b -ndo NAME,TYPE,RM,SIZE 2>/dev/null)
+
+    [[ -n "$preferred" ]] || error "Unable to identify the current Linux system disk; use --disk"
+    select_detected_disk "$preferred" "$reason"
+}
+
+auto_detect_freebsd_disk() {
+    local disks root_source root_disk d size count=0 only="" tags note
+    disks=$(sysctl -n kern.disks 2>/dev/null || true)
+    [[ -n "$disks" ]] || error "kern.disks is empty; use --disk"
+
+    root_source=$(freebsd_mount_source_for "/" || true)
+    root_disk=$(freebsd_provider_to_disk "$root_source" || true)
+    [[ -z "$root_source" ]] || info "Current /: $root_source"
+    [[ -z "$root_disk" ]] || info "Current / through GEOM: $root_disk"
+
+    for d in $disks; do
+        case "$d" in cd*|md*|lo*|ram*) continue ;; esac
+        size=$(diskinfo "/dev/$d" 2>/dev/null | awk 'NR==1 {print $3; exit}')
+        size=${size:-0}
+        count=$((count + 1)); only="/dev/$d"; tags=""; note=""
+        if [[ "$only" == "$root_disk" ]]; then
+            tags=" root recommended"
+            note="current / resolves through GEOM to this disk"
+        fi
+        candidate_add "$only" "$size" "$tags" "$note"
+    done
+
+    if [[ -n "$root_disk" ]] && grep -qw "${root_disk#/dev/}" <<<"$disks"; then
+        select_detected_disk "$root_disk" "current / resolves through FreeBSD GEOM to this disk"
+        return
+    fi
+    [[ "$count" == 1 ]] && { select_detected_disk "$only" "only usable physical disk"; return; }
+    error "Unable to identify the FreeBSD system disk confidently; use --disk"
+}
+
 auto_detect_disk() {
     info "Auto-detecting target disk..."
-
     DISK_CANDIDATE_LINES=""
+    DISK_CANDIDATE_COUNT=0
     AUTO_DETECTED_DISK=""
     AUTO_DETECT_REASON=""
     DISK_AUTO_SELECTED=0
 
-    if [[ "$OS" == "Linux" ]]; then
-        if command -v lsblk >/dev/null 2>&1; then
-            local best_name="" best_size=0
-            local root_disk="" boot_disk="" efi_disk=""
-            local preferred=""
-            local idx=0
-            local line name type rm size disk_path marker reason
-
-            root_disk=$(linux_current_root_disk || true)
-            boot_disk=$(linux_current_boot_disk || true)
-            efi_disk=$(linux_current_efi_disk || true)
-
-            if [[ -n "$root_disk" ]]; then
-                info "Current / appears to be on: $root_disk"
-            fi
-            if [[ -n "$boot_disk" ]]; then
-                info "Current /boot appears to be on: $boot_disk"
-            fi
-            if [[ -n "$efi_disk" ]]; then
-                info "Current EFI appears to be on: $efi_disk"
-            fi
-
-            if [[ -n "$root_disk" && -n "$boot_disk" && -n "$efi_disk" &&
-                  "$root_disk" == "$boot_disk" && "$boot_disk" == "$efi_disk" ]]; then
-                preferred="$root_disk"
-                AUTO_DETECT_REASON="current /, /boot, and EFI all resolve to the same disk"
-            elif [[ -n "$root_disk" ]]; then
-                preferred="$root_disk"
-                AUTO_DETECT_REASON="current / resolves to this disk"
-            elif [[ -n "$boot_disk" ]]; then
-                preferred="$boot_disk"
-                AUTO_DETECT_REASON="current /boot resolves to this disk"
-            elif [[ -n "$efi_disk" ]]; then
-                preferred="$efi_disk"
-                AUTO_DETECT_REASON="current EFI resolves to this disk"
-            fi
-
-            while read -r name type rm size; do
-                [[ "$type" == "disk" ]] || continue
-                [[ "$rm" == "0" ]] || continue
-
-                disk_path="/dev/$name"
-                marker=""
-                reason=""
-
-                if [[ -n "$root_disk" && "$disk_path" == "$root_disk" ]]; then
-                    marker+=" root"
-                fi
-                if [[ -n "$boot_disk" && "$disk_path" == "$boot_disk" ]]; then
-                    marker+=" boot"
-                fi
-                if [[ -n "$efi_disk" && "$disk_path" == "$efi_disk" ]]; then
-                    marker+=" efi"
-                fi
-                if [[ -n "$preferred" && "$disk_path" == "$preferred" ]]; then
-                    marker+=" recommended"
-                    reason="$AUTO_DETECT_REASON"
-                fi
-
-                idx=$(( idx + 1 ))
-                if [[ -n "$DISK_CANDIDATE_LINES" ]]; then
-                    DISK_CANDIDATE_LINES+=$'\n'
-                fi
-                if [[ -n "$marker" ]]; then
-                    DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes markers:%s%s' "$idx" "$disk_path" "$size" "$marker" "${reason:+ ($reason)}")
-                else
-                    DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes' "$idx" "$disk_path" "$size")
-                fi
-
-                if [[ "$size" -gt "$best_size" ]]; then
-                    best_size="$size"
-                    best_name="$name"
-                fi
-            done < <(lsblk -b -ndo NAME,TYPE,RM,SIZE 2>/dev/null || true)
-
-            if [[ -n "$preferred" ]]; then
-                AUTO_DETECTED_DISK="$preferred"
-                DISK="$preferred"
-                DISK_AUTO_SELECTED=1
-                info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
-                return 0
-            fi
-
-            if [[ -n "$best_name" ]]; then
-                warn "Could not resolve the current system disk confidently. Refusing to choose the largest disk automatically."
-            fi
-        fi
-        error "Unable to auto-detect target disk on Linux. Please specify --disk explicitly."
-    else
-        if command -v sysctl >/dev/null 2>&1; then
-            local disks size d idx=0 candidate_count=0
-            local only_disk="" root_source="" root_disk=""
-            local marker="" reason=""
-
-            disks=$(sysctl -n kern.disks 2>/dev/null || true)
-
-            root_source=$(freebsd_mount_source_for "/" || true)
-            if [[ -n "$root_source" ]]; then
-                info "Current / is mounted from: $root_source"
-                root_disk=$(freebsd_provider_to_disk "$root_source" || true)
-                if [[ -n "$root_disk" ]]; then
-                    info "Current / resolves through GEOM to: $root_disk"
-                fi
-            fi
-
-            for d in $disks; do
-                case "$d" in
-                    cd*|md*|lo*|ram*) continue ;;
-                esac
-
-                if command -v diskinfo >/dev/null 2>&1; then
-                    size=$(diskinfo "/dev/$d" 2>/dev/null | awk 'NR==1 {print $3; exit}')
-                else
-                    size=0
-                fi
-                [[ -z "$size" ]] && size=0
-
-                candidate_count=$(( candidate_count + 1 ))
-                only_disk="/dev/$d"
-                marker=""
-                reason=""
-
-                if [[ -n "$root_disk" && "/dev/$d" == "$root_disk" ]]; then
-                    marker=" root recommended"
-                    reason="current / resolves through FreeBSD GEOM to this disk"
-                fi
-
-                idx=$(( idx + 1 ))
-                if [[ -n "$DISK_CANDIDATE_LINES" ]]; then
-                    DISK_CANDIDATE_LINES+=$'\n'
-                fi
-
-                if [[ -n "$marker" ]]; then
-                    DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes markers:%s (%s)' \
-                        "$idx" "/dev/$d" "$size" "$marker" "$reason")
-                else
-                    DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes' \
-                        "$idx" "/dev/$d" "$size")
-                fi
-            done
-
-            if [[ -n "$root_disk" ]]; then
-                for d in $disks; do
-                    case "$d" in
-                        cd*|md*|lo*|ram*) continue ;;
-                    esac
-                    if [[ "/dev/$d" == "$root_disk" ]]; then
-                        AUTO_DETECTED_DISK="$root_disk"
-                        DISK="$root_disk"
-                        AUTO_DETECT_REASON="current / resolves through FreeBSD GEOM to this disk"
-                        DISK_AUTO_SELECTED=1
-                        info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
-                        return 0
-                    fi
-                done
-                warn "Current root resolved to $root_disk, but it is not present in the usable kern.disks candidate list."
-            fi
-
-            if [[ "$candidate_count" -eq 1 && -n "$only_disk" ]]; then
-                AUTO_DETECTED_DISK="$only_disk"
-                DISK="$only_disk"
-                AUTO_DETECT_REASON="only one usable physical disk is present"
-                DISK_AUTO_SELECTED=1
-                info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
-                return 0
-            fi
-
-            if [[ "$candidate_count" -gt 1 ]]; then
-                warn "Multiple FreeBSD disks are present and the current root disk could not be resolved confidently."
-            fi
-        fi
-        error "Unable to auto-detect target disk on FreeBSD. Please specify --disk explicitly."
-    fi
+    case "$OS" in
+        Linux)   auto_detect_linux_disk ;;
+        FreeBSD) auto_detect_freebsd_disk ;;
+    esac
 }
 
 show_partition_info() {
@@ -1102,296 +944,189 @@ Available options:
 }
 
 get_default_image_url() {
-    local os="$1" ver="$2"
+    local key="$1:$2:$MACHINE_ARCH"
 
-    case "$os" in
-        freebsd)
-            case "$ver" in
-                14)
-                    case "$MACHINE_ARCH" in
-                        x86_64)
-                            echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/amd64/Latest/FreeBSD-14.5-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
-                            ;;
-                        aarch64)
-                            echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/aarch64/Latest/FreeBSD-14.5-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
-                            ;;
-                        *)
-                            error "Current arch $MACHINE_ARCH is not supported for automatic FreeBSD image selection, please specify --img manually"
-                            ;;
-                    esac
-                    ;;
-                15)
-                    case "$MACHINE_ARCH" in
-                        x86_64)
-                            echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
-                            ;;
-                        aarch64)
-                            echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
-                            ;;
-                        *)
-                            error "Current arch $MACHINE_ARCH is not supported for automatic FreeBSD image selection, please specify --img manually"
-                            ;;
-                    esac
-                    ;;
-                *)
-                    error "Unsupported FreeBSD major version: $ver (supported: 14 -> latest 14.x, 15 -> latest 15.x)"
-                    ;;
-            esac
-            ;;
-        rocky)
-            case "$ver" in
-                10)
-                    case "$MACHINE_ARCH" in
-                        x86_64)
-                            echo "https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-EC2-LVM.latest.x86_64.qcow2"
-                            ;;
-                        aarch64)
-                            echo "https://download.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-EC2-LVM.latest.aarch64.qcow2"
-                            ;;
-                        *)
-                            error "Current arch $MACHINE_ARCH is not supported for automatic Rocky image selection, please specify --img manually"
-                            ;;
-                    esac
-                    ;;
-                *)
-                    error "Unsupported Rocky version: $ver (future: add rocky 9, etc.)"
-                    ;;
-            esac
-            ;;
-        almalinux)
-            case "$ver" in
-                10)
-                    case "$MACHINE_ARCH" in
-                        x86_64)
-                            echo "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2"
-                            ;;
-                        aarch64)
-                            echo "https://repo.almalinux.org/almalinux/10/cloud/aarch64/images/AlmaLinux-10-GenericCloud-latest.aarch64.qcow2"
-                            ;;
-                        *)
-                            error "Current arch $MACHINE_ARCH is not supported for automatic AlmaLinux image selection, please specify --img manually"
-                            ;;
-                    esac
-                    ;;
-                *)
-                    error "Unsupported AlmaLinux version: $ver"
-                    ;;
-            esac
-            ;;
-        fedora)
-            case "$ver" in
-                44)
-                    case "$MACHINE_ARCH" in
-                        x86_64)
-                            echo "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
-                            ;;
-                        aarch64)
-                            echo "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
-                            ;;
-                        *)
-                            error "Current arch $MACHINE_ARCH is not supported for automatic Fedora image selection, please specify --img manually"
-                            ;;
-                    esac
-                    ;;
-                *)
-                    error "Unsupported Fedora version: $ver"
-                    ;;
-            esac
-            ;;
-        debian)
-            case "$ver" in
-                13)
-                    case "$MACHINE_ARCH" in
-                        x86_64)
-                            echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2"
-                            ;;
-                        aarch64)
-                            echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2"
-                            ;;
-                        *)
-                            error "Current arch $MACHINE_ARCH is not supported for automatic Debian image selection, please specify --img manually"
-                            ;;
-                    esac
-                    ;;
-                *)
-                    error "Unsupported Debian version: $ver (supported: 13)"
-                    ;;
-            esac
-            ;;
-        redhat)
-            echo ""
-            ;;
-        *)
-            error "Unknown target OS: $os"
-            ;;
+    case "$key" in
+        freebsd:14:x86_64)  echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/amd64/Latest/FreeBSD-14.5-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
+        freebsd:14:aarch64) echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/aarch64/Latest/FreeBSD-14.5-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
+        freebsd:15:x86_64)  echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
+        freebsd:15:aarch64) echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
+        rocky:10:x86_64)    echo "https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-EC2-LVM.latest.x86_64.qcow2" ;;
+        rocky:10:aarch64)   echo "https://download.rockylinux.org/pub/rocky/10/images/aarch64/Rocky-10-EC2-LVM.latest.aarch64.qcow2" ;;
+        almalinux:10:x86_64)  echo "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2" ;;
+        almalinux:10:aarch64) echo "https://repo.almalinux.org/almalinux/10/cloud/aarch64/images/AlmaLinux-10-GenericCloud-latest.aarch64.qcow2" ;;
+        fedora:44:x86_64)   echo "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2" ;;
+        fedora:44:aarch64)  echo "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2" ;;
+        debian:13:x86_64)   echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2" ;;
+        debian:13:aarch64)  echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2" ;;
+        redhat::*)           echo "" ;;
+        *) error "No built-in image for $1 $2 on $MACHINE_ARCH; use --img URL" ;;
     esac
 }
 
-write_nocloud_seed() {
-    local os="$1" meta_path="$2" user_path="$3"
-    local frpc_b64=""
+# ----------------- NoCloud seed -----------------
 
-    mkdir -p "$(dirname "$meta_path")"
+emit_ssh_keys() {
+    local indent="$1" key
+    while IFS= read -r key; do
+        [[ -n "$key" ]] && printf '%s- %s\n' "$indent" "$key"
+    done <<<"$SSH_KEYS_ALL"
+}
 
-    cat >"$meta_path" <<EOF
-instance-id: iid-$(date +%s)
-local-hostname: localhost
-EOF
+seed_account_freebsd() {
+    echo "disable_root: false"
+    echo "ssh_pwauth: $([[ -n "$PASSWORD_HASH" ]] && echo true || echo false)"
 
-    if [[ -n "${FRPC_PRESENT:-}" && -n "${FRPC_TOML:-}" && -f "$FRPC_TOML" ]]; then
-        frpc_b64=$(base64 <"$FRPC_TOML" | tr -d '\n')
+    if [[ -n "$SSH_KEYS_ALL" ]]; then
+        echo "ssh_authorized_keys:"
+        emit_ssh_keys "  "
     fi
 
-    {
-        echo "#cloud-config"
+    [[ -n "$PASSWORD_HASH" ]] || return 0
+    cat <<EOF
 
-        if [[ "$os" == "freebsd" ]]; then
-            echo "disable_root: false"
+chpasswd:
+  expire: false
+  users:
+    - name: root
+      password: "${PASSWORD_HASH}"
+EOF
+}
 
-            if [[ -n "$PASSWORD_HASH" ]]; then
-                echo "ssh_pwauth: true"
-            else
-                echo "ssh_pwauth: false"
-            fi
+seed_account_linux() {
+    cat <<'EOF'
+preserve_hostname: false
+hostname: localhost
+prefer_fqdn_over_hostname: false
+EOF
 
-            if [[ -n "$SSH_KEYS_ALL" ]]; then
-                echo "ssh_authorized_keys:"
-                while IFS= read -r line; do
-                    [[ -n "$line" ]] || continue
-                    printf '  - %s\n' "$line"
-                done <<<"$SSH_KEYS_ALL"
-            fi
+    [[ -n "$PASSWORD_HASH" || -n "$SSH_KEYS_ALL" ]] || return 0
 
-            if [[ -n "$PASSWORD_HASH" ]]; then
-                echo
-                echo "chpasswd:"
-                echo "  expire: false"
-                echo "  users:"
-                echo "    - name: root"
-                echo "      password: \"${PASSWORD_HASH}\""
-            fi
-        else
-            echo "preserve_hostname: false"
-            echo "hostname: localhost"
-            echo "prefer_fqdn_over_hostname: false"
+    echo "ssh_pwauth: $([[ -n "$PASSWORD_HASH" ]] && echo true || echo false)"
+    echo "disable_root: false"
+    echo "users:"
+    echo "  - name: root"
 
-            if [[ -n "$PASSWORD_HASH" || -n "$SSH_KEYS_ALL" ]]; then
-                if [[ -n "$PASSWORD_HASH" ]]; then
-                    echo "ssh_pwauth: true"
-                else
-                    echo "ssh_pwauth: false"
-                fi
-                echo "disable_root: false"
-                echo "users:"
-                echo "  - name: root"
+    if [[ -n "$PASSWORD_HASH" ]]; then
+        echo "    lock_passwd: false"
+        echo "    hashed_passwd: \"${PASSWORD_HASH}\""
+    else
+        echo "    lock_passwd: true"
+    fi
 
-                if [[ -n "$PASSWORD_HASH" ]]; then
-                    echo "    lock_passwd: false"
-                    echo "    hashed_passwd: \"${PASSWORD_HASH}\""
-                else
-                    echo "    lock_passwd: true"
-                fi
+    [[ -n "$SSH_KEYS_ALL" ]] || return 0
+    echo "    ssh_authorized_keys:"
+    emit_ssh_keys "      "
+}
 
-                if [[ -n "$SSH_KEYS_ALL" ]]; then
-                    echo "    ssh_authorized_keys:"
-                    while IFS= read -r line; do
-                        [[ -n "$line" ]] || continue
-                        printf '      - %s\n' "$line"
-                    done <<<"$SSH_KEYS_ALL"
-                fi
-            fi
-        fi
+seed_write_files() {
+    local frpc_b64="$1"
+    [[ -n "$WEB_PORT" || -n "$frpc_b64" ]] || return 0
 
-        if [[ -n "$WEB_PORT" || -n "$frpc_b64" ]]; then
-            echo
-            echo "write_files:"
-        fi
+    echo
+    echo "write_files:"
 
-        if [[ -n "$WEB_PORT" ]]; then
-            cat <<EOF
+    [[ -z "$WEB_PORT" ]] || cat <<EOF
   - path: /etc/reinstall-web-port
     permissions: '0644'
     owner: root:root
     content: |
       $WEB_PORT
 EOF
-        fi
 
-        if [[ -n "$frpc_b64" ]]; then
-            cat <<EOF
+    [[ -z "$frpc_b64" ]] || cat <<EOF
   - path: /etc/frp/frpc.toml
     permissions: '0600'
     owner: root:root
     encoding: b64
     content: $frpc_b64
 EOF
-        fi
+}
 
-        if [[ -n "$SSH_PORT" || -n "$frpc_b64" || "$os" == "freebsd" ]]; then
-            echo
-            echo "runcmd:"
-        fi
-
-        if [[ "$os" == "freebsd" ]]; then
-            cat <<EOF
+seed_runcmd_freebsd() {
+    cat <<EOF
   - |
-      if [ -f /etc/ssh/sshd_config ]; then
-        awk '
-          /^[[:space:]]*PermitRootLogin[[:space:]]+/ { next }
-          /^[[:space:]]*PasswordAuthentication[[:space:]]+/ { next }
-          { print }
-          END {
-            if ("${PASSWORD_HASH}" != "") {
-              print "PermitRootLogin yes"
-              print "PasswordAuthentication yes"
-            } else {
-              print "PermitRootLogin prohibit-password"
-              print "PasswordAuthentication no"
-            }
+      awk '
+        /^[[:space:]]*PermitRootLogin[[:space:]]+/ { next }
+        /^[[:space:]]*PasswordAuthentication[[:space:]]+/ { next }
+        { print }
+        END {
+          if ("${PASSWORD_HASH}" != "") {
+            print "PermitRootLogin yes"
+            print "PasswordAuthentication yes"
+          } else {
+            print "PermitRootLogin prohibit-password"
+            print "PasswordAuthentication no"
           }
-        ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
-        cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
-        rm -f /tmp/sshd_config.reinstall
-      fi
+        }
+      ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
+      cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
+      rm -f /tmp/sshd_config.reinstall
       service sshd restart 2>/dev/null || true
 EOF
-        fi
+}
 
-        if [[ -n "$SSH_PORT" ]]; then
-            cat <<EOF
+seed_runcmd_ssh_port() {
+    [[ -n "$SSH_PORT" ]] || return 0
+    cat <<EOF
   - |
-      if [ -f /etc/ssh/sshd_config ]; then
-        awk '
-          /^[[:space:]]*Port[[:space:]]+/ { next }
-          { print }
-          END { print "Port ${SSH_PORT}" }
-        ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
-        cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
-        rm -f /tmp/sshd_config.reinstall
-      fi
+      awk '
+        /^[[:space:]]*Port[[:space:]]+/ { next }
+        { print }
+        END { print "Port ${SSH_PORT}" }
+      ' /etc/ssh/sshd_config > /tmp/sshd_config.reinstall && \
+      cat /tmp/sshd_config.reinstall > /etc/ssh/sshd_config && \
+      rm -f /tmp/sshd_config.reinstall
       if command -v semanage >/dev/null 2>&1; then
         semanage port -a -t ssh_port_t -p tcp ${SSH_PORT} 2>/dev/null || \
         semanage port -m -t ssh_port_t -p tcp ${SSH_PORT} 2>/dev/null || true
       fi
-      if command -v sshd >/dev/null 2>&1; then
-        sshd -t || exit 1
-      fi
-      systemctl restart sshd 2>/dev/null || \
-      systemctl restart ssh 2>/dev/null || \
-      service sshd restart 2>/dev/null || \
-      service ssh restart 2>/dev/null || exit 1
+      sshd -t 2>/dev/null || true
+      systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || \
+      service sshd restart 2>/dev/null || service ssh restart 2>/dev/null || true
 EOF
-        fi
+}
 
-        if [[ -n "$frpc_b64" ]]; then
-            cat <<'EOF'
+seed_runcmd_frpc() {
+    [[ -n "$1" ]] || return 0
+    cat <<'EOF'
   - |
-      if [ -f /etc/frp/frpc.toml ]; then
-        (frpc -c /etc/frp/frpc.toml || /usr/local/bin/frpc -c /etc/frp/frpc.toml || true) &
-      fi
+      (frpc -c /etc/frp/frpc.toml || /usr/local/bin/frpc -c /etc/frp/frpc.toml || true) &
 EOF
-        fi
-    } >"$user_path"
+}
+
+seed_runcmd() {
+    local os="$1" frpc_b64="$2"
+    [[ "$os" == "freebsd" || -n "$SSH_PORT" || -n "$frpc_b64" ]] || return 0
+
+    echo
+    echo "runcmd:"
+    [[ "$os" != "freebsd" ]] || seed_runcmd_freebsd
+    seed_runcmd_ssh_port
+    seed_runcmd_frpc "$frpc_b64"
+}
+
+write_nocloud_seed() {
+    local os="$1" meta="$2" user="$3" frpc_b64=""
+
+    mkdir -p "$(dirname "$meta")"
+    cat >"$meta" <<EOF
+instance-id: iid-$(date +%s)
+local-hostname: localhost
+EOF
+
+    [[ -z "${FRPC_PRESENT:-}" || -z "${FRPC_TOML:-}" || ! -f "$FRPC_TOML" ]] || \
+        frpc_b64=$(base64 <"$FRPC_TOML" | tr -d '\n')
+
+    {
+        echo "#cloud-config"
+        case "$os" in
+            freebsd) seed_account_freebsd ;;
+            *)       seed_account_linux ;;
+        esac
+        seed_write_files "$frpc_b64"
+        seed_runcmd "$os" "$frpc_b64"
+    } >"$user"
 }
 
 # ----------------- bootstrap state -----------------
@@ -1980,7 +1715,7 @@ setup_work_tmpfs() {
 }
 
 relocate_modloop_to_ram() {
-    local loopdev backing ram_modloop kver new_loopdev boot_mnt
+    local loopdev backing ram_modloop kver new_loopdev
 
     kver="$(uname -r)"
 
@@ -2126,16 +1861,10 @@ rm -f /etc/runlevels/sysinit/modloop 2>/dev/null || true
 
 echo "[init] bringing up Alpine sysinit services"
 
-if ! /sbin/openrc sysinit; then
-    echo "[init] openrc sysinit failed; falling back to normal Alpine init."
-    exec /sbin/init
-fi
+/sbin/openrc sysinit || exec /sbin/init
 
 echo "[init] bringing up Alpine boot services"
-if ! /sbin/openrc boot; then
-    echo "[init] openrc boot failed; falling back to normal Alpine init."
-    exec /sbin/init
-fi
+/sbin/openrc boot || exec /sbin/init
 
 echo "[init] launching reinstall runner directly"
 if /usr/local/sbin/reinstall-auto.sh; then
@@ -2190,135 +1919,60 @@ EOF
     "$GRUB_REBOOT_CMD" "${ALPINE_ENTRY_TITLE}"
 }
 
-build_freebsd_grub_efi() {
-    ensure_freebsd_boot_tools
-
-    [[ "$PLAN_STORAGE_MODE" == "efi" ]] || \
-        error "FreeBSD automatic bootstrap requires EFI storage"
-    [[ "$PLAN_EFI_UUID" =~ ^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$ ]] || \
-        error "Could not determine FAT EFI filesystem UUID on FreeBSD: ${PLAN_EFI_UUID:-unset}"
-
-    local alpine_release iso_url efi_name
-    local FREEBSD_ALPINE_CONSOLE_ARGS
-    local tmp iso member volid marker offset
-    local old_cfg new_cfg old_len new_len pad
-    local expected_file before_file patch_file
-
-    alpine_release="${ALPINE_NETBOOT_SUBDIR#netboot-}"
-
+freebsd_grub_arch() {
     case "$ALPINE_NETBOOT_ARCH" in
         x86_64)
-            efi_name="bootx64.efi"
+            FREEBSD_GRUB_EFI_NAME="bootx64.efi"
             FREEBSD_ALPINE_CONSOLE_ARGS="console=tty0 console=ttyS0,115200n8"
             ;;
         aarch64)
-            efi_name="bootaa64.efi"
+            FREEBSD_GRUB_EFI_NAME="bootaa64.efi"
             FREEBSD_ALPINE_CONSOLE_ARGS="console=tty0 console=ttyS0,115200n8 console=ttyAMA0,115200n8"
             ;;
-        *)
-            error "Unsupported FreeBSD UEFI bootstrap arch: $ALPINE_NETBOOT_ARCH"
-            ;;
+        *) error "Unsupported UEFI bootstrap arch: $ALPINE_NETBOOT_ARCH" ;;
     esac
+}
 
-    iso_url="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/alpine-virt-${alpine_release}-${ALPINE_NETBOOT_ARCH}.iso"
-
-    tmp=$(mktemp -d /tmp/reinstall-alpine-efi.XXXXXX)
-    iso="$tmp/alpine-virt.iso"
-
-    info "Downloading official Alpine virt ISO only for its GRUB EFI bootstrap:"
-    info "  $iso_url"
-    if ! http_download "$iso_url" "$iso"; then
-        rm -rf "$tmp"
-        error "Failed to download Alpine virt ISO for FreeBSD UEFI bootstrap"
-    fi
-
+extract_alpine_grub_efi() {
+    local iso="$1" member p normalized
     member=$(
         while IFS= read -r p; do
-            local normalized
             normalized="${p#./}"
-            if [[ "${normalized,,}" == "efi/boot/${efi_name,,}" ]]; then
-                printf '%s\n' "$p"
-                break
-            fi
+            [[ "${normalized,,}" == "efi/boot/${FREEBSD_GRUB_EFI_NAME,,}" ]] || continue
+            echo "$p"; break
         done < <(tar -tf "$iso" 2>/dev/null)
     )
-    [[ -n "$member" ]] || {
-        rm -rf "$tmp"
-        error "Could not locate efi/boot/${efi_name} inside Alpine virt ISO"
-    }
-
+    [[ -n "$member" ]] || error "${FREEBSD_GRUB_EFI_NAME} not found in Alpine ISO"
     mkdir -p "$(dirname "$ALPINE_FREEBSD_GRUB_EFI_ABS")"
-    if ! tar -xOf "$iso" "$member" >"$ALPINE_FREEBSD_GRUB_EFI_ABS"; then
-        rm -rf "$tmp"
-        error "Failed to extract ${efi_name} from Alpine virt ISO"
-    fi
-    [[ -s "$ALPINE_FREEBSD_GRUB_EFI_ABS" ]] || {
-        rm -rf "$tmp"
-        error "Extracted Alpine GRUB EFI binary is empty"
-    }
+    tar -xOf "$iso" "$member" >"$ALPINE_FREEBSD_GRUB_EFI_ABS" || error "Failed to extract Alpine GRUB EFI"
+    [[ -s "$ALPINE_FREEBSD_GRUB_EFI_ABS" ]] || error "Extracted GRUB EFI is empty"
+}
 
-    volid="alpine-virt ${alpine_release} ${ALPINE_NETBOOT_ARCH}"
-    printf -v old_cfg \
-        'search --no-floppy --set=root --label "%s"\nset prefix=($root)/boot/grub\n' \
-        "$volid"
-    printf -v new_cfg \
-        'search --no-floppy --fs-uuid --set=root %s\nset prefix=($root)%s/grub\n' \
-        "$PLAN_EFI_UUID" "$ALPINE_BOOT_DIR_REL"
-
-    old_len=${#old_cfg}
-    new_len=${#new_cfg}
-    (( new_len <= old_len )) || {
-        rm -rf "$tmp"
-        error "Patched Alpine GRUB early config is larger than the embedded config (${new_len} > ${old_len})"
-    }
+patch_alpine_grub_efi() {
+    local tmp="$1" release="$2" volid marker offset old_cfg new_cfg old_len new_len patch
+    volid="alpine-virt ${release} ${ALPINE_NETBOOT_ARCH}"
+    printf -v old_cfg 'search --no-floppy --set=root --label "%s"\nset prefix=($root)/boot/grub\n' "$volid"
+    printf -v new_cfg 'search --no-floppy --fs-uuid --set=root %s\nset prefix=($root)%s/grub\n' "$PLAN_EFI_UUID" "$ALPINE_BOOT_DIR_REL"
+    old_len=${#old_cfg}; new_len=${#new_cfg}
+    (( new_len <= old_len )) || error "Patched GRUB early config is too large"
 
     marker="search --no-floppy --set=root --label \"${volid}\""
-    offset=$(
-        LC_ALL=C grep -a -b -o -F "$marker" "$ALPINE_FREEBSD_GRUB_EFI_ABS" 2>/dev/null |
-        head -n1 | cut -d: -f1
-    )
-    [[ "$offset" =~ ^[0-9]+$ ]] || {
-        rm -rf "$tmp"
-        error "Could not locate Alpine GRUB embedded early config; refusing to patch an unknown EFI binary"
-    }
+    offset=$(LC_ALL=C grep -a -b -o -F "$marker" "$ALPINE_FREEBSD_GRUB_EFI_ABS" | head -n1 | cut -d: -f1)
+    [[ "$offset" =~ ^[0-9]+$ ]] || error "Could not locate Alpine GRUB early config"
 
-    expected_file="$tmp/expected.cfg"
-    before_file="$tmp/before.cfg"
-    patch_file="$tmp/patch.cfg"
+    dd if="$ALPINE_FREEBSD_GRUB_EFI_ABS" of="$tmp/original.cfg" bs=1 skip="$offset" count="$old_len" status=none
+    printf '%s' "$old_cfg" >"$tmp/expected.cfg"
+    cmp -s "$tmp/expected.cfg" "$tmp/original.cfg" || error "Unexpected Alpine GRUB early config; refusing binary patch"
 
-    printf '%s' "$old_cfg" >"$expected_file"
-    dd if="$ALPINE_FREEBSD_GRUB_EFI_ABS" of="$before_file" \
-        bs=1 skip="$offset" count="$old_len" 2>/dev/null || {
-        rm -rf "$tmp"
-        error "Failed to read Alpine GRUB embedded config before patching"
-    }
+    patch="$tmp/patch.cfg"
+    printf '%s' "$new_cfg" >"$patch"
+    printf '%*s' $((old_len - new_len)) '' >>"$patch"
+    dd if="$patch" of="$ALPINE_FREEBSD_GRUB_EFI_ABS" bs=1 seek="$offset" conv=notrunc status=none
+    grep -a -Fq "search --no-floppy --fs-uuid --set=root ${PLAN_EFI_UUID}" "$ALPINE_FREEBSD_GRUB_EFI_ABS" || \
+        error "Patched GRUB EFI verification failed"
+}
 
-    if ! cmp -s "$expected_file" "$before_file"; then
-        warn "Alpine GRUB embedded config verification failed at byte offset $offset."
-        warn "Expected the official Alpine early config beginning with: $marker"
-        rm -rf "$tmp"
-        error "Alpine GRUB embedded config did not exactly match the expected ${alpine_release} virt image; refusing binary patch"
-    fi
-
-    printf '%s' "$new_cfg" >"$patch_file"
-    pad=$(( old_len - new_len ))
-    if (( pad > 0 )); then
-        printf '%*s' "$pad" '' >>"$patch_file"
-    fi
-
-    dd if="$patch_file" of="$ALPINE_FREEBSD_GRUB_EFI_ABS" \
-        bs=1 seek="$offset" conv=notrunc 2>/dev/null || {
-        rm -rf "$tmp"
-        error "Failed to patch Alpine GRUB EFI embedded config"
-    }
-
-    if ! LC_ALL=C grep -a -F \
-        "search --no-floppy --fs-uuid --set=root ${PLAN_EFI_UUID}" \
-        "$ALPINE_FREEBSD_GRUB_EFI_ABS" >/dev/null 2>&1; then
-        rm -rf "$tmp"
-        error "Patched Alpine GRUB EFI verification failed"
-    fi
-
+write_freebsd_grub_cfg() {
     mkdir -p "$(dirname "$ALPINE_FREEBSD_GRUB_CFG_ABS")"
     cat >"$ALPINE_FREEBSD_GRUB_CFG_ABS" <<EOF
 set timeout=0
@@ -2328,110 +1982,65 @@ linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} modules=loop,squashfs ip=dhcp alpin
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
+}
 
+build_freebsd_grub_efi() {
+    ensure_freebsd_boot_tools
+    [[ "$PLAN_STORAGE_MODE" == efi ]] || error "FreeBSD bootstrap requires EFI"
+    [[ "$PLAN_EFI_UUID" =~ ^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$ ]] || error "Invalid ESP UUID: $PLAN_EFI_UUID"
+
+    local release tmp iso url
+    release="${ALPINE_NETBOOT_SUBDIR#netboot-}"
+    freebsd_grub_arch
+    url="${ALPINE_REPO_BASE}/releases/${ALPINE_NETBOOT_ARCH}/alpine-virt-${release}-${ALPINE_NETBOOT_ARCH}.iso"
+    tmp=$(mktemp -d /tmp/reinstall-alpine-efi.XXXXXX); iso="$tmp/alpine.iso"
+
+    info "Downloading Alpine virt ISO for GRUB EFI"
+    http_download "$url" "$iso" || error "Failed to download Alpine virt ISO"
+    extract_alpine_grub_efi "$iso"
+    patch_alpine_grub_efi "$tmp" "$release"
+    write_freebsd_grub_cfg
     chmod 0644 "$ALPINE_FREEBSD_GRUB_EFI_ABS" "$ALPINE_FREEBSD_GRUB_CFG_ABS"
-    rm -rf "$tmp"
-    sync
+    rm -rf "$tmp"; sync
+    info "Prepared FreeBSD UEFI bootstrap: $ALPINE_FREEBSD_GRUB_EFI_ABS"
+}
 
-    info "Prepared Alpine official GRUB EFI bootstrap for FreeBSD:"
-    info "  EFI: $ALPINE_FREEBSD_GRUB_EFI_ABS"
-    info "  CFG: $ALPINE_FREEBSD_GRUB_CFG_ABS"
-    info "  ESP UUID: $PLAN_EFI_UUID"
+efi_entry_numbers() {
+    local title="${1:-}"
+    efibootmgr 2>/dev/null | awk -v title="$title" '
+        title == "" || index($0, title) {
+            if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) print toupper(substr($0, RSTART + 4, 4))
+        }
+    ' | sort -u
+}
+
+efi_bootnext_number() {
+    efibootmgr 2>/dev/null | awk -F: '/^BootNext[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print toupper($2); exit}'
 }
 
 install_freebsd_bootnext_entry() {
     ensure_freebsd_boot_tools
-
-    local before after newnum old bootnext
+    local old before after num bootnext
 
     while read -r old; do
-        [[ -n "$old" ]] || continue
-        info "Deleting old EFI boot entry $old (${ALPINE_ENTRY_TITLE})"
-        efibootmgr -B -b "$old" >/dev/null 2>&1 || \
-            warn "Failed to delete old EFI boot entry: $old"
-    done < <(
-        efibootmgr 2>/dev/null | awk -v title="$ALPINE_ENTRY_TITLE" '
-            index($0, title) {
-                if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) {
-                    n = substr($0, RSTART + 4, 4)
-                    print toupper(n)
-                }
-            }
-        ' | sort -u
-    )
+        [[ -z "$old" ]] || efibootmgr -B -b "$old" >/dev/null 2>&1 || true
+    done < <(efi_entry_numbers "$ALPINE_ENTRY_TITLE")
 
-    before=$(
-        efibootmgr 2>/dev/null |
-        awk '{
-            if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) {
-                n = substr($0, RSTART + 4, 4)
-                print toupper(n)
-            }
-        }' | sort -u
-    )
+    before=$(efi_entry_numbers)
+    efibootmgr -a -c -l "$ALPINE_FREEBSD_GRUB_EFI_ABS" -L "$ALPINE_ENTRY_TITLE" >/dev/null || \
+        error "Failed to create UEFI boot entry"
 
-    info "Creating FreeBSD UEFI boot entry: ${ALPINE_ENTRY_TITLE}"
-    efibootmgr -a -c \
-        -l "$ALPINE_FREEBSD_GRUB_EFI_ABS" \
-        -L "$ALPINE_ENTRY_TITLE" >/dev/null || \
-        error "efibootmgr failed to create EFI boot entry: ${ALPINE_ENTRY_TITLE}"
-
-    newnum=$(
-        efibootmgr 2>/dev/null | awk -v title="$ALPINE_ENTRY_TITLE" '
-            index($0, title) {
-                if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) {
-                    n = substr($0, RSTART + 4, 4)
-                    print toupper(n)
-                    exit
-                }
-            }
-        '
-    )
-
-    if [[ -z "$newnum" ]]; then
-        after=$(
-            efibootmgr 2>/dev/null |
-            awk '{
-                if (match($0, /Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/)) {
-                    n = substr($0, RSTART + 4, 4)
-                    print toupper(n)
-                }
-            }' | sort -u
-        )
-        newnum=$(comm -13 \
-            <(printf '%s\n' "$before") \
-            <(printf '%s\n' "$after") |
-            head -n1)
+    num=$(efi_entry_numbers "$ALPINE_ENTRY_TITLE" | head -n1)
+    if [[ -z "$num" ]]; then
+        after=$(efi_entry_numbers)
+        num=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n1)
     fi
+    [[ "$num" =~ ^[0-9A-F]{4}$ ]] || error "Could not determine new UEFI boot entry"
 
-    [[ "$newnum" =~ ^[0-9A-Fa-f]{4}$ ]] || {
-        efibootmgr -v >&2 2>/dev/null || true
-        error "Failed to determine new EFI boot entry after creating ${ALPINE_ENTRY_TITLE}"
-    }
-
-    info "Setting BootNext to EFI entry $newnum (${ALPINE_ENTRY_TITLE})"
-    efibootmgr -n -b "$newnum" >/dev/null || \
-        error "Failed to set BootNext to EFI entry $newnum"
-
-    bootnext=$(
-        efibootmgr 2>/dev/null |
-        awk '
-            /^BootNext[[:space:]]*:/ {
-                v=$0
-                sub(/^[^:]*:[[:space:]]*/, "", v)
-                gsub(/[[:space:]]/, "", v)
-                print toupper(v)
-                exit
-            }
-        '
-    )
-
-    if [[ -n "$bootnext" && "$bootnext" != "${newnum^^}" ]]; then
-        efibootmgr -v >&2 2>/dev/null || true
-        error "BootNext verification failed: expected ${newnum^^}, got $bootnext"
-    fi
-
-    info "BootNext verified: ${newnum^^} (${ALPINE_ENTRY_TITLE})"
+    efibootmgr -n -b "$num" >/dev/null || error "Failed to set BootNext=$num"
+    bootnext=$(efi_bootnext_number)
+    [[ -z "$bootnext" || "$bootnext" == "$num" ]] || error "BootNext verification failed: $bootnext != $num"
+    info "BootNext=$num ($ALPINE_ENTRY_TITLE)"
 }
 
 prepare_and_boot_alpine_ram() {
@@ -2572,117 +2181,78 @@ ensure_linux_block_node_from_sysfs() {
     [[ -b "$devpath" ]]
 }
 
-prepare_fixed_temp_staging_partition() {
-    [[ "$OS" == "Linux" ]] || error "The fixed 3 GiB staging partition requires the Linux/Alpine installer environment"
-    command -v sgdisk >/dev/null 2>&1 || error "sgdisk is required for the fixed staging partition"
-    command -v mkfs.ext4 >/dev/null 2>&1 || error "mkfs.ext4 is required for the fixed staging partition"
-    command -v blockdev >/dev/null 2>&1 || error "blockdev is required for the fixed staging partition"
-
-    local disk_size first_sector last_sector actual_bytes min_remaining
-    disk_size=$(get_disk_size_bytes "$DISK" || true)
-    [[ -n "$disk_size" ]] || error "Could not determine target disk size before creating staging partition"
-
-    min_remaining=$((2 * 1024 * 1024 * 1024))
-    if [[ "$disk_size" -le $((TEMP_STAGE_SIZE_BYTES + min_remaining)) ]]; then
-        error "Target disk is too small for the mandatory 3 GiB staging partition. Disk=${disk_size} bytes"
-    fi
-
-    info "Preparing mandatory 3 GiB staging partition at the end of $DISK ..."
-    info "This step destroys the old partition table; Alpine is already running from RAM."
-
+reset_disk_for_staging() {
     wipefs -a "$DISK" >/dev/null 2>&1 || true
     sgdisk -Z "$DISK" >/dev/null 2>&1 || true
+    partx -d "$DISK" >/dev/null 2>&1 || true
+    blockdev --rereadpt "$DISK" >/dev/null 2>&1 || true
+    mdev -s 2>/dev/null || true
 
-    if command -v partx >/dev/null 2>&1; then
-        partx -d "$DISK" >/dev/null 2>&1 || true
-    fi
-    command -v blockdev >/dev/null 2>&1 && blockdev --rereadpt "$DISK" >/dev/null 2>&1 || true
-    command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
-
-    sgdisk -o "$DISK" >/dev/null || error "Failed to create temporary GPT on $DISK"
-    sgdisk -n "${TEMP_STAGE_PART_NUM}:-3072M:0" \
-           -t "${TEMP_STAGE_PART_NUM}:8300" \
-           -c "${TEMP_STAGE_PART_NUM}:${TEMP_STAGE_LABEL}" \
-           "$DISK" >/dev/null || error "Failed to create mandatory 3 GiB staging partition"
-
+    sgdisk -o "$DISK" >/dev/null || error "Failed to create temporary GPT"
+    sgdisk -n "${TEMP_STAGE_PART_NUM}:-3072M:0" -t "${TEMP_STAGE_PART_NUM}:8300" \
+        -c "${TEMP_STAGE_PART_NUM}:${TEMP_STAGE_LABEL}" "$DISK" >/dev/null || error "Failed to create staging partition"
     reread_partition_table_strict
+}
 
-    # already valid. The partition number is known because the temporary GPT
+wait_for_stage_partition() {
+    local i
     TEMP_STAGE_PART=$(partition_device_for_number "$DISK" "$TEMP_STAGE_PART_NUM")
-    local wait_i
-    for wait_i in 1 2 3 4 5 6 7 8; do
-        [[ -b "$TEMP_STAGE_PART" ]] && break
-
-        command -v partx >/dev/null 2>&1 && {
-            partx -u "$DISK" >/dev/null 2>&1 || partx -a "$DISK" >/dev/null 2>&1 || true
-        }
-        command -v mdev >/dev/null 2>&1 && mdev -s 2>/dev/null || true
-        command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
-
-        ensure_linux_block_node_from_sysfs "$TEMP_STAGE_PART" && break
-
+    for i in 1 2 3 4 5 6 7 8; do
+        [[ -b "$TEMP_STAGE_PART" ]] && return
+        partx -u "$DISK" >/dev/null 2>&1 || partx -a "$DISK" >/dev/null 2>&1 || true
+        mdev -s 2>/dev/null || true
+        udevadm settle 2>/dev/null || true
+        ensure_linux_block_node_from_sysfs "$TEMP_STAGE_PART" && return
         sleep 1
     done
+    sgdisk -p "$DISK" >&2 || true
+    lsblk -a -o NAME,PATH,TYPE,SIZE,PARTN,PARTLABEL,MAJ:MIN "$DISK" >&2 || true
+    error "Staging partition node did not appear: $TEMP_STAGE_PART"
+}
 
-    if [[ ! -b "$TEMP_STAGE_PART" ]]; then
-        warn "Temporary GPT as reported by sgdisk:"
-        sgdisk -p "$DISK" >&2 || true
-        warn "Current block-device view:"
-        lsblk -a -o NAME,PATH,TYPE,SIZE,PARTN,PARTLABEL,MAJ:MIN "$DISK" >&2 || true
-        warn "Relevant sysfs state:"
-        local stage_name
-        stage_name="${TEMP_STAGE_PART#/dev/}"
-        if [[ -d "/sys/class/block/$stage_name" ]]; then
-            ls -la "/sys/class/block/$stage_name" >&2 || true
-            cat "/sys/class/block/$stage_name/dev" >&2 2>/dev/null || true
-        fi
-        error "Could not create/locate expected temporary staging partition node: $TEMP_STAGE_PART"
-    fi
+read_stage_geometry() {
+    local first last actual
+    TEMP_STAGE_SECTOR_SIZE=$(blockdev --getss "$DISK")
+    first=$(sgdisk -i "$TEMP_STAGE_PART_NUM" "$DISK" | awk '/First sector:/ {print $3; exit}')
+    last=$(sgdisk -i "$TEMP_STAGE_PART_NUM" "$DISK" | awk '/Last sector:/ {print $3; exit}')
+    [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || error "Could not read staging geometry"
 
-    info "Temporary staging partition node ready: $TEMP_STAGE_PART"
+    TEMP_STAGE_START_SECTOR="$first"
+    TEMP_STAGE_START_BYTES=$((first * TEMP_STAGE_SECTOR_SIZE))
+    actual=$(((last - first + 1) * TEMP_STAGE_SECTOR_SIZE))
+    (( actual >= TEMP_STAGE_SIZE_BYTES - 2 * 1024 * 1024 )) || error "Staging partition is smaller than 3 GiB"
+    TEMP_STAGE_LAST_SECTOR="$last"
+}
 
-    TEMP_STAGE_SECTOR_SIZE=$(blockdev --getss "$DISK" 2>/dev/null || true)
-    [[ "$TEMP_STAGE_SECTOR_SIZE" =~ ^[0-9]+$ && "$TEMP_STAGE_SECTOR_SIZE" -gt 0 ]] || \
-        error "Could not determine target logical sector size"
-
-    first_sector=$(sgdisk -i "$TEMP_STAGE_PART_NUM" "$DISK" 2>/dev/null | \
-        awk '/First sector:/ {print $3; exit}')
-    last_sector=$(sgdisk -i "$TEMP_STAGE_PART_NUM" "$DISK" 2>/dev/null | \
-        awk '/Last sector:/ {print $3; exit}')
-    [[ "$first_sector" =~ ^[0-9]+$ && "$last_sector" =~ ^[0-9]+$ ]] || \
-        error "Could not determine temporary staging partition boundaries"
-
-    TEMP_STAGE_START_SECTOR="$first_sector"
-    TEMP_STAGE_START_BYTES=$((first_sector * TEMP_STAGE_SECTOR_SIZE))
-    actual_bytes=$(((last_sector - first_sector + 1) * TEMP_STAGE_SECTOR_SIZE))
-
-    if [[ "$actual_bytes" -lt $((TEMP_STAGE_SIZE_BYTES - 2 * 1024 * 1024)) ]]; then
-        error "Temporary staging partition is smaller than requested: ${actual_bytes} bytes"
-    fi
-
-    mkfs.ext4 -F -m 0 -L "$TEMP_STAGE_LABEL" "$TEMP_STAGE_PART" >/dev/null || \
-        error "Failed to format temporary staging partition: $TEMP_STAGE_PART"
-    mkdir -p "$TEMP_STAGE_MNT"
-    mount -t ext4 -o noatime "$TEMP_STAGE_PART" "$TEMP_STAGE_MNT" || \
-        error "Failed to mount temporary staging partition: $TEMP_STAGE_PART"
-
-    # Deliberately invalidate the temporary GPT backup header after the kernel has
-    # learned the partition mapping. Later the image primary GPT will replace the
-    # temporary primary GPT, and sgdisk -e can rebuild a clean backup GPT without
-    local disk_bytes total_sectors tail_start
+invalidate_staging_backup_gpt() {
+    local disk_bytes total tail
     disk_bytes=$(blockdev --getsize64 "$DISK")
-    total_sectors=$((disk_bytes / TEMP_STAGE_SECTOR_SIZE))
-    tail_start=$((total_sectors - 34))
-    if [[ "$tail_start" -gt "$last_sector" ]]; then
-        dd if=/dev/zero of="$DISK" bs="$TEMP_STAGE_SECTOR_SIZE" \
-           seek="$tail_start" count=34 conv=notrunc status=none || \
-            error "Failed to invalidate temporary backup GPT"
-        sync
-    fi
+    total=$((disk_bytes / TEMP_STAGE_SECTOR_SIZE))
+    tail=$((total - 34))
+    (( tail <= TEMP_STAGE_LAST_SECTOR )) && return
+    dd if=/dev/zero of="$DISK" bs="$TEMP_STAGE_SECTOR_SIZE" seek="$tail" count=34 conv=notrunc status=none || \
+        error "Failed to invalidate temporary backup GPT"
+    sync
+}
 
-    info "Temporary staging partition: $TEMP_STAGE_PART"
-    info "Temporary staging mount:     $TEMP_STAGE_MNT"
-    info "Staging boundary:            ${TEMP_STAGE_START_BYTES} bytes from disk start"
+prepare_fixed_temp_staging_partition() {
+    local disk_size min_remaining=$((2 * 1024 * 1024 * 1024))
+    [[ "$OS" == Linux ]] || error "Staging requires Alpine/Linux"
+    disk_size=$(get_disk_size_bytes "$DISK")
+    (( disk_size > TEMP_STAGE_SIZE_BYTES + min_remaining )) || error "Target disk is too small for 3 GiB staging"
+
+    info "Preparing 3 GiB staging partition at the end of $DISK"
+    reset_disk_for_staging
+    wait_for_stage_partition
+    read_stage_geometry
+
+    mkfs.ext4 -F -m 0 -L "$TEMP_STAGE_LABEL" "$TEMP_STAGE_PART" >/dev/null || error "Failed to format staging partition"
+    mkdir -p "$TEMP_STAGE_MNT"
+    mount -t ext4 -o noatime "$TEMP_STAGE_PART" "$TEMP_STAGE_MNT" || error "Failed to mount staging partition"
+    invalidate_staging_backup_gpt
+
+    info "Staging: $TEMP_STAGE_PART mounted at $TEMP_STAGE_MNT"
+    info "Staging boundary: ${TEMP_STAGE_START_BYTES} bytes"
     df -h "$TEMP_STAGE_MNT" || true
 }
 
@@ -2859,229 +2429,135 @@ connect_raw_rw_nbd() {
     error "Could not allocate a free NBD device for sparse-shadow preparation"
 }
 
-prepare_sparse_shadow_for_target() {
-    local img="$1" shadow="$2"
-    local allocated logical_size
-    local nbd table sector_size target_sector_size target_disk_bytes target_total_sectors
-    local reserve_bytes reserve_sectors target_end
-    local line partnum="" part_start="" part_end=0 part_code=""
-    local info_text type_guid unique_guid attrs name new_part_bytes partdev wait_i
-
-    rm -f "$shadow"
-
-    info "Creating sparse raw shadow in RAM/zram because the image GPT overlaps the live 3 GiB staging partition..."
-    info "This file is logically as large as the cloud disk, but sparse holes do not consume tmpfs/zram pages."
-
-    qemu-img convert -p -S 4k -f qcow2 -O raw "$img" "$shadow" || {
-        rm -f "$shadow"
-        error "Failed to create sparse raw shadow from qcow2"
-    }
-
-    logical_size=$(stat -c %s "$shadow" 2>/dev/null || true)
-    allocated=$(du -B1 "$shadow" 2>/dev/null | awk '{print $1; exit}' || true)
-    [[ "$logical_size" =~ ^[0-9]+$ && "$logical_size" -gt 0 ]] || \
-        error "Could not determine sparse-shadow logical size"
-
-    info "Sparse shadow logical size:   ${logical_size} bytes"
-    [[ "$allocated" =~ ^[0-9]+$ ]] && info "Sparse shadow allocated RAM/zram: ${allocated} bytes"
-    df -h /run/reinstall-work || true
-
-    connect_raw_rw_nbd "$shadow"
-    nbd="$QCOW_NBD_DEV"
-
-    table=$(sgdisk -p "$nbd" 2>&1) || {
-        echo "$table" >&2
-        cleanup_qcow_nbd
-        error "Sparse shadow does not expose a usable GPT"
-    }
-
-    sector_size=$(blockdev --getss "$nbd" 2>/dev/null || true)
-    target_sector_size=$(blockdev --getss "$DISK" 2>/dev/null || true)
-    [[ "$sector_size" =~ ^[0-9]+$ && "$sector_size" -gt 0 ]] || {
-        cleanup_qcow_nbd
-        error "Could not determine sparse-shadow sector size"
-    }
-    [[ "$target_sector_size" == "$sector_size" ]] || {
-        cleanup_qcow_nbd
-        error "Sparse-shadow sector size ($sector_size) differs from target disk sector size ($target_sector_size)"
-    }
-
-    target_disk_bytes=$(get_disk_size_bytes "$DISK" || true)
-    [[ "$target_disk_bytes" =~ ^[0-9]+$ && "$target_disk_bytes" -gt 0 ]] || {
-        cleanup_qcow_nbd
-        error "Could not determine target disk size while preparing sparse shadow"
-    }
-
-    target_total_sectors=$((target_disk_bytes / sector_size))
-    reserve_bytes=$((32 * 1024 * 1024))
-    reserve_sectors=$(((reserve_bytes + sector_size - 1) / sector_size))
-    target_end=$((target_total_sectors - 34 - reserve_sectors))
-
-    if (( target_end <= 2048 )); then
-        cleanup_qcow_nbd
-        error "Target disk is too small to reserve GPT metadata and CIDATA"
-    fi
+shadow_last_partition() {
+    local nbd="$1" line best_end=0
+    SHADOW_PART_NUM="" SHADOW_PART_START="" SHADOW_PART_END="" SHADOW_PART_CODE=""
 
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+.*[[:space:]]+([0-9A-Fa-f]{4})[[:space:]] ]] || continue
-        if (( BASH_REMATCH[3] > part_end )); then
-            partnum="${BASH_REMATCH[1]}"
-            part_start="${BASH_REMATCH[2]}"
-            part_end="${BASH_REMATCH[3]}"
-            part_code="${BASH_REMATCH[4]^^}"
-        fi
-    done <<<"$table"
+        (( BASH_REMATCH[3] <= best_end )) && continue
+        best_end="${BASH_REMATCH[3]}"
+        SHADOW_PART_NUM="${BASH_REMATCH[1]}"
+        SHADOW_PART_START="${BASH_REMATCH[2]}"
+        SHADOW_PART_END="${BASH_REMATCH[3]}"
+        SHADOW_PART_CODE="${BASH_REMATCH[4]^^}"
+    done < <(sgdisk -p "$nbd" 2>/dev/null)
 
-    [[ -n "$partnum" && "$part_start" =~ ^[0-9]+$ && "$part_end" =~ ^[0-9]+$ ]] || {
-        cleanup_qcow_nbd
-        error "Could not identify the final GPT partition inside sparse shadow"
-    }
+    [[ -n "$SHADOW_PART_NUM" ]] || error "Could not identify final GPT partition in sparse shadow"
+}
 
-    if (( part_end <= target_end )); then
-        info "Sparse-shadow GPT already fits the target disk with 32 MiB reserved for CIDATA."
-        cleanup_qcow_nbd
-        return 0
-    fi
+shadow_partition_node() {
+    local nbd="$1" num="$2" dev i
+    dev=$(partition_device_for_number "$nbd" "$num")
 
-    info "Sparse-shadow final partition $partnum extends to sector $part_end; target-safe end is $target_end."
-
-    # GPT type codes describe intended use, not necessarily the on-disk content.
-    # even when the payload is an LVM PV or a directly formatted root filesystem.
-    partdev=$(partition_device_for_number "$nbd" "$partnum")
-    for wait_i in 1 2 3 4 5; do
-        [[ -b "$partdev" ]] && break
-        command -v partx >/dev/null 2>&1 && partx -u "$nbd" >/dev/null 2>&1 || true
+    for i in 1 2 3 4 5; do
+        [[ -b "$dev" ]] && { echo "$dev"; return; }
+        partx -u "$nbd" >/dev/null 2>&1 || true
         mdev -s 2>/dev/null || true
-        ensure_linux_block_node_from_sysfs "$partdev" && break
+        ensure_linux_block_node_from_sysfs "$dev" && { echo "$dev"; return; }
         sleep 1
     done
-    [[ -b "$partdev" ]] || {
-        cleanup_qcow_nbd
-        error "Could not create sparse-shadow partition node: $partdev"
-    }
+    error "Could not create sparse-shadow partition node: $dev"
+}
 
-    new_part_bytes=$(((target_end - part_start + 1) * sector_size))
-    (( new_part_bytes > 0 )) || {
-        cleanup_qcow_nbd
-        error "Target disk is smaller than the start of the Rocky LVM partition"
-    }
+shadow_resize_lvm() {
+    local dev="$1" bytes="$2"
+    pvs --noheadings -o pv_name "$dev" 2>/dev/null | grep -Fq "$dev" || return 1
+    info "Shrinking LVM PV to ${bytes} bytes"
+    pvresize --yes --setphysicalvolumesize "${bytes}B" "$dev" || \
+        error "LVM allocated extents do not fit on the target disk"
+    return 0
+}
 
-    local content_type="" pv_detected=0 fs_block_size="" fs_blocks="" fs_bytes=""
-    local target_fs_blocks="" e2fsck_rc=0
+shadow_resize_xfs() {
+    local dev="$1" bytes="$2" block_size blocks fs_bytes
+    block_size=$(xfs_db -r -c 'sb 0' -c 'p blocksize' "$dev" 2>/dev/null | awk -F'= *' '/blocksize =/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+    blocks=$(xfs_db -r -c 'sb 0' -c 'p dblocks' "$dev" 2>/dev/null | awk -F'= *' '/dblocks =/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+    [[ "$block_size" =~ ^[0-9]+$ && "$blocks" =~ ^[0-9]+$ ]] || error "Could not read XFS size on $dev"
+    fs_bytes=$((block_size * blocks))
+    (( fs_bytes <= bytes )) || error "XFS uses ${fs_bytes} bytes and cannot be shrunk to ${bytes} bytes"
+    info "XFS already fits inside the new partition boundary"
+}
 
-    # Prefer explicit LVM probing. Do not infer LVM from the GPT type code.
-    if pvs --noheadings -o pv_name "$partdev" 2>/dev/null | grep -Fq "$partdev"; then
-        pv_detected=1
-    fi
+shadow_resize_ext() {
+    local dev="$1" bytes="$2" block_size blocks fs_bytes target_blocks rc=0
+    block_size=$(dumpe2fs -h "$dev" 2>/dev/null | awk -F': *' '/^Block size:/ {print $2; exit}')
+    blocks=$(dumpe2fs -h "$dev" 2>/dev/null | awk -F': *' '/^Block count:/ {print $2; exit}')
+    [[ "$block_size" =~ ^[0-9]+$ && "$blocks" =~ ^[0-9]+$ ]] || error "Could not read ext filesystem size on $dev"
+    fs_bytes=$((block_size * blocks))
+    (( fs_bytes > bytes )) || { info "ext filesystem already fits inside the new partition boundary"; return; }
 
-    if [[ "$pv_detected" -eq 1 ]]; then
-        info "Detected LVM PV inside GPT type $part_code on $partdev."
-        info "Shrinking LVM PV to fit ${new_part_bytes} bytes before changing the GPT boundary..."
-        if ! pvresize --yes --setphysicalvolumesize "${new_part_bytes}B" "$partdev"; then
-            cleanup_qcow_nbd
-            error "LVM allocated extents cannot fit inside ${new_part_bytes} bytes. The target disk is genuinely too small."
-        fi
-    else
-        content_type=$(blkid -p -o value -s TYPE "$partdev" 2>/dev/null || true)
-        info "Final partition GPT type=$part_code; detected content=${content_type:-unknown}"
+    target_blocks=$((bytes / block_size - 256))
+    (( target_blocks > 0 )) || error "Target partition is too small for ext filesystem"
+    e2fsck -f -p "$dev" >/dev/null 2>&1 || rc=$?
+    (( rc <= 1 )) || error "e2fsck failed before ext shrink (rc=$rc)"
+    info "Shrinking ext filesystem to ${target_blocks} blocks"
+    resize2fs "$dev" "$target_blocks" >/dev/null || error "resize2fs failed"
+}
 
-        case "$content_type" in
-            xfs)
-                fs_block_size=$(xfs_db -r -c 'sb 0' -c 'p blocksize' "$partdev" 2>/dev/null |                     awk -F'= *' '/blocksize =/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
-                fs_blocks=$(xfs_db -r -c 'sb 0' -c 'p dblocks' "$partdev" 2>/dev/null |                     awk -F'= *' '/dblocks =/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
-                [[ "$fs_block_size" =~ ^[0-9]+$ && "$fs_blocks" =~ ^[0-9]+$ ]] || {
-                    cleanup_qcow_nbd
-                    error "Could not determine XFS filesystem size on $partdev"
-                }
-                fs_bytes=$((fs_block_size * fs_blocks))
-                info "XFS filesystem size: ${fs_bytes} bytes; target partition capacity: ${new_part_bytes} bytes"
-                if (( fs_bytes > new_part_bytes )); then
-                    cleanup_qcow_nbd
-                    error "XFS filesystem is larger than the target-safe partition size and XFS cannot be shrunk offline. Target disk is too small for this image."
-                fi
-                info "XFS filesystem already fits; only the GPT partition boundary needs to be reduced."
-                ;;
-            ext2|ext3|ext4)
-                fs_block_size=$(dumpe2fs -h "$partdev" 2>/dev/null | awk -F': *' '/^Block size:/ {print $2; exit}')
-                fs_blocks=$(dumpe2fs -h "$partdev" 2>/dev/null | awk -F': *' '/^Block count:/ {print $2; exit}')
-                [[ "$fs_block_size" =~ ^[0-9]+$ && "$fs_blocks" =~ ^[0-9]+$ ]] || {
-                    cleanup_qcow_nbd
-                    error "Could not determine ext filesystem size on $partdev"
-                }
-                fs_bytes=$((fs_block_size * fs_blocks))
-                info "ext filesystem size: ${fs_bytes} bytes; target partition capacity: ${new_part_bytes} bytes"
+shadow_resize_payload() {
+    local dev="$1" bytes="$2" type
+    shadow_resize_lvm "$dev" "$bytes" && return
 
-                if (( fs_bytes > new_part_bytes )); then
-                    target_fs_blocks=$((new_part_bytes / fs_block_size - 256))
-                    (( target_fs_blocks > 0 )) || {
-                        cleanup_qcow_nbd
-                        error "Target partition is too small for a valid ext filesystem"
-                    }
+    type=$(blkid -p -o value -s TYPE "$dev" 2>/dev/null || true)
+    info "Final partition content: ${type:-unknown} (GPT type $SHADOW_PART_CODE)"
+    case "$type" in
+        xfs)              shadow_resize_xfs "$dev" "$bytes" ;;
+        ext2|ext3|ext4)   shadow_resize_ext "$dev" "$bytes" ;;
+        *) error "Cannot safely shrink final partition content '${type:-unknown}'" ;;
+    esac
+}
 
-                    e2fsck -f -p "$partdev" >/dev/null 2>&1 || e2fsck_rc=$?
-                    if (( e2fsck_rc > 1 )); then
-                        cleanup_qcow_nbd
-                        error "e2fsck failed before ext filesystem shrink (rc=$e2fsck_rc)"
-                    fi
+shadow_resize_gpt() {
+    local nbd="$1" num="$2" start="$3" end="$4" info_text type_guid unique_guid attrs name
+    info_text=$(sgdisk -i "$num" "$nbd" 2>/dev/null) || error "Failed to inspect GPT partition $num"
+    type_guid=$(awk '/Partition GUID code:/ {print $4; exit}' <<<"$info_text")
+    unique_guid=$(awk '/Partition unique GUID:/ {print $4; exit}' <<<"$info_text")
+    attrs=$(awk '/Attribute flags:/ {print $3; exit}' <<<"$info_text")
+    name=$(sed -n "s/^Partition name: '\(.*\)'$/\1/p" <<<"$info_text" | head -n1)
 
-                    info "Shrinking ext filesystem to ${target_fs_blocks} filesystem blocks..."
-                    resize2fs "$partdev" "$target_fs_blocks" >/dev/null || {
-                        cleanup_qcow_nbd
-                        error "resize2fs failed while shrinking the root filesystem"
-                    }
-                else
-                    info "ext filesystem already fits; only the GPT partition boundary needs to be reduced."
-                fi
-                ;;
-            *)
-                pvs "$partdev" 2>&1 || true
-                blkid -p "$partdev" 2>&1 || true
-                cleanup_qcow_nbd
-                error "Cannot safely shrink final partition content '${content_type:-unknown}' (GPT type $part_code). Refusing to modify its boundary blindly."
-                ;;
-        esac
-    fi
+    sgdisk -d "$num" "$nbd" >/dev/null || error "Failed to delete GPT partition $num"
+    sgdisk -n "${num}:${start}:${end}" "$nbd" >/dev/null || error "Failed to recreate GPT partition $num"
+    sgdisk -t "${num}:${type_guid}" "$nbd" >/dev/null || error "Failed to restore GPT type"
+    [[ -z "$unique_guid" ]] || sgdisk -u "${num}:${unique_guid}" "$nbd" >/dev/null || error "Failed to restore PARTUUID"
+    [[ -z "$name" ]] || sgdisk -c "${num}:${name}" "$nbd" >/dev/null || error "Failed to restore partition name"
+    [[ -z "$attrs" || "$attrs" == 0000000000000000 ]] || sgdisk -A "${num}:=:${attrs}" "$nbd" >/dev/null || error "Failed to restore GPT attributes"
+}
 
-    info_text=$(sgdisk -i "$partnum" "$nbd" 2>/dev/null) || {
-        cleanup_qcow_nbd
-        error "Failed to inspect sparse-shadow partition metadata"
-    }
-    type_guid=$(printf '%s\n' "$info_text" | awk '/Partition GUID code:/ {print $4; exit}')
-    unique_guid=$(printf '%s\n' "$info_text" | awk '/Partition unique GUID:/ {print $4; exit}')
-    attrs=$(printf '%s\n' "$info_text" | awk '/Attribute flags:/ {print $3; exit}')
-    name=$(printf '%s\n' "$info_text" | sed -n "s/^Partition name: '\(.*\)'$/\1/p" | head -n1)
+prepare_sparse_shadow_for_target() {
+    local img="$1" shadow="$2" nbd sector target_sector disk_bytes total reserve target_end partdev part_bytes allocated
 
-    sgdisk -d "$partnum" "$nbd" >/dev/null || {
-        cleanup_qcow_nbd
-        error "Failed to delete sparse-shadow partition $partnum for resize"
-    }
-    sgdisk -n "${partnum}:${part_start}:${target_end}" "$nbd" >/dev/null || {
-        cleanup_qcow_nbd
-        error "Failed to recreate sparse-shadow partition $partnum at target-safe size"
-    }
-    sgdisk -t "${partnum}:${type_guid}" "$nbd" >/dev/null || {
-        cleanup_qcow_nbd
-        error "Failed to restore sparse-shadow GPT type"
-    }
-    [[ -z "$unique_guid" ]] || sgdisk -u "${partnum}:${unique_guid}" "$nbd" >/dev/null || {
-        cleanup_qcow_nbd
-        error "Failed to restore sparse-shadow PARTUUID"
-    }
-    [[ -z "$name" ]] || sgdisk -c "${partnum}:${name}" "$nbd" >/dev/null || {
-        cleanup_qcow_nbd
-        error "Failed to restore sparse-shadow GPT name"
-    }
-    if [[ -n "$attrs" && "$attrs" != "0000000000000000" ]]; then
-        sgdisk -A "${partnum}:=:${attrs}" "$nbd" >/dev/null || {
-            cleanup_qcow_nbd
-            error "Failed to restore sparse-shadow GPT attributes"
-        }
-    fi
+    rm -f "$shadow"
+    info "Creating sparse RAM/zram shadow"
+    qemu-img convert -p -S 4k -f qcow2 -O raw "$img" "$shadow" || error "Failed to create sparse raw shadow"
+    allocated=$(du -B1 "$shadow" 2>/dev/null | awk '{print $1; exit}')
+    info "Sparse shadow: logical=$(stat -c %s "$shadow") allocated=${allocated:-unknown} bytes"
 
+    connect_raw_rw_nbd "$shadow"
+    nbd="$QCOW_NBD_DEV"
+    sector=$(blockdev --getss "$nbd")
+    target_sector=$(blockdev --getss "$DISK")
+    [[ "$sector" == "$target_sector" ]] || error "Image/target sector-size mismatch"
+
+    disk_bytes=$(get_disk_size_bytes "$DISK")
+    total=$((disk_bytes / sector))
+    reserve=$(((32 * 1024 * 1024 + sector - 1) / sector))
+    target_end=$((total - 34 - reserve))
+    (( target_end > 2048 )) || error "Target disk is too small for GPT + CIDATA"
+
+    shadow_last_partition "$nbd"
+    (( SHADOW_PART_END > target_end )) || { cleanup_qcow_nbd; return; }
+
+    info "Final partition: $SHADOW_PART_NUM sectors $SHADOW_PART_START..$SHADOW_PART_END -> $target_end"
+    partdev=$(shadow_partition_node "$nbd" "$SHADOW_PART_NUM")
+    part_bytes=$(((target_end - SHADOW_PART_START + 1) * sector))
+    (( part_bytes > 0 )) || error "Target disk ends before the final image partition starts"
+
+    shadow_resize_payload "$partdev" "$part_bytes"
+    shadow_resize_gpt "$nbd" "$SHADOW_PART_NUM" "$SHADOW_PART_START" "$target_end"
     sync
     cleanup_qcow_nbd
-
-    info "Sparse-shadow root/GPT boundary adjusted successfully."
+    info "Sparse-shadow payload and GPT now fit the target disk"
 }
 
 write_sparse_shadow_to_target_after_releasing_stage() {
@@ -3255,475 +2731,275 @@ grow_last_partition_reserving_cidata() {
     sleep 1
 }
 
-do_install() {
-    info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
-    info "Target: $TARGET_OS ${TARGET_VER:-"(no version)"}"
-    info "Disk: $DISK"
-    info "Image URL: $IMG_URL"
+cleanup_install_stage() {
+    cleanup_qcow_nbd
+    is_mountpoint "$TEMP_STAGE_MNT" && umount "$TEMP_STAGE_MNT" 2>/dev/null || true
+    [[ -z "${INSTALL_TMPDIR:-}" ]] || rm -rf "$INSTALL_TMPDIR" 2>/dev/null || true
+}
 
-    if [[ "$HOLD" == "1" ]]; then
-        info "--hold 1 is set: only parameter check and summary, no download or disk write."
-        return 0
-    fi
-
-    if [[ -d /run/reinstall-work ]] && is_mountpoint /run/reinstall-work; then
-        INSTALL_TMPDIR=$(mktemp -d /run/reinstall-work/install.XXXXXX)
-    else
-        error "Swap-backed Alpine work tmpfs is not mounted at /run/reinstall-work"
-    fi
-
-    local staged_frpc
-    local CIDATA_PART MNT_CIDATA
-    staged_frpc=""
-
-    cleanup_install_stage() {
-        cleanup_qcow_nbd
-        if is_mountpoint "$TEMP_STAGE_MNT"; then
-            umount "$TEMP_STAGE_MNT" 2>/dev/null || true
-        fi
-        rm -rf "$INSTALL_TMPDIR" 2>/dev/null || true
-    }
+installer_workspace() {
+    is_mountpoint /run/reinstall-work || error "Alpine work tmpfs is not mounted"
+    INSTALL_TMPDIR=$(mktemp -d /run/reinstall-work/install.XXXXXX)
     trap cleanup_install_stage EXIT
+}
 
-    if [[ -n "${FRPC_TOML:-}" && "$FRPC_TOML" =~ ^https?:// ]]; then
-        staged_frpc="$INSTALL_TMPDIR/frpc.toml"
-        info "Downloading FRPC config: $FRPC_TOML"
-        http_download "$FRPC_TOML" "$staged_frpc" || error "Failed to download FRPC config"
-        FRPC_TOML="$staged_frpc"
-    fi
+installer_stage_optional_inputs() {
+    [[ -n "${FRPC_TOML:-}" && "$FRPC_TOML" =~ ^https?:// ]] || return 0
+    local dst="$INSTALL_TMPDIR/frpc.toml"
+    info "Downloading FRPC config"
+    http_download "$FRPC_TOML" "$dst" || error "Failed to download FRPC config"
+    FRPC_TOML="$dst"
+}
 
-    sync
-    cd /
-    unmount_target_disk_filesystems "$DISK"
-
+confirm_destructive_write() {
     echo
-    echo "WARNING: the target disk will now be repartitioned for a mandatory 3 GiB staging area."
-    echo "ALL EXISTING DATA ON $DISK WILL BE LOST BEFORE THE IMAGE DOWNLOAD STARTS."
+    echo "WARNING: $DISK will be repartitioned. ALL DATA WILL BE LOST."
+    [[ "$AUTO_YES" == 1 ]] && return 0
+    read -r -p "Type yes to continue: " ans
+    case "$ans" in y|Y|yes|YES|Yes) return ;; *) error "Cancelled" ;; esac
+}
 
-    if [[ "$AUTO_YES" -eq 1 ]]; then
-        info "AUTO_YES=1, skipping interactive confirmation."
-    else
-        read -r -p "Type 'yes' or 'y' to continue: " ans
-        case "$ans" in
-            y|Y|yes|YES|Yes) ;;
-            *) error "Operation cancelled by user." ;;
-        esac
-    fi
-
+installer_write_image() {
+    unmount_target_disk_filesystems "$DISK"
+    confirm_destructive_write
     prepare_fixed_temp_staging_partition
+
     IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
     download_target_image_in_alpine "$IMG_QCOW"
-
     inspect_qcow_partition_layout "$IMG_QCOW"
-
-    info "Writing qcow2 from the 3 GiB tail staging partition without overwriting its live source..."
     write_qcow_without_overwriting_staging "$IMG_QCOW"
+
+    [[ "${TEMP_STAGE_RELEASED:-0}" == 1 ]] || release_temp_staging_partition
     sync
-    info "Safe qcow2 prefix write finished."
-
-    # In sparse-shadow mode the staging partition has already been released
-    if [[ "${TEMP_STAGE_RELEASED:-0}" != "1" ]]; then
-        release_temp_staging_partition
-    fi
-    sync
-
-    # Work directly on the image GPT while no target partitions are mapped in the
-    # kernel. grow_last_partition_reserving_cidata() repairs the backup GPT,
-    sgdisk -e "$DISK" >/dev/null || error "Failed to repair target GPT after releasing staging partition"
-
+    sgdisk -e "$DISK" >/dev/null || error "Failed to repair target GPT"
     grow_last_partition_reserving_cidata
+}
 
-    CIDATA_PART=$(create_nocloud_cidata_partition)
-    info "Using NoCloud CIDATA partition: $CIDATA_PART"
+installer_write_seed() {
+    local part mnt="$INSTALL_TMPDIR/cidata"
+    part=$(create_nocloud_cidata_partition)
+    mkdir -p "$mnt"
+    mount -t vfat "$part" "$mnt" || error "Failed to mount CIDATA partition $part"
 
-    MNT_CIDATA="$INSTALL_TMPDIR/cidata"
-    mkdir -p "$MNT_CIDATA"
-    mount -t vfat "$CIDATA_PART" "$MNT_CIDATA" || error "Failed to mount CIDATA partition $CIDATA_PART"
-
-    if [[ -n "$FRPC_TOML" && -f "$FRPC_TOML" ]]; then
-        FRPC_PRESENT=1
-    else
-        FRPC_PRESENT=""
-    fi
-
-    info "Writing standard NoCloud seed to CIDATA:/ ..."
-    write_nocloud_seed "$TARGET_OS" "$MNT_CIDATA/meta-data" "$MNT_CIDATA/user-data"
-
+    [[ -n "$FRPC_TOML" && -f "$FRPC_TOML" ]] && FRPC_PRESENT=1 || FRPC_PRESENT=""
+    write_nocloud_seed "$TARGET_OS" "$mnt/meta-data" "$mnt/user-data"
     sync
-    umount "$MNT_CIDATA" || error "Failed to unmount CIDATA partition $CIDATA_PART"
+    umount "$mnt" || error "Failed to unmount CIDATA"
+}
 
-    info "Image write, target-partition expansion, and cloud-init NoCloud injection completed."
-
-    run_post_install_hook
-    show_partition_info
-
-    FINAL_SSH_PORT="${SSH_PORT:-22}"
-
+print_install_summary() {
+    local key
     echo
     echo "==================== Installation summary ===================="
-    echo "Disk device:  $DISK"
-    echo "Target OS:    $TARGET_OS ${TARGET_VER:-"(no version)"}"
-    echo "Username:     root"
-    echo "SSH port:     $FINAL_SSH_PORT"
-
-    if [[ -n "$PASSWORD_HASH" ]]; then
-        echo "Root password: configured (stored as hash; plain text is not kept in plan.env)"
-    else
-        echo "Root password: (not set; SSH key login only)"
-    fi
-
-    echo "SSH authorized keys:"
+    echo "Disk:       $DISK"
+    echo "Target:     $TARGET_OS ${TARGET_VER:-}"
+    echo "Hostname:   localhost"
+    echo "User:       root"
+    echo "SSH port:   ${SSH_PORT:-22}"
+    echo "Password:   $([[ -n "$PASSWORD_HASH" ]] && echo configured || echo 'SSH-key only')"
+    echo "SSH keys:"
     if [[ -n "$SSH_KEYS_ALL" ]]; then
-        while IFS= read -r k; do
-            [[ -n "$k" ]] && echo "  $k"
-        done <<<"$SSH_KEYS_ALL"
+        while IFS= read -r key; do [[ -z "$key" ]] || echo "  $key"; done <<<"$SSH_KEYS_ALL"
     else
         echo "  (none)"
     fi
-
-    if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
-        echo
-        echo "NOTE: The root password was auto-generated and should have been shown before reboot."
-    fi
     echo "=============================================================="
+}
 
-    if [[ "$HOLD" == "2" ]]; then
-        info "--hold 2 is set: will NOT reboot automatically. You can inspect or chroot into the new system manually."
-        trap - EXIT
-        cleanup_install_stage
-        return 0
-    fi
+do_install() {
+    info "Installing $TARGET_OS ${TARGET_VER:-} to $DISK"
+    info "Image: $IMG_URL"
+    [[ "$HOLD" != 1 ]] || { info "--hold 1: validation only"; return; }
+
+    installer_workspace
+    installer_stage_optional_inputs
+    installer_write_image
+    installer_write_seed
+    run_post_install_hook
+    show_partition_info
+    print_install_summary
 
     trap - EXIT
     cleanup_install_stage
-
-    echo
-    echo "You can now reboot into the new system, for example:"
-    if [[ "$OS" == "FreeBSD" ]]; then
-        echo "  shutdown -r now"
-    else
-        echo "  reboot"
-    fi
+    [[ "$HOLD" != 2 ]] || { info "--hold 2: installation complete; not rebooting"; return; }
+    info "Installation complete. Reboot when ready."
 }
 
 # ----------------- main -----------------
 
-PHASE="host"
-if [[ "${1:-}" == "--phase" ]]; then
-    shift
-    [[ -n "${1:-}" ]] || error "Need value for --phase"
-    PHASE="$1"
-    shift
-fi
+reset_config() {
+    TARGET_OS="" TARGET_VER="" IMG_URL="" DISK=""
+    PASSWORD="" PASSWORD_HASH="" PASSWORD_TO_DISPLAY="" AUTO_PASSWORD=0
+    SSH_KEYS_ALL="" SSH_PORT="" WEB_PORT="" FRPC_TOML="" POST_INSTALL_HOOK="" FRPC_PRESENT=""
+    HOLD=0 AUTO_YES=0
+}
 
-if [[ "$PHASE" == "installer" ]]; then
-    TARGET_OS=""
-    TARGET_VER=""
-    DISK=""
-    PASSWORD=""
-    PASSWORD_HASH=""
-    SSH_KEYS_ALL=""
-    SSH_PORT=""
-    WEB_PORT=""
-    FRPC_TOML=""
-    POST_INSTALL_HOOK=""
-    FRPC_PRESENT=""
-    HOLD="0"
-    AUTO_PASSWORD=0
-    AUTO_YES=0
+target_versions() {
+    case "$1" in
+        freebsd) echo "14 15" ;;
+        rocky|almalinux) echo "10" ;;
+        fedora) echo "44" ;;
+        debian) echo "13" ;;
+        redhat) echo "" ;;
+        *) return 1 ;;
+    esac
+}
 
+parse_target() {
+    [[ $# -gt 0 ]] || error "Missing target OS"
+    TARGET_OS=$(to_lower "$1"); shift
+    target_versions "$TARGET_OS" >/dev/null || error "Unknown target OS: $TARGET_OS"
+
+    [[ "$TARGET_OS" != redhat ]] || { PARSE_SHIFT=0; return; }
+    [[ $# -gt 0 && "$1" != --* ]] || error "Missing version for $TARGET_OS"
+    TARGET_VER="$1"
+    grep -qw "$TARGET_VER" <<<"$(target_versions "$TARGET_OS")" || \
+        error "Unsupported $TARGET_OS version: $TARGET_VER (supported: $(target_versions "$TARGET_OS"))"
+    PARSE_SHIFT=1
+}
+
+append_ssh_key() {
+    local key
+    key=$(parse_ssh_key "$1")
+    SSH_KEYS_ALL+="${SSH_KEYS_ALL:+$'\n'}$key"
+}
+
+parse_host_options() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --hold)
-                shift
-                [[ "${1:-}" == "1" || "${1:-}" == "2" ]] || error "Invalid --hold"
-                HOLD="$1"
+            -h|--help) usage ;;
+            --disk|--img|--password|--passwd|--ssh-key|--public-key|--ssh-port|--web-port|--frpc-toml|--post-install-hook|--hold)
+                local opt="$1"; shift
+                [[ $# -gt 0 ]] || error "Need value for $opt"
+                case "$opt" in
+                    --disk) DISK="$1" ;;
+                    --img) IMG_URL="$1" ;;
+                    --password|--passwd) PASSWORD="$1" ;;
+                    --ssh-key|--public-key) append_ssh_key "$1" ;;
+                    --ssh-port) is_port_valid "$1" || error "Invalid SSH port: $1"; SSH_PORT="$1" ;;
+                    --web-port) is_port_valid "$1" || error "Invalid web port: $1"; WEB_PORT="$1" ;;
+                    --frpc-toml) FRPC_TOML="$1" ;;
+                    --post-install-hook) POST_INSTALL_HOOK="$1" ;;
+                    --hold) [[ "$1" == 1 || "$1" == 2 ]] || error "--hold must be 1 or 2"; HOLD="$1" ;;
+                esac
                 ;;
-            --yes|--force)
-                AUTO_YES=1
-                ;;
-            *)
-                error "Unknown installer argument: $1"
-                ;;
+            --disk=*) DISK="${1#*=}" ;;
+            --img=*) IMG_URL="${1#*=}" ;;
+            *) error "Unknown argument: $1" ;;
         esac
         shift
     done
+}
 
-    INSTALLER_HOLD_OVERRIDE="$HOLD"
-    detect_os_arch
-    load_install_plan
-    [[ "$INSTALLER_HOLD_OVERRIDE" == "0" ]] || HOLD="$INSTALLER_HOLD_OVERRIDE"
-    [[ "$HOLD" == "1" ]] || ensure_dependencies
-
-    [[ -z "$DISK" || "$DISK" == /dev/* ]] || DISK="/dev/$DISK"
-    if [[ -z "$DISK" ]]; then
-        auto_detect_disk
+prepare_target_disk() {
+    if [[ -n "$DISK" ]]; then
+        [[ "$DISK" == /dev/* ]] || DISK="/dev/$DISK"
     else
-        resolve_target_disk_from_identity
+        auto_detect_disk
+        confirm_auto_detected_disk_host
     fi
     validate_target_disk "$DISK"
-    do_install
-    exit 0
-fi
+    capture_target_disk_identity "$DISK"
+}
 
-[[ "$PHASE" == "host" ]] || error "Unsupported phase: $PHASE"
-
-if [[ $# -lt 1 ]]; then
-    error "Missing target OS. Supported targets: freebsd, rocky, almalinux, fedora, debian, redhat"
-fi
-
-case "$1" in
-    -h|--help)
-        usage
-        ;;
-esac
-
-TARGET_OS=$(to_lower "$1")
-shift || true
-
-TARGET_VER=""
-IMG_URL=""
-DISK=""
-PASSWORD=""
-PASSWORD_HASH=""
-SSH_KEYS_ALL=""
-SSH_PORT=""
-WEB_PORT=""
-FRPC_TOML=""
-POST_INSTALL_HOOK=""
-FRPC_PRESENT=""
-HOLD="0"
-AUTO_PASSWORD=0
-
-case "$TARGET_OS" in
-    freebsd)
-        [[ $# -gt 0 && "${1:-}" != --* ]] || \
-            error "Missing FreeBSD major version. Use: $SCRIPT_NAME freebsd 14|15 [options...]"
-        [[ "$1" == "14" || "$1" == "15" ]] || \
-            error "Unsupported FreeBSD major version: $1 (supported: 14, 15)"
-        TARGET_VER="$1"
-        shift
-        ;;
-    rocky)
-        [[ $# -gt 0 && "${1:-}" != --* ]] || \
-            error "Missing Rocky Linux major version. Use: $SCRIPT_NAME rocky 10 [options...]"
-        [[ "$1" == "10" ]] || \
-            error "Unsupported Rocky Linux major version: $1 (supported: 10)"
-        TARGET_VER="$1"
-        shift
-        ;;
-    almalinux)
-        [[ $# -gt 0 && "${1:-}" != --* ]] || \
-            error "Missing AlmaLinux major version. Use: $SCRIPT_NAME almalinux 10 [options...]"
-        [[ "$1" == "10" ]] || \
-            error "Unsupported AlmaLinux major version: $1 (supported: 10)"
-        TARGET_VER="$1"
-        shift
-        ;;
-    fedora)
-        [[ $# -gt 0 && "${1:-}" != --* ]] || \
-            error "Missing Fedora version. Use: $SCRIPT_NAME fedora 44 [options...]"
-        [[ "$1" == "44" ]] || \
-            error "Unsupported Fedora version: $1 (supported: 44)"
-        TARGET_VER="$1"
-        shift
-        ;;
-    debian)
-        [[ $# -gt 0 && "${1:-}" != --* ]] || \
-            error "Missing Debian major version. Use: $SCRIPT_NAME debian 13 [options...]"
-        [[ "$1" == "13" ]] || \
-            error "Unsupported Debian major version: $1 (supported: 13)"
-        TARGET_VER="$1"
-        shift
-        ;;
-    redhat)
-        if [[ $# -gt 0 && "${1:-}" != --* ]]; then
-            error "Do not specify a version for redhat. Use: $SCRIPT_NAME redhat --img URL [options...]"
-        fi
-        ;;
-    *)
-        error "Unknown target OS: $TARGET_OS (supported: freebsd, rocky, almalinux, fedora, debian, redhat)"
-        ;;
-esac
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -h|--help)
-            usage
-            ;;
-        --disk)
-            shift
-            [[ -n "${1:-}" ]] || error "Need value for --disk"
-            DISK="$1"
-            ;;
-        --disk=*)
-            DISK="${1#*=}"
-            ;;
-        --img)
-            shift
-            [[ -n "${1:-}" ]] || error "Need value for --img"
-            IMG_URL="$1"
-            ;;
-        --img=*)
-            IMG_URL="${1#*=}"
-            ;;
-        --password|--passwd)
-            shift
-            [[ -n "${1:-}" ]] || error "Need value for --password"
-            PASSWORD="$1"
-            ;;
-        --ssh-key|--public-key)
-            shift
-            [[ -n "${1:-}" ]] || error "Need value for --ssh-key"
-            key_line=$(parse_ssh_key "$1")
-            if [[ -n "$SSH_KEYS_ALL" ]]; then
-                SSH_KEYS_ALL+=$'\n'
-            fi
-            SSH_KEYS_ALL+="$key_line"
-            ;;
-        --ssh-port)
-            shift
-            [[ -n "${1:-}" ]] || error "Need value for --ssh-port"
-            is_port_valid "$1" || error "Invalid --ssh-port: $1"
-            SSH_PORT="$1"
-            ;;
-        --web-port)
-            shift
-            [[ -n "${1:-}" ]] || error "Need value for --web-port"
-            is_port_valid "$1" || error "Invalid --web-port: $1"
-            WEB_PORT="$1"
-            ;;
-        --frpc-toml)
-            shift
-            [[ -n "${1:-}" ]] || error "Need value for --frpc-toml"
-            FRPC_TOML="$1"
-            ;;
-        --post-install-hook)
-            shift
-            [[ -n "${1:-}" ]] || error "Need value for --post-install-hook"
-            POST_INSTALL_HOOK="$1"
-            ;;
-        --hold)
-            shift
-            [[ -n "${1:-}" ]] || error "Need value for --hold"
-            [[ "$1" == "1" || "$1" == "2" ]] || error "Invalid --hold: $1 (must be 1 or 2)"
-            HOLD="$1"
-            ;;
-        *)
-            error "Unknown argument: $1"
-            ;;
-    esac
-    shift || true
-done
-
-if [[ "$TARGET_OS" == "redhat" && -z "$IMG_URL" ]]; then
-    error "redhat requires --img URL. Use: $SCRIPT_NAME redhat --img URL [options...]"
-fi
-
-detect_os_arch
-if [[ "$HOLD" != "1" ]]; then
-    ensure_dependencies
-fi
-
-if [[ -n "$DISK" ]]; then
-    if [[ "$DISK" != /dev/* ]]; then
-        DISK="/dev/$DISK"
-    fi
-else
-    auto_detect_disk
-    confirm_auto_detected_disk_host
-fi
-
-validate_target_disk "$DISK"
-capture_target_disk_identity "$DISK"
-
-if [[ -z "$PASSWORD" ]] && [[ -z "$SSH_KEYS_ALL" ]]; then
-    echo "No --password or --ssh-key specified."
-    echo "You can set a root password now, or leave empty to auto-generate a random 20-character password."
-
-    while :; do
-        read -r -s -p "Enter root password (leave empty to auto-generate): " pw1
-        echo
-
-        if [[ -z "$pw1" ]]; then
-            if command -v tr >/dev/null 2>&1; then
-                PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20 || true)
-            fi
-            if [[ -z "$PASSWORD" ]]; then
-                error "Failed to generate random password."
-            fi
-            PASSWORD_TO_DISPLAY="$PASSWORD"
-            AUTO_PASSWORD=1
-            info "A random root password will be generated and shown before reboot."
-            break
-        fi
-
-        read -r -s -p "Confirm root password: " pw2
-        echo
-
-        if [[ "$pw1" == "$pw2" ]]; then
-            PASSWORD="$pw1"
-            break
+prepare_credentials() {
+    local a b
+    [[ -n "$PASSWORD" || -n "$SSH_KEYS_ALL" ]] || {
+        echo "No --password or --ssh-key specified."
+        read -r -s -p "Root password (empty = random): " a; echo
+        if [[ -z "$a" ]]; then
+            PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20 || true)
+            [[ -n "$PASSWORD" ]] || error "Failed to generate random password"
+            PASSWORD_TO_DISPLAY="$PASSWORD"; AUTO_PASSWORD=1
         else
-            echo "Passwords do not match, please try again."
-            echo
+            read -r -s -p "Confirm root password: " b; echo
+            [[ "$a" == "$b" ]] || error "Passwords do not match"
+            PASSWORD="$a"
         fi
-    done
-fi
+    }
 
-if [[ -n "$PASSWORD" ]]; then
+    [[ -n "$PASSWORD" ]] || return 0
     PASSWORD_HASH=$(hash_password "$PASSWORD")
-    if [[ "$AUTO_PASSWORD" -ne 1 ]]; then
-        unset PASSWORD
-        PASSWORD=""
-    fi
-fi
-
-if [[ -z "$IMG_URL" ]] && [[ "$TARGET_OS" != "redhat" ]]; then
-    IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
-fi
-
-info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
-info "Target: $TARGET_OS ${TARGET_VER:-"(no version)"}"
-info "Disk: $DISK"
-info "Image URL: $IMG_URL"
-
-if [[ "$HOLD" == "1" ]]; then
-    info "--hold 1 is set: only parameter check and summary, no download or disk write."
-    exit 0
-fi
-
-echo
-echo "==================== Host stage summary ====================="
-echo "Disk device:  $DISK"
-if [[ "$DISK_AUTO_SELECTED" -eq 1 ]]; then
-    echo "Disk reason:  $AUTO_DETECT_REASON"
-fi
-echo "Target OS:    $TARGET_OS ${TARGET_VER:-"(no version)"}"
-echo "Username:     root"
-echo "SSH port:     ${SSH_PORT:-22}"
-if [[ -n "$PASSWORD_HASH" ]]; then
-    if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
-        echo "Generated root password:"
-        echo "  $PASSWORD_TO_DISPLAY"
-    else
-        echo "Root password: provided by user (plain text will NOT be saved to EFI)"
-    fi
-else
-    echo "Root password: (not set; SSH key login only)"
-fi
-if [[ -n "$POST_INSTALL_HOOK" ]]; then
-    echo "Post-install hook: $POST_INSTALL_HOOK"
-fi
-echo "============================================================"
-echo
-
-if [[ "$AUTO_PASSWORD" -eq 1 ]]; then
-    unset PASSWORD
     PASSWORD=""
-fi
-unset PASSWORD_TO_DISPLAY
-PASSWORD_TO_DISPLAY=""
+}
 
-prepare_and_boot_alpine_ram
-exit 0
+print_host_summary() {
+    echo
+    echo "====================== Reinstall plan ======================"
+    echo "Host:       $OS $ARCH"
+    echo "Target:     $TARGET_OS ${TARGET_VER:-}"
+    echo "Disk:       $DISK"
+    echo "Image:      $IMG_URL"
+    echo "Hostname:   localhost"
+    echo "SSH port:   ${SSH_PORT:-22}"
+    [[ "$DISK_AUTO_SELECTED" != 1 ]] || echo "Disk reason: $AUTO_DETECT_REASON"
+    if [[ "$AUTO_PASSWORD" == 1 ]]; then
+        echo "Generated root password: $PASSWORD_TO_DISPLAY"
+    else
+        echo "Password:   $([[ -n "$PASSWORD_HASH" ]] && echo configured || echo 'SSH-key only')"
+    fi
+    echo "============================================================"
+}
+
+host_main() {
+    reset_config
+    [[ "${1:-}" != -h && "${1:-}" != --help ]] || usage
+
+    parse_target "$@"
+    local skip=$((1 + PARSE_SHIFT))
+    shift "$skip"
+    parse_host_options "$@"
+
+    [[ "$TARGET_OS" != redhat || -n "$IMG_URL" ]] || error "redhat requires --img URL"
+    detect_os_arch
+    [[ "$HOLD" == 1 ]] || ensure_dependencies
+    prepare_target_disk
+    prepare_credentials
+    [[ -n "$IMG_URL" ]] || IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
+    print_host_summary
+
+    [[ "$HOLD" != 1 ]] || return 0
+    PASSWORD_TO_DISPLAY=""
+    prepare_and_boot_alpine_ram
+}
+
+parse_installer_options() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|--force) AUTO_YES=1 ;;
+            --hold) shift; [[ "${1:-}" == 1 || "${1:-}" == 2 ]] || error "Invalid --hold"; HOLD="$1" ;;
+            *) error "Unknown installer argument: $1" ;;
+        esac
+        shift
+    done
+}
+
+installer_main() {
+    reset_config
+    parse_installer_options "$@"
+    local hold_override="$HOLD"
+
+    detect_os_arch
+    load_install_plan
+    [[ "$hold_override" == 0 ]] || HOLD="$hold_override"
+    [[ "$HOLD" == 1 ]] || ensure_dependencies
+
+    [[ -z "$DISK" || "$DISK" == /dev/* ]] || DISK="/dev/$DISK"
+    [[ -n "$DISK" ]] && resolve_target_disk_from_identity || auto_detect_disk
+    validate_target_disk "$DISK"
+    do_install
+}
+
+main() {
+    case "${1:-}" in
+        --phase)
+            shift
+            [[ "${1:-}" == installer ]] || error "Only --phase installer is supported"
+            shift
+            installer_main "$@"
+            ;;
+        *) host_main "$@" ;;
+    esac
+}
+
+main "$@"
