@@ -668,6 +668,31 @@ capture_target_disk_identity() {
 
 resolve_target_disk_from_identity() {
     local matches=() line path typ wwn serial size model d
+    local bootstrap_part="" bootstrap_disk="" bootstrap_size=""
+    local strong_match=0
+
+    # The bootstrap filesystem UUID is a better cross-environment identity than
+    # virtio device names/serials.  QEMU/UTM may expose SERIAL/WWN differently
+    # between the host kernel and Alpine, while the existing filesystem UUID is
+    # stored on disk and remains stable until the destructive write begins.
+    if [[ "$OS" == "Linux" && -n "${PLAN_EFI_UUID:-}" ]] && command -v blkid >/dev/null 2>&1; then
+        bootstrap_part=$(blkid -U "$PLAN_EFI_UUID" 2>/dev/null || true)
+        if [[ -n "$bootstrap_part" && -b "$bootstrap_part" ]]; then
+            bootstrap_disk=$(linux_source_to_disk "$bootstrap_part" || true)
+            if [[ -n "$bootstrap_disk" && -b "$bootstrap_disk" ]]; then
+                bootstrap_size=$(lsblk -b -dn -o SIZE "$bootstrap_disk" 2>/dev/null | head -n1 || true)
+                if [[ -z "${DISK_ID_SIZE:-}" || -z "$bootstrap_size" || "$bootstrap_size" == "$DISK_ID_SIZE" ]]; then
+                    if [[ -n "${DISK:-}" && "$DISK" != "$bootstrap_disk" ]]; then
+                        info "Target disk device name changed: $DISK -> $bootstrap_disk"
+                    fi
+                    info "Resolved target disk from bootstrap filesystem UUID ${PLAN_EFI_UUID}: ${bootstrap_part} -> ${bootstrap_disk}"
+                    DISK="$bootstrap_disk"
+                    return 0
+                fi
+                warn "Bootstrap UUID ${PLAN_EFI_UUID} resolved to ${bootstrap_disk}, but disk size changed (${bootstrap_size} != ${DISK_ID_SIZE}); not trusting it."
+            fi
+        fi
+    fi
 
     if [[ -z "${DISK_ID_SERIAL:-}" && -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SIZE:-}" ]]; then
         warn "No saved target disk identity is present; using saved device path: ${DISK:-unset}"
@@ -684,19 +709,30 @@ resolve_target_disk_from_identity() {
             model=$(lsblk_get_kv "$line" "MODEL")
             [[ "$typ" == "disk" && -n "$path" ]] || continue
 
-            if [[ -n "${DISK_ID_SERIAL:-}" ]]; then
-                [[ "$serial" == "$DISK_ID_SERIAL" ]] || continue
-                [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
-            elif [[ -n "${DISK_ID_WWN:-}" ]]; then
-                [[ "$wwn" == "$DISK_ID_WWN" ]] || continue
-                [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
-            else
-                [[ "$size" == "$DISK_ID_SIZE" ]] || continue
+            # Saved disk size is always used as an additional guard when known.
+            [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
+
+            strong_match=0
+            if [[ -n "${DISK_ID_WWN:-}" && -n "$wwn" && "$wwn" == "$DISK_ID_WWN" ]]; then
+                strong_match=1
+            elif [[ -n "${DISK_ID_SERIAL:-}" && -n "$serial" && "$serial" == "$DISK_ID_SERIAL" ]]; then
+                strong_match=1
+            fi
+
+            if [[ "$strong_match" -eq 1 ]]; then
+                matches+=("$path")
+                continue
+            fi
+
+            # Only fall back to size/model when no stable hardware identifier is
+            # available on either side.  Never silently ignore a conflicting ID.
+            if [[ -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SERIAL:-}" ]]; then
+                [[ -n "${DISK_ID_SIZE:-}" && "$size" == "$DISK_ID_SIZE" ]] || continue
                 if [[ -n "${DISK_ID_MODEL:-}" ]]; then
                     [[ "$model" == "$DISK_ID_MODEL" ]] || continue
                 fi
+                matches+=("$path")
             fi
-            matches+=("$path")
         done < <(lsblk -b -dn -P -o PATH,TYPE,WWN,SERIAL,SIZE,MODEL 2>/dev/null || true)
     else
         for d in $(sysctl -n kern.disks 2>/dev/null || true); do
@@ -711,23 +747,36 @@ resolve_target_disk_from_identity() {
                 model=$(geom disk list "$d" 2>/dev/null | awk -F: '/^[[:space:]]*descr:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
             fi
 
-            if [[ -n "${DISK_ID_SERIAL:-}" ]]; then
-                [[ "$serial" == "$DISK_ID_SERIAL" ]] || continue
-                [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
-            elif [[ -n "${DISK_ID_WWN:-}" ]]; then
-                [[ "$wwn" == "$DISK_ID_WWN" ]] || continue
-                [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
-            else
-                [[ "$size" == "$DISK_ID_SIZE" ]] || continue
+            [[ -z "${DISK_ID_SIZE:-}" || "$size" == "$DISK_ID_SIZE" ]] || continue
+
+            strong_match=0
+            if [[ -n "${DISK_ID_WWN:-}" && -n "$wwn" && "$wwn" == "$DISK_ID_WWN" ]]; then
+                strong_match=1
+            elif [[ -n "${DISK_ID_SERIAL:-}" && -n "$serial" && "$serial" == "$DISK_ID_SERIAL" ]]; then
+                strong_match=1
+            fi
+
+            if [[ "$strong_match" -eq 1 ]]; then
+                matches+=("$path")
+                continue
+            fi
+
+            if [[ -z "${DISK_ID_WWN:-}" && -z "${DISK_ID_SERIAL:-}" ]]; then
+                [[ -n "${DISK_ID_SIZE:-}" && "$size" == "$DISK_ID_SIZE" ]] || continue
                 if [[ -n "${DISK_ID_MODEL:-}" ]]; then
                     [[ "$model" == "$DISK_ID_MODEL" ]] || continue
                 fi
+                matches+=("$path")
             fi
-            matches+=("$path")
         done
     fi
 
     if [[ "${#matches[@]}" -ne 1 ]]; then
+        warn "Saved target identity: path=${DISK:-unset} wwn=${DISK_ID_WWN:-none} serial=${DISK_ID_SERIAL:-none} size=${DISK_ID_SIZE:-none} model=${DISK_ID_MODEL:-none} bootstrap_uuid=${PLAN_EFI_UUID:-none}"
+        if [[ "$OS" == "Linux" ]]; then
+            warn "Disks visible in installer environment:"
+            lsblk -b -dn -o PATH,TYPE,WWN,SERIAL,SIZE,MODEL 2>/dev/null >&2 || true
+        fi
         error "Saved target disk identity matched ${#matches[@]} disks; refusing destructive write. Matches: ${matches[*]:-(none)}"
     fi
 
