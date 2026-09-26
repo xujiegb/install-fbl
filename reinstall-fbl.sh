@@ -5,6 +5,7 @@
 #   - rocky
 #   - almalinux
 #   - fedora
+#   - debian
 #   - redhat
 #
 # All target systems use cloud-init to inject:
@@ -32,7 +33,7 @@
 #     directly from the official Alpine repositories.
 #   - Alpine RAM enables zram swap for runtime memory pressure.
 #   - After relocating modloop to RAM, Alpine always recreates the target disk with a
-#     dedicated 1.5 GiB temporary staging partition at the physical end of the disk.
+#     dedicated 3 GiB temporary staging partition at the physical end of the disk.
 #   - Target qcow/qcow.xz is downloaded/decompressed as qcow2 onto that staging partition.
 #   - qcow2 is written only to the safe prefix before the staging partition, then the
 #     staging partition is released, GPT is repaired, the last data partition is expanded,
@@ -71,6 +72,7 @@ Usage:
   $SCRIPT_NAME rocky     10   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME almalinux 10   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME fedora    44   [--disk /dev/sdX] [options...]
+  $SCRIPT_NAME debian    13   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME redhat         [--disk /dev/sdX] --img URL [options...]
 
 If --disk is not specified, the script will try to auto-detect the main disk:
@@ -1303,6 +1305,26 @@ get_default_image_url() {
                     ;;
                 *)
                     error "Unsupported Fedora version: $ver"
+                    ;;
+            esac
+            ;;
+        debian)
+            case "$ver" in
+                13)
+                    case "$MACHINE_ARCH" in
+                        x86_64)
+                            echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2"
+                            ;;
+                        aarch64)
+                            echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2"
+                            ;;
+                        *)
+                            error "Current arch $MACHINE_ARCH is not supported for automatic Debian image selection, please specify --img manually"
+                            ;;
+                    esac
+                    ;;
+                *)
+                    error "Unsupported Debian version: $ver (supported: 13)"
                     ;;
             esac
             ;;
@@ -3794,7 +3816,7 @@ AUTO_PASSWORD=0
 # maps each supported major version to its latest supported release image.
 if [[ $# -gt 0 ]] && [[ "$1" =~ ^[0-9]+$ ]]; then
     case "$TARGET_OS" in
-        freebsd|rocky|almalinux|fedora)
+        freebsd|rocky|almalinux|fedora|debian)
             TARGET_VER="$1"
             shift
             ;;
@@ -3941,6 +3963,7 @@ if [[ -z "$TARGET_VER" ]]; then
         rocky)     TARGET_VER="10" ;;
         almalinux) TARGET_VER="10" ;;
         fedora)    TARGET_VER="44" ;;
+        debian)    TARGET_VER="13" ;;
         redhat)    TARGET_VER="" ;;
         *)         ;;
     esac
