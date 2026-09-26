@@ -946,6 +946,65 @@ linux_is_partition_of_disk() {
     [[ -n "$pk" && "$pk" == "$disk" ]]
 }
 
+freebsd_mount_source_for() {
+    local mountpoint="$1"
+
+    mount -p 2>/dev/null | awk -v mp="$mountpoint" '
+        $2 == mp {
+            print $1
+            exit
+        }
+    '
+}
+
+freebsd_provider_to_disk() {
+    local source="$1"
+    local provider disks d resolved=""
+
+    [[ -n "$source" ]] || return 1
+    provider="${source#/dev/}"
+    disks=$(sysctl -n kern.disks 2>/dev/null || true)
+    [[ -n "$disks" ]] || return 1
+
+    # Fast path for normal FreeBSD partition names such as:
+    #   nda0p4, ada0p3, da0p2, vtbd0p4
+    # and MBR/BSD forms such as da0s1a.
+    for d in $disks; do
+        case "$provider" in
+            "$d"|"$d"p[0-9]*|"$d"s[0-9]*)
+                printf '/dev/%s\n' "$d"
+                return 0
+                ;;
+        esac
+    done
+
+    # Labels such as /dev/gpt/rootfs, /dev/ufs/rootfs and similar providers
+    # appear below their backing PART/DISK provider in GEOM's hierarchy.
+    if command -v geom >/dev/null 2>&1; then
+        resolved=$(
+            geom -t 2>/dev/null | awk -v target="$provider" '
+                /^[^[:space:]]/ && $2 == "DISK" {
+                    disk=$1
+                }
+                {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i == target && disk != "") {
+                            print "/dev/" disk
+                            exit
+                        }
+                    }
+                }
+            '
+        )
+        if [[ -n "$resolved" ]]; then
+            printf '%s\n' "$resolved"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 print_disk_candidates() {
     [[ -n "$DISK_CANDIDATE_LINES" ]] || return 0
     echo
@@ -1074,12 +1133,26 @@ auto_detect_disk() {
         error "Unable to auto-detect target disk on Linux. Please specify --disk explicitly."
     else
         if command -v sysctl >/dev/null 2>&1; then
-            local disks best_name="" best_size=0 size d idx=0
+            local disks size d idx=0 candidate_count=0
+            local only_disk="" root_source="" root_disk=""
+            local marker="" reason=""
+
             disks=$(sysctl -n kern.disks 2>/dev/null || true)
+
+            root_source=$(freebsd_mount_source_for "/" || true)
+            if [[ -n "$root_source" ]]; then
+                info "Current / is mounted from: $root_source"
+                root_disk=$(freebsd_provider_to_disk "$root_source" || true)
+                if [[ -n "$root_disk" ]]; then
+                    info "Current / resolves through GEOM to: $root_disk"
+                fi
+            fi
+
             for d in $disks; do
                 case "$d" in
                     cd*|md*|lo*|ram*) continue ;;
                 esac
+
                 if command -v diskinfo >/dev/null 2>&1; then
                     size=$(diskinfo "/dev/$d" 2>/dev/null | awk 'NR==1 {print $3; exit}')
                 else
@@ -1087,19 +1160,58 @@ auto_detect_disk() {
                 fi
                 [[ -z "$size" ]] && size=0
 
+                candidate_count=$(( candidate_count + 1 ))
+                only_disk="/dev/$d"
+                marker=""
+                reason=""
+
+                if [[ -n "$root_disk" && "/dev/$d" == "$root_disk" ]]; then
+                    marker=" root recommended"
+                    reason="current / resolves through FreeBSD GEOM to this disk"
+                fi
+
                 idx=$(( idx + 1 ))
                 if [[ -n "$DISK_CANDIDATE_LINES" ]]; then
                     DISK_CANDIDATE_LINES+=$'\n'
                 fi
-                DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes' "$idx" "/dev/$d" "$size")
 
-                if [[ "$size" -gt "$best_size" ]]; then
-                    best_size="$size"
-                    best_name="$d"
+                if [[ -n "$marker" ]]; then
+                    DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes markers:%s (%s)' \
+                        "$idx" "/dev/$d" "$size" "$marker" "$reason")
+                else
+                    DISK_CANDIDATE_LINES+=$(printf '  [%d] %-16s size=%s bytes' \
+                        "$idx" "/dev/$d" "$size")
                 fi
             done
-            if [[ -n "$best_name" ]]; then
-                warn "FreeBSD disk auto-detection is ambiguous. Refusing to choose the largest disk automatically."
+
+            if [[ -n "$root_disk" ]]; then
+                for d in $disks; do
+                    case "$d" in
+                        cd*|md*|lo*|ram*) continue ;;
+                    esac
+                    if [[ "/dev/$d" == "$root_disk" ]]; then
+                        AUTO_DETECTED_DISK="$root_disk"
+                        DISK="$root_disk"
+                        AUTO_DETECT_REASON="current / resolves through FreeBSD GEOM to this disk"
+                        DISK_AUTO_SELECTED=1
+                        info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
+                        return 0
+                    fi
+                done
+                warn "Current root resolved to $root_disk, but it is not present in the usable kern.disks candidate list."
+            fi
+
+            if [[ "$candidate_count" -eq 1 && -n "$only_disk" ]]; then
+                AUTO_DETECTED_DISK="$only_disk"
+                DISK="$only_disk"
+                AUTO_DETECT_REASON="only one usable physical disk is present"
+                DISK_AUTO_SELECTED=1
+                info "Auto-detected disk: $DISK ($AUTO_DETECT_REASON)"
+                return 0
+            fi
+
+            if [[ "$candidate_count" -gt 1 ]]; then
+                warn "Multiple FreeBSD disks are present and the current root disk could not be resolved confidently."
             fi
         fi
         error "Unable to auto-detect target disk on FreeBSD. Please specify --disk explicitly."
