@@ -2078,7 +2078,8 @@ prepare_alpine_paths() {
     ALPINE_VMLINUZ_REL="$ALPINE_BOOT_DIR_REL/vmlinuz"
     ALPINE_INITRAMFS_REL="$ALPINE_BOOT_DIR_REL/initramfs"
     ALPINE_MODLOOP_REL="$ALPINE_BOOT_DIR_REL/modloop"
-    ALPINE_APKOVL_REL="$ALPINE_BOOT_DIR_REL/reinstall.apkovl.tar.gz"
+    # Keep apkovl at bootstrap filesystem root so Alpine nlplug-findfs can auto-discover it.
+    ALPINE_APKOVL_REL="/reinstall.apkovl.tar.gz"
 
     ALPINE_VMLINUZ_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_VMLINUZ_REL"
     ALPINE_INITRAMFS_ABS="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL$ALPINE_INITRAMFS_REL"
@@ -2354,6 +2355,9 @@ build_alpine_apkovl() {
         "$ovl_dir/usr/local/sbin" \
         "$ovl_dir/etc/reinstall"
 
+    # Tell Alpine initramfs to add the normal default OpenRC boot services even with an apkovl.
+    : >"$ovl_dir/etc/.default_boot_services"
+
     repofile="$ovl_dir/etc/apk/repositories"
     cat >"$repofile" <<EOF
 ${ALPINE_REPO_BASE}/main/${ALPINE_NETBOOT_ARCH}
@@ -2381,7 +2385,13 @@ set -eu
 LOG="/var/log/reinstall-auto.log"
 mkdir -p /var/log
 touch "$LOG"
-exec >>"$LOG" 2>&1
+# Keep output visible on the serial/system console. A diskless reinstall must not
+# look idle at a login prompt while destructive work is running.
+if [ -w /dev/console ]; then
+    exec >/dev/console 2>&1
+else
+    exec >>"$LOG" 2>&1
+fi
 
 echo "===== reinstall-auto start $(date) ====="
 
@@ -2677,7 +2687,7 @@ install_grub_entry_for_alpine() {
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
     search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -2686,7 +2696,7 @@ EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
-    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} apkovl=/boot${ALPINE_APKOVL_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=/boot${ALPINE_MODLOOP_REL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
     initrd /boot${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -2709,7 +2719,7 @@ build_freebsd_grub_efi() {
     cfg="$tmp/grub.cfg"
     cat >"$cfg" <<EOF
 search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} apkovl=${ALPINE_APKOVL_REL} reinstall_alpine=1 console=ttyS0 console=tty0
+linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_REL} reinstall_alpine=1 console=ttyS0 console=tty0
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
