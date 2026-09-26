@@ -3245,17 +3245,14 @@ build_freebsd_grub_efi() {
     fi
 
     member=$(
-        tar -tf "$iso" 2>/dev/null |
-        awk -v want="efi/boot/${efi_name}" '
-            {
-                p=$0
-                sub(/^\\.\\//, "", p)
-                if (tolower(p) == tolower(want)) {
-                    print $0
-                    exit
-                }
-            }
-        '
+        while IFS= read -r p; do
+            local normalized
+            normalized="${p#./}"
+            if [[ "${normalized,,}" == "efi/boot/${efi_name,,}" ]]; then
+                printf '%s\n' "$p"
+                break
+            fi
+        done < <(tar -tf "$iso" 2>/dev/null)
     )
     [[ -n "$member" ]] || {
         rm -rf "$tmp"
