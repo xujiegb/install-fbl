@@ -64,7 +64,7 @@ info() {
 usage() {
     cat <<EOF
 Usage:
-  $SCRIPT_NAME freebsd   14|15 [--disk /dev/sdX] [options...]
+  $SCRIPT_NAME freebsd   14|15 [--disk /dev/sdX] [options...]  # major version only
   $SCRIPT_NAME rocky     10   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME almalinux 10   [--disk /dev/sdX] [options...]
   $SCRIPT_NAME fedora    44   [--disk /dev/sdX] [options...]
@@ -1212,7 +1212,7 @@ get_default_image_url() {
     case "$os" in
         freebsd)
             case "$ver" in
-                14|14.*)
+                14)
                     case "$MACHINE_ARCH" in
                         x86_64)
                             echo "https://download.freebsd.org/releases/VM-IMAGES/14.5-RELEASE/amd64/Latest/FreeBSD-14.5-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
@@ -1225,20 +1225,7 @@ get_default_image_url() {
                             ;;
                     esac
                     ;;
-                15.0|15.0.*)
-                    case "$MACHINE_ARCH" in
-                        x86_64)
-                            echo "https://download.freebsd.org/releases/VM-IMAGES/15.0-RELEASE/amd64/Latest/FreeBSD-15.0-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
-                            ;;
-                        aarch64)
-                            echo "https://download.freebsd.org/releases/VM-IMAGES/15.0-RELEASE/aarch64/Latest/FreeBSD-15.0-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz"
-                            ;;
-                        *)
-                            error "Current arch $MACHINE_ARCH is not supported for automatic FreeBSD image selection, please specify --img manually"
-                            ;;
-                    esac
-                    ;;
-                15|15.1|15.1.*)
+                15)
                     case "$MACHINE_ARCH" in
                         x86_64)
                             echo "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
@@ -1252,7 +1239,7 @@ get_default_image_url() {
                     esac
                     ;;
                 *)
-                    error "Unsupported FreeBSD version: $ver (built-in: 14.x -> 14.5, 15 -> 15.1, explicit 15.0/15.1; use --img for others)"
+                    error "Unsupported FreeBSD major version: $ver (supported: 14 -> latest 14.x, 15 -> latest 15.x)"
                     ;;
             esac
             ;;
@@ -3757,6 +3744,8 @@ FRPC_PRESENT=""
 HOLD="0"
 AUTO_PASSWORD=0
 
+# Version arguments are major versions only. Built-in image selection always
+# maps each supported major version to its latest supported release image.
 if [[ $# -gt 0 ]] && [[ "$1" =~ ^[0-9]+$ ]]; then
     case "$TARGET_OS" in
         freebsd|rocky|almalinux|fedora)
