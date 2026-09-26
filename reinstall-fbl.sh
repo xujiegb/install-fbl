@@ -3891,10 +3891,17 @@ if [[ "$ENV_MODE" == "initramfs" || "$ENV_MODE" == "mfsbsd" || "$ENV_MODE" == "a
     exit 0
 fi
 
-# Host phase: collect config and save plan, do not dd here
+# Host phase: validate the command line prefix before doing anything that can
+# install packages, inspect/select disks, prompt for credentials, or modify state.
 if [[ $# -lt 1 ]]; then
-    usage
+    error "Missing target OS. Supported targets: freebsd, rocky, almalinux, fedora, debian, redhat"
 fi
+
+case "$1" in
+    -h|--help)
+        usage
+        ;;
+esac
 
 TARGET_OS=$(to_lower "$1")
 shift || true
@@ -3913,21 +3920,56 @@ FRPC_PRESENT=""
 HOLD="0"
 AUTO_PASSWORD=0
 
-# Version arguments are major versions only. Built-in image selection always
-# maps each supported major version to its latest supported release image.
-if [[ $# -gt 0 ]] && [[ "$1" =~ ^[0-9]+$ ]]; then
-    case "$TARGET_OS" in
-        freebsd|rocky|almalinux|fedora|debian)
-            TARGET_VER="$1"
-            shift
-            ;;
-        redhat)
-            error "Do not specify a version for redhat. Use: $SCRIPT_NAME redhat --img URL [--disk /dev/XXX] ..."
-            ;;
-        *)
-            ;;
-    esac
-fi
+case "$TARGET_OS" in
+    freebsd)
+        [[ $# -gt 0 && "${1:-}" != --* ]] || \
+            error "Missing FreeBSD major version. Use: $SCRIPT_NAME freebsd 14|15 [options...]"
+        [[ "$1" == "14" || "$1" == "15" ]] || \
+            error "Unsupported FreeBSD major version: $1 (supported: 14, 15)"
+        TARGET_VER="$1"
+        shift
+        ;;
+    rocky)
+        [[ $# -gt 0 && "${1:-}" != --* ]] || \
+            error "Missing Rocky Linux major version. Use: $SCRIPT_NAME rocky 10 [options...]"
+        [[ "$1" == "10" ]] || \
+            error "Unsupported Rocky Linux major version: $1 (supported: 10)"
+        TARGET_VER="$1"
+        shift
+        ;;
+    almalinux)
+        [[ $# -gt 0 && "${1:-}" != --* ]] || \
+            error "Missing AlmaLinux major version. Use: $SCRIPT_NAME almalinux 10 [options...]"
+        [[ "$1" == "10" ]] || \
+            error "Unsupported AlmaLinux major version: $1 (supported: 10)"
+        TARGET_VER="$1"
+        shift
+        ;;
+    fedora)
+        [[ $# -gt 0 && "${1:-}" != --* ]] || \
+            error "Missing Fedora version. Use: $SCRIPT_NAME fedora 44 [options...]"
+        [[ "$1" == "44" ]] || \
+            error "Unsupported Fedora version: $1 (supported: 44)"
+        TARGET_VER="$1"
+        shift
+        ;;
+    debian)
+        [[ $# -gt 0 && "${1:-}" != --* ]] || \
+            error "Missing Debian major version. Use: $SCRIPT_NAME debian 13 [options...]"
+        [[ "$1" == "13" ]] || \
+            error "Unsupported Debian major version: $1 (supported: 13)"
+        TARGET_VER="$1"
+        shift
+        ;;
+    redhat)
+        if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+            error "Do not specify a version for redhat. Use: $SCRIPT_NAME redhat --img URL [options...]"
+        fi
+        ;;
+    *)
+        error "Unknown target OS: $TARGET_OS (supported: freebsd, rocky, almalinux, fedora, debian, redhat)"
+        ;;
+esac
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -3999,6 +4041,10 @@ while [[ $# -gt 0 ]]; do
     shift || true
 done
 
+if [[ "$TARGET_OS" == "redhat" && -z "$IMG_URL" ]]; then
+    error "redhat requires --img URL. Use: $SCRIPT_NAME redhat --img URL [options...]"
+fi
+
 detect_os_arch
 if [[ "$HOLD" != "1" ]]; then
     ensure_dependencies
@@ -4058,23 +4104,8 @@ if [[ -n "$PASSWORD" ]]; then
     fi
 fi
 
-if [[ -z "$TARGET_VER" ]]; then
-    case "$TARGET_OS" in
-        freebsd)   TARGET_VER="14" ;;
-        rocky)     TARGET_VER="10" ;;
-        almalinux) TARGET_VER="10" ;;
-        fedora)    TARGET_VER="44" ;;
-        debian)    TARGET_VER="13" ;;
-        redhat)    TARGET_VER="" ;;
-        *)         ;;
-    esac
-fi
-
 if [[ -z "$IMG_URL" ]] && [[ "$TARGET_OS" != "redhat" ]]; then
     IMG_URL=$(get_default_image_url "$TARGET_OS" "$TARGET_VER")
-fi
-if [[ -z "$IMG_URL" ]] && [[ "$TARGET_OS" == "redhat" ]]; then
-    error "For redhat you must specify image URL with --img"
 fi
 
 info "Host: OS=$OS ARCH=$ARCH ($MACHINE_ARCH)"
