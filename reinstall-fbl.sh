@@ -2729,19 +2729,18 @@ cache_optional_inputs_to_bootstrap() {
 }
 
 build_alpine_apkovl() {
-    local tmp ovl_dir startfile svcfile runlevel_link repofile markerfile
+    local tmp ovl_dir startfile initfile repofile markerfile
     tmp=$(mktemp -d /tmp/reinstall-alpine-apkovl.XXXXXX)
 
     ovl_dir="$tmp/ovl"
 
     mkdir -p \
         "$ovl_dir/etc/apk" \
-        "$ovl_dir/etc/init.d" \
-        "$ovl_dir/etc/runlevels/default" \
         "$ovl_dir/usr/local/sbin" \
         "$ovl_dir/etc/reinstall"
 
-    # Tell Alpine initramfs to add the normal default OpenRC boot services even with an apkovl.
+    # Tell Alpine initramfs to add the normal sysinit/boot services even with an apkovl.
+    # reinstall-init.sh runs those stages directly before launching the installer.
     : >"$ovl_dir/etc/.default_boot_services"
 
     repofile="$ovl_dir/etc/apk/repositories"
@@ -2807,6 +2806,17 @@ echo "===== reinstall-auto start $(date) ====="
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
 export PATH
+
+is_mountpoint() {
+    local p="$1"
+
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$p" 2>/dev/null
+        return $?
+    fi
+
+    awk -v p="$p" '$2 == p { found=1; exit } END { exit(found ? 0 : 1) }' /proc/mounts 2>/dev/null
+}
 
 [ -f /etc/reinstall/vars ] || {
     echo "Missing /etc/reinstall/vars"
@@ -3140,26 +3150,40 @@ main
 EOF
     chmod 0755 "$startfile"
 
-    svcfile="$ovl_dir/etc/init.d/reinstall-auto"
-    cat >"$svcfile" <<'EOF'
-#!/sbin/openrc-run
-name="reinstall-auto"
-description="Automatic reinstall runner from bootstrap plan"
-command="/usr/local/sbin/reinstall-auto.sh"
-command_background="no"
-depend() {
-    need localmount
-}
-start() {
-    ebegin "Starting reinstall-auto"
-    ${command}
-    eend $?
-}
-EOF
-    chmod 0755 "$svcfile"
+    initfile="$ovl_dir/usr/local/sbin/reinstall-init.sh"
+    cat >"$initfile" <<'EOF'
+#!/bin/sh
+set -u
 
-    runlevel_link="$ovl_dir/etc/runlevels/default/reinstall-auto"
-    ln -s ../../init.d/reinstall-auto "$runlevel_link"
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+echo "===== reinstall-init start $(date) ====="
+echo "[init] bringing up Alpine sysinit services"
+
+if ! /sbin/openrc sysinit; then
+    echo "[init] openrc sysinit failed; falling back to normal Alpine init."
+    exec /sbin/init
+fi
+
+echo "[init] bringing up Alpine boot services"
+if ! /sbin/openrc boot; then
+    echo "[init] openrc boot failed; falling back to normal Alpine init."
+    exec /sbin/init
+fi
+
+echo "[init] launching reinstall runner directly"
+if /usr/local/sbin/reinstall-auto.sh; then
+    rc=0
+else
+    rc=$?
+fi
+
+echo "[init] reinstall runner returned rc=$rc"
+echo "[init] entering normal Alpine init for troubleshooting/HOLD mode."
+exec /sbin/init
+EOF
+    chmod 0755 "$initfile"
 
     tar -C "$ovl_dir" -czf "$ALPINE_APKOVL_ABS" .
     chmod 0644 "$ALPINE_APKOVL_ABS"
@@ -3178,7 +3202,7 @@ install_grub_entry_for_alpine() {
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
     search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
     initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -3187,7 +3211,7 @@ EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
-    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1${CURRENT_CONSOLE_ARGS}
+    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
     initrd /boot${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -3210,6 +3234,7 @@ build_freebsd_grub_efi() {
         error "Could not determine FAT EFI filesystem UUID on FreeBSD: ${PLAN_EFI_UUID:-unset}"
 
     local alpine_release iso_url efi_name
+    local FREEBSD_ALPINE_CONSOLE_ARGS
     local tmp iso member volid marker offset
     local old_cfg new_cfg old_len new_len pad
     local expected_file before_file patch_file
@@ -3219,9 +3244,11 @@ build_freebsd_grub_efi() {
     case "$ALPINE_NETBOOT_ARCH" in
         x86_64)
             efi_name="bootx64.efi"
+            FREEBSD_ALPINE_CONSOLE_ARGS="console=tty0 console=ttyS0,115200n8"
             ;;
         aarch64)
             efi_name="bootaa64.efi"
+            FREEBSD_ALPINE_CONSOLE_ARGS="console=tty0 console=ttyS0,115200n8 console=ttyAMA0,115200n8"
             ;;
         *)
             error "Unsupported FreeBSD UEFI bootstrap arch: $ALPINE_NETBOOT_ARCH"
@@ -3346,7 +3373,7 @@ build_freebsd_grub_efi() {
 set timeout=0
 set default=0
 search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1 console=ttyS0 console=tty0
+linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh ${FREEBSD_ALPINE_CONSOLE_ARGS}
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
