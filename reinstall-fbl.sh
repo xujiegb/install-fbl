@@ -30,9 +30,13 @@
 #     and Alpine boot assets on bootstrap storage.
 #   - Alpine RAM obtains networking with DHCP and installs runtime packages
 #     directly from the official Alpine repositories.
-#   - Alpine RAM enables zram swap before downloading/converting the target image.
-#   - Target qcow/qcow.xz and URL-based optional files are downloaded by Alpine.
-#   - qcow2 is converted directly onto the target block device; no raw staging file is kept.
+#   - Alpine RAM enables zram swap for runtime memory pressure.
+#   - After relocating modloop to RAM, Alpine always recreates the target disk with a
+#     dedicated 1.5 GiB temporary staging partition at the physical end of the disk.
+#   - Target qcow/qcow.xz is downloaded/decompressed as qcow2 onto that staging partition.
+#   - qcow2 is written only to the safe prefix before the staging partition, then the
+#     staging partition is released, GPT is repaired, the last data partition is expanded,
+#     and a dedicated CIDATA partition is created.
 #
 # Important compatibility note:
 #   - This script creates a dedicated VFAT partition labeled CIDATA for standard NoCloud discovery.
@@ -3054,22 +3058,199 @@ create_nocloud_cidata_partition() {
     printf '%s\n' "$seed_part"
 }
 
+TEMP_STAGE_SIZE_BYTES=$((1536 * 1024 * 1024))
+TEMP_STAGE_PART_NUM=128
+TEMP_STAGE_LABEL="REINSTALL_TMP"
+TEMP_STAGE_MNT="/mnt/reinstall-stage"
+TEMP_STAGE_PART=""
+TEMP_STAGE_START_SECTOR=""
+TEMP_STAGE_START_BYTES=""
+TEMP_STAGE_SECTOR_SIZE=""
+QCOW_VIRTUAL_SIZE=""
+QCOW_MAX_PART_END_BYTES=""
+QCOW_MAX_PART_END_SECTOR=""
+QCOW_NBD_DEV=""
+
+prepare_fixed_temp_staging_partition() {
+    [[ "$OS" == "Linux" ]] || error "The fixed 1.5 GiB staging partition requires the Linux/Alpine installer environment"
+    command -v sgdisk >/dev/null 2>&1 || error "sgdisk is required for the fixed staging partition"
+    command -v mkfs.ext4 >/dev/null 2>&1 || error "mkfs.ext4 is required for the fixed staging partition"
+    command -v blockdev >/dev/null 2>&1 || error "blockdev is required for the fixed staging partition"
+
+    local disk_size first_sector last_sector actual_bytes min_remaining
+    disk_size=$(get_disk_size_bytes "$DISK" || true)
+    [[ -n "$disk_size" ]] || error "Could not determine target disk size before creating staging partition"
+
+    # Keep at least 2 GiB in front of the staging partition. The actual image-layout
+    # check below is stricter and will refuse an image whose partitions cross the boundary.
+    min_remaining=$((2 * 1024 * 1024 * 1024))
+    if [[ "$disk_size" -le $((TEMP_STAGE_SIZE_BYTES + min_remaining)) ]]; then
+        error "Target disk is too small for the mandatory 1.5 GiB staging partition. Disk=${disk_size} bytes"
+    fi
+
+    info "Preparing mandatory 1.5 GiB staging partition at the end of $DISK ..."
+    info "This step destroys the old partition table; Alpine is already running from RAM."
+
+    wipefs -a "$DISK" >/dev/null 2>&1 || true
+    sgdisk -Z "$DISK" >/dev/null 2>&1 || true
+    sgdisk -o "$DISK" >/dev/null || error "Failed to create temporary GPT on $DISK"
+    sgdisk -n "${TEMP_STAGE_PART_NUM}:-1536M:0" \
+           -t "${TEMP_STAGE_PART_NUM}:8300" \
+           -c "${TEMP_STAGE_PART_NUM}:${TEMP_STAGE_LABEL}" \
+           "$DISK" >/dev/null || error "Failed to create mandatory 1.5 GiB staging partition"
+
+    reread_partition_table_strict
+    sleep 1
+
+    TEMP_STAGE_PART=$(lsblk -lnpo NAME,PARTLABEL "$DISK" 2>/dev/null | \
+        awk -v label="$TEMP_STAGE_LABEL" '$2==label {print $1; exit}')
+    [[ -n "$TEMP_STAGE_PART" && -b "$TEMP_STAGE_PART" ]] || \
+        error "Could not locate the temporary staging partition after GPT creation"
+
+    TEMP_STAGE_SECTOR_SIZE=$(blockdev --getss "$DISK" 2>/dev/null || true)
+    [[ "$TEMP_STAGE_SECTOR_SIZE" =~ ^[0-9]+$ && "$TEMP_STAGE_SECTOR_SIZE" -gt 0 ]] || \
+        error "Could not determine target logical sector size"
+
+    first_sector=$(sgdisk -i "$TEMP_STAGE_PART_NUM" "$DISK" 2>/dev/null | \
+        awk '/First sector:/ {print $3; exit}')
+    last_sector=$(sgdisk -i "$TEMP_STAGE_PART_NUM" "$DISK" 2>/dev/null | \
+        awk '/Last sector:/ {print $3; exit}')
+    [[ "$first_sector" =~ ^[0-9]+$ && "$last_sector" =~ ^[0-9]+$ ]] || \
+        error "Could not determine temporary staging partition boundaries"
+
+    TEMP_STAGE_START_SECTOR="$first_sector"
+    TEMP_STAGE_START_BYTES=$((first_sector * TEMP_STAGE_SECTOR_SIZE))
+    actual_bytes=$(((last_sector - first_sector + 1) * TEMP_STAGE_SECTOR_SIZE))
+
+    # The start is normally aligned, so the actual size may differ from exactly 1.5 GiB
+    # by less than one alignment unit. Reject a materially smaller partition.
+    if [[ "$actual_bytes" -lt $((TEMP_STAGE_SIZE_BYTES - 2 * 1024 * 1024)) ]]; then
+        error "Temporary staging partition is smaller than requested: ${actual_bytes} bytes"
+    fi
+
+    mkfs.ext4 -F -m 0 -L "$TEMP_STAGE_LABEL" "$TEMP_STAGE_PART" >/dev/null || \
+        error "Failed to format temporary staging partition: $TEMP_STAGE_PART"
+    mkdir -p "$TEMP_STAGE_MNT"
+    mount -t ext4 -o noatime "$TEMP_STAGE_PART" "$TEMP_STAGE_MNT" || \
+        error "Failed to mount temporary staging partition: $TEMP_STAGE_PART"
+
+    # Deliberately invalidate the temporary GPT backup header after the kernel has
+    # learned the partition mapping. Later the image primary GPT will replace the
+    # temporary primary GPT, and sgdisk -e can rebuild a clean backup GPT without
+    # accidentally preferring the stale temporary backup table.
+    local disk_bytes total_sectors tail_start
+    disk_bytes=$(blockdev --getsize64 "$DISK")
+    total_sectors=$((disk_bytes / TEMP_STAGE_SECTOR_SIZE))
+    tail_start=$((total_sectors - 34))
+    if [[ "$tail_start" -gt "$last_sector" ]]; then
+        dd if=/dev/zero of="$DISK" bs="$TEMP_STAGE_SECTOR_SIZE" \
+           seek="$tail_start" count=34 conv=notrunc status=none || \
+            error "Failed to invalidate temporary backup GPT"
+        sync
+    fi
+
+    info "Temporary staging partition: $TEMP_STAGE_PART"
+    info "Temporary staging mount:     $TEMP_STAGE_MNT"
+    info "Staging boundary:            ${TEMP_STAGE_START_BYTES} bytes from disk start"
+    df -h "$TEMP_STAGE_MNT" || true
+}
+
+cleanup_qcow_nbd() {
+    if [[ -n "${QCOW_NBD_DEV:-}" ]]; then
+        qemu-nbd --disconnect "$QCOW_NBD_DEV" >/dev/null 2>&1 || true
+        QCOW_NBD_DEV=""
+    fi
+}
+
+connect_qcow_readonly_nbd() {
+    local img="$1" n dev size
+
+    command -v qemu-nbd >/dev/null 2>&1 || error "qemu-nbd is required to inspect qcow2 partition layout"
+    modprobe nbd max_part=64 >/dev/null 2>&1 || error "Could not load nbd kernel module"
+    mdev -s 2>/dev/null || true
+
+    for n in $(seq 0 15); do
+        dev="/dev/nbd$n"
+        [[ -b "$dev" ]] || continue
+        size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+        [[ "$size" == "0" ]] || continue
+        if qemu-nbd --connect="$dev" --read-only --format=qcow2 "$img" >/dev/null 2>&1; then
+            QCOW_NBD_DEV="$dev"
+            sleep 1
+            return 0
+        fi
+    done
+
+    error "Could not allocate a free NBD device for qcow2 inspection"
+}
+
+inspect_qcow_partition_layout() {
+    local img="$1" nbd sector_size max_end table
+
+    QCOW_VIRTUAL_SIZE=$(get_qcow_virtual_size_bytes "$img" || true)
+    [[ "$QCOW_VIRTUAL_SIZE" =~ ^[0-9]+$ && "$QCOW_VIRTUAL_SIZE" -gt 0 ]] || \
+        error "Could not determine qcow2 virtual size"
+
+    connect_qcow_readonly_nbd "$img"
+    nbd="$QCOW_NBD_DEV"
+
+    if ! table=$(sgdisk -p "$nbd" 2>&1); then
+        echo "$table" >&2
+        error "Target qcow2 does not expose a usable GPT; cannot safely use an in-disk staging partition"
+    fi
+
+    sector_size=$(blockdev --getss "$nbd" 2>/dev/null || true)
+    [[ "$sector_size" =~ ^[0-9]+$ && "$sector_size" -gt 0 ]] || \
+        error "Could not determine qcow2 logical sector size"
+
+    max_end=$(printf '%s\n' "$table" | awk '
+        /^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+/ {
+            if ($3 + 0 > max + 0) max=$3
+        }
+        END { if (max != "") print max }
+    ')
+    [[ "$max_end" =~ ^[0-9]+$ ]] || error "Could not determine the last partition sector inside qcow2"
+
+    QCOW_MAX_PART_END_SECTOR="$max_end"
+    QCOW_MAX_PART_END_BYTES=$(((max_end + 1) * sector_size))
+
+    cleanup_qcow_nbd
+
+    info "qcow2 virtual size:          ${QCOW_VIRTUAL_SIZE} bytes"
+    info "qcow2 last partition end:    ${QCOW_MAX_PART_END_BYTES} bytes"
+    info "temporary partition begins:  ${TEMP_STAGE_START_BYTES} bytes"
+
+    # Keep 8 MiB of safety space before the live staging partition.
+    if [[ "$QCOW_MAX_PART_END_BYTES" -gt $((TEMP_STAGE_START_BYTES - 8 * 1024 * 1024)) ]]; then
+        error "The qcow2 partition layout reaches the mandatory 1.5 GiB staging area. Refusing a self-overwriting install. Image partition end=${QCOW_MAX_PART_END_BYTES}; staging start=${TEMP_STAGE_START_BYTES}"
+    fi
+}
+
 download_target_image_in_alpine() {
-    local dst="$1" tmp="${1}.part.$$"
+    local dst="$1" tmp="${1}.part.$$" remote_size allocated
 
     rm -f "$tmp"
-    info "Downloading target image from Alpine RAM: $IMG_URL"
+    info "Downloading target image onto the mandatory 1.5 GiB staging partition: $IMG_URL"
+
+    remote_size=$(http_content_length "$IMG_URL" || true)
+    if [[ "$remote_size" =~ ^[0-9]+$ && "$remote_size" -gt $((1450 * 1024 * 1024)) ]]; then
+        error "Remote image payload is too large for the fixed 1.5 GiB staging partition: ${remote_size} bytes"
+    fi
 
     if [[ "$IMG_URL" == *.xz ]]; then
+        # Keep FreeBSD and other xz-wrapped qcow2 images as qcow2. We do not store
+        # the compressed .xz separately: the network stream is decompressed directly
+        # into a regular qcow2 file on the staging filesystem. xz recreates sparse
+        # regions when the output is a seekable regular file.
         if command -v curl >/dev/null 2>&1; then
             if ! curl -L --fail "$IMG_URL" | xz -dc >"$tmp"; then
                 rm -f "$tmp"
-                error "Failed to download/decompress target xz image: $IMG_URL"
+                error "Failed to download/decompress target qcow2.xz onto staging partition: $IMG_URL"
             fi
         elif command -v wget >/dev/null 2>&1; then
             if ! wget -O - "$IMG_URL" | xz -dc >"$tmp"; then
                 rm -f "$tmp"
-                error "Failed to download/decompress target xz image: $IMG_URL"
+                error "Failed to download/decompress target qcow2.xz onto staging partition: $IMG_URL"
             fi
         else
             error "No curl or wget available in Alpine RAM"
@@ -3077,7 +3258,7 @@ download_target_image_in_alpine() {
     else
         http_download "$IMG_URL" "$tmp" || {
             rm -f "$tmp"
-            error "Failed to download target image: $IMG_URL"
+            error "Failed to download target image onto staging partition: $IMG_URL"
         }
     fi
 
@@ -3087,13 +3268,136 @@ download_target_image_in_alpine() {
     }
 
     mv -f "$tmp" "$dst"
-    info "Target qcow2 is ready in Alpine RAM: $dst"
+    sync
+    allocated=$(du -B1 "$dst" 2>/dev/null | awk '{print $1; exit}' || true)
+    info "Target qcow2 is ready on staging partition: $dst"
+    [[ -n "$allocated" ]] && info "qcow2 allocated staging space: ${allocated} bytes"
+    df -h "$TEMP_STAGE_MNT" || true
 }
 
 get_qcow_virtual_size_bytes() {
     local path="$1"
     qemu-img info --output=json "$path" 2>/dev/null | \
         awk -F': *' '/"virtual-size"/ {v=$2; gsub(/[,[:space:]]/, "", v); print v; exit}'
+}
+
+write_qcow_without_overwriting_staging() {
+    local img="$1" bs_arg count_arg
+
+    [[ -n "$TEMP_STAGE_START_BYTES" ]] || error "Temporary staging boundary is unknown"
+
+    if [[ "$QCOW_VIRTUAL_SIZE" -le "$TEMP_STAGE_START_BYTES" ]]; then
+        info "qcow2 virtual disk ends before the staging partition; converting the whole image."
+        qemu-img convert -p -n -S 0 -f qcow2 -O raw "$img" "$DISK" || \
+            error "qemu-img failed while writing the target disk"
+        return 0
+    fi
+
+    # The image virtual disk extends beyond the staging boundary, but its real GPT
+    # partitions were verified to end before the boundary. Copy only the safe prefix;
+    # this intentionally omits trailing free space and the source backup GPT. The GPT
+    # backup is rebuilt after the staging partition has been released.
+    if (( TEMP_STAGE_START_BYTES % (4 * 1024 * 1024) == 0 )); then
+        bs_arg="4M"
+        count_arg=$((TEMP_STAGE_START_BYTES / (4 * 1024 * 1024)))
+    elif (( TEMP_STAGE_START_BYTES % (1024 * 1024) == 0 )); then
+        bs_arg="1M"
+        count_arg=$((TEMP_STAGE_START_BYTES / (1024 * 1024)))
+    else
+        bs_arg="$TEMP_STAGE_SECTOR_SIZE"
+        count_arg="$TEMP_STAGE_START_SECTOR"
+    fi
+
+    info "qcow2 virtual size crosses the staging area, but all image partitions fit before it."
+    info "Writing only the safe prefix with qemu-img dd: bs=$bs_arg count=$count_arg"
+    qemu-img dd -f qcow2 -O raw "bs=$bs_arg" "count=$count_arg" \
+        "if=$img" "of=$DISK" || error "qemu-img dd failed while writing the safe image prefix"
+}
+
+release_temp_staging_partition() {
+    sync
+    if mountpoint -q "$TEMP_STAGE_MNT" 2>/dev/null; then
+        umount "$TEMP_STAGE_MNT" || error "Failed to unmount temporary staging partition"
+    fi
+    TEMP_STAGE_PART=""
+}
+
+find_last_growable_gpt_partition() {
+    local line num start end code best_num="" best_end=0 best_code=""
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+.*[[:space:]]+([0-9A-Fa-f]{4})[[:space:]] ]] || continue
+        num="${BASH_REMATCH[1]}"
+        start="${BASH_REMATCH[2]}"
+        end="${BASH_REMATCH[3]}"
+        code="${BASH_REMATCH[4]}"
+        code="${code^^}"
+        if (( end > best_end )); then
+            best_end="$end"
+            best_num="$num"
+            best_code="$code"
+        fi
+    done < <(sgdisk -p "$DISK" 2>/dev/null || true)
+
+    [[ -n "$best_num" ]] || return 1
+    case "$best_code" in
+        EF00|EF02|8200|A502)
+            warn "The physically last GPT partition is type $best_code; refusing to expand EFI/BIOS/swap partition automatically."
+            return 1
+            ;;
+    esac
+
+    printf '%s\n' "$best_num"
+}
+
+grow_last_partition_reserving_cidata() {
+    command -v sgdisk >/dev/null 2>&1 || error "sgdisk is required to expand the target GPT"
+
+    local partnum info_text start end type_guid unique_guid attrs name
+    local sector_size reserve_bytes reserve_sectors largest_end new_end
+
+    sgdisk -e "$DISK" >/dev/null || error "Failed to relocate/rebuild target backup GPT after staging write"
+
+    partnum=$(find_last_growable_gpt_partition || true)
+    [[ -n "$partnum" ]] || error "Could not identify a safe final GPT data partition to expand"
+
+    info_text=$(sgdisk -i "$partnum" "$DISK" 2>/dev/null) || error "Failed to inspect target partition $partnum"
+    start=$(printf '%s\n' "$info_text" | awk '/First sector:/ {print $3; exit}')
+    end=$(printf '%s\n' "$info_text" | awk '/Last sector:/ {print $3; exit}')
+    type_guid=$(printf '%s\n' "$info_text" | awk '/Partition GUID code:/ {print $4; exit}')
+    unique_guid=$(printf '%s\n' "$info_text" | awk '/Partition unique GUID:/ {print $4; exit}')
+    attrs=$(printf '%s\n' "$info_text" | awk '/Attribute flags:/ {print $3; exit}')
+    name=$(printf '%s\n' "$info_text" | sed -n "s/^Partition name: '\(.*\)'$/\1/p" | head -n1)
+
+    [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && -n "$type_guid" ]] || \
+        error "Could not preserve partition metadata while preparing expansion"
+
+    sector_size=$(blockdev --getss "$DISK")
+    reserve_bytes=$((32 * 1024 * 1024))
+    reserve_sectors=$(((reserve_bytes + sector_size - 1) / sector_size))
+    largest_end=$(sgdisk -E "$DISK" 2>/dev/null || true)
+    [[ "$largest_end" =~ ^[0-9]+$ && "$largest_end" -gt 0 ]] || \
+        error "Could not determine free-space end for target partition expansion"
+
+    new_end=$((largest_end - reserve_sectors))
+    if [[ "$new_end" -le "$end" ]]; then
+        warn "No useful room remains to expand target partition $partnum before CIDATA reservation."
+        return 0
+    fi
+
+    info "Expanding target GPT partition $partnum from end sector $end to $new_end; reserving 32 MiB for CIDATA/alignment."
+    sgdisk -d "$partnum" "$DISK" >/dev/null || error "Failed to delete partition $partnum for boundary-only resize"
+    sgdisk -n "${partnum}:${start}:${new_end}" "$DISK" >/dev/null || error "Failed to recreate expanded partition $partnum"
+    sgdisk -t "${partnum}:${type_guid}" "$DISK" >/dev/null || error "Failed to restore GPT type for partition $partnum"
+    [[ -z "$unique_guid" ]] || sgdisk -u "${partnum}:${unique_guid}" "$DISK" >/dev/null || error "Failed to restore PARTUUID for partition $partnum"
+    [[ -z "$name" ]] || sgdisk -c "${partnum}:${name}" "$DISK" >/dev/null || error "Failed to restore GPT name for partition $partnum"
+    if [[ -n "$attrs" && "$attrs" != "0000000000000000" ]]; then
+        sgdisk -A "${partnum}:=:${attrs}" "$DISK" >/dev/null || \
+            error "Failed to restore GPT attributes for partition $partnum"
+    fi
+
+    reread_partition_table_strict
+    sleep 1
 }
 
 do_install() {
@@ -3112,24 +3416,23 @@ do_install() {
     else
         error "Swap-backed Alpine work tmpfs is not mounted at /run/reinstall-work"
     fi
-    trap 'rm -rf "$INSTALL_TMPDIR"' EXIT
-
-    IMG_QCOW="$INSTALL_TMPDIR/image.qcow2"
 
     local bootstrap_root_abs virtual_size disk_size staged_frpc staged_hook
+    local CIDATA_PART MNT_CIDATA
     bootstrap_root_abs="$EFI_MOUNT_POINT$PLAN_PATH_PREFIX_REL"
-
-    download_target_image_in_alpine "$IMG_QCOW"
-
-    virtual_size=$(get_qcow_virtual_size_bytes "$IMG_QCOW" || true)
-    disk_size=$(get_disk_size_bytes "$DISK" || true)
-    [[ -n "$virtual_size" && -n "$disk_size" ]] || error "Could not determine qcow2 virtual size or target disk size before write"
-    if [[ "$virtual_size" -gt "$disk_size" ]]; then
-        error "Target disk is smaller than the qcow2 virtual disk. Image virtual size: ${virtual_size} bytes; target disk: ${disk_size} bytes"
-    fi
-
     staged_frpc=""
     staged_hook=""
+
+    cleanup_install_stage() {
+        cleanup_qcow_nbd
+        if mountpoint -q "$TEMP_STAGE_MNT" 2>/dev/null; then
+            umount "$TEMP_STAGE_MNT" 2>/dev/null || true
+        fi
+        rm -rf "$INSTALL_TMPDIR" 2>/dev/null || true
+    }
+    trap cleanup_install_stage EXIT
+
+    # Small optional inputs are staged in RAM before the old disk layout is destroyed.
     if [[ -n "${FRPC_TOML:-}" && "$FRPC_TOML" =~ ^https?:// ]]; then
         staged_frpc="$INSTALL_TMPDIR/frpc.toml"
         info "Downloading FRPC config from Alpine RAM: $FRPC_TOML"
@@ -3147,35 +3450,52 @@ do_install() {
         POST_INSTALL_HOOK="$staged_hook"
     fi
 
+    # A fixed 1.5 GiB tail partition is always used for image staging, even when
+    # there is enough RAM. At this point modloop and the installer itself are in RAM.
     sync
+    cd /
     unmount_target_disk_filesystems "$DISK"
 
     echo
-    echo "WARNING: the target image will overwrite $DISK. ALL DATA ON THIS DISK WILL BE LOST!"
+    echo "WARNING: the target disk will now be repartitioned for a mandatory 1.5 GiB staging area."
+    echo "ALL EXISTING DATA ON $DISK WILL BE LOST BEFORE THE IMAGE DOWNLOAD STARTS."
 
     if [[ "$AUTO_YES" -eq 1 ]]; then
         info "AUTO_YES=1, skipping interactive confirmation."
     else
         read -r -p "Type 'yes' or 'y' to continue: " ans
         case "$ans" in
-            y|Y|yes|YES|Yes)
-                ;;
-            *)
-                error "Operation cancelled by user."
-                ;;
+            y|Y|yes|YES|Yes) ;;
+            *) error "Operation cancelled by user." ;;
         esac
     fi
 
-    info "Writing qcow2 directly to target disk with qemu-img; no raw staging file will be created..."
-    qemu-img convert -p -n -f qcow2 -O raw "$IMG_QCOW" "$DISK" || \
-        error "qemu-img failed while writing the target disk"
-    sync
-    info "Target image write finished."
+    prepare_fixed_temp_staging_partition
+    IMG_QCOW="$TEMP_STAGE_MNT/image.qcow2"
+    download_target_image_in_alpine "$IMG_QCOW"
 
+    virtual_size=$(get_qcow_virtual_size_bytes "$IMG_QCOW" || true)
+    disk_size=$(get_disk_size_bytes "$DISK" || true)
+    [[ -n "$virtual_size" && -n "$disk_size" ]] || error "Could not determine qcow2 virtual size or target disk size before write"
+
+    inspect_qcow_partition_layout "$IMG_QCOW"
+
+    info "Writing qcow2 from the 1.5 GiB tail staging partition without overwriting its live source..."
+    write_qcow_without_overwriting_staging "$IMG_QCOW"
+    sync
+    info "Safe qcow2 prefix write finished."
+
+    # qemu-img has closed the source file. Release the temporary tail partition,
+    # then make the image GPT authoritative and recover the 1.5 GiB for the target.
+    release_temp_staging_partition
+    sync
+
+    sgdisk -e "$DISK" >/dev/null || error "Failed to repair target GPT after releasing staging partition"
     reread_partition_table_strict
     sleep 2
 
-    local CIDATA_PART MNT_CIDATA
+    grow_last_partition_reserving_cidata
+
     CIDATA_PART=$(create_nocloud_cidata_partition)
     info "Using NoCloud CIDATA partition: $CIDATA_PART"
 
@@ -3195,7 +3515,7 @@ do_install() {
     sync
     umount "$MNT_CIDATA" || error "Failed to unmount CIDATA partition $CIDATA_PART"
 
-    info "Image write and cloud-init NoCloud injection completed."
+    info "Image write, target-partition expansion, and cloud-init NoCloud injection completed."
 
     run_rhel_freebsd_hook
     show_partition_info
@@ -3232,8 +3552,13 @@ do_install() {
 
     if [[ "$HOLD" == "2" ]]; then
         info "--hold 2 is set: will NOT reboot automatically. You can inspect or chroot into the new system manually."
+        trap - EXIT
+        cleanup_install_stage
         return 0
     fi
+
+    trap - EXIT
+    cleanup_install_stage
 
     echo
     echo "You can now reboot into the new system, for example:"
