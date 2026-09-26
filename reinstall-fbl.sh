@@ -2955,6 +2955,58 @@ REPOEOF
     done
 }
 
+ensure_modloop_ready() {
+    local kver attempt modloop_file
+
+    kver="$(uname -r)"
+    modloop_file="/lib/modloop-${ALPINE_KERNEL_FLAVOR:-virt}"
+
+    if is_mountpoint /.modloop && [ -d "/.modloop/modules/$kver" ] && [ -e "/lib/modules/$kver" ]; then
+        echo "Alpine modloop is already mounted and matches kernel $kver."
+        return 0
+    fi
+
+    echo "[stage] ensuring Alpine modloop for kernel $kver"
+    echo "Remote modloop: ${ALPINE_MODLOOP_URL:-from-kernel-cmdline}"
+
+    # The early OpenRC attempt may have left a truncated /lib/modloop-virt.
+    # Alpine's modloop service intentionally skips downloading when that file
+    # already exists, so remove it before every retry.
+    for attempt in 1 2 3 4 5; do
+        echo "Starting Alpine modloop service (attempt $attempt/5)..."
+
+        rc-service modloop stop >/dev/null 2>&1 || true
+        if is_mountpoint /.modloop; then
+            umount /.modloop >/dev/null 2>&1 || true
+        fi
+
+        rm -f "$modloop_file"
+        rm -f /lib/modloop-virt /lib/modloop-lts 2>/dev/null || true
+
+        if rc-service modloop start; then
+            if is_mountpoint /.modloop && \
+               [ -d "/.modloop/modules/$kver" ] && \
+               [ -e "/lib/modules/$kver" ]; then
+                echo "Alpine modloop mounted successfully for kernel $kver."
+                findmnt /.modloop 2>/dev/null || true
+                return 0
+            fi
+        fi
+
+        echo "Modloop attempt $attempt failed; removing any partial download before retry."
+        rc-service modloop stop >/dev/null 2>&1 || true
+        rm -f "$modloop_file" /lib/modloop-virt /lib/modloop-lts 2>/dev/null || true
+        sleep 3
+    done
+
+    echo "Failed to obtain a valid Alpine modloop after 5 attempts."
+    echo "Expected URL: ${ALPINE_MODLOOP_URL:-see /proc/cmdline}"
+    echo "Kernel cmdline:"
+    cat /proc/cmdline 2>/dev/null || true
+    ls -lh /lib/modloop-* 2>/dev/null || true
+    exit 1
+}
+
 setup_zram_swap() {
     local mem_kb zram_bytes min_bytes max_bytes
 
@@ -2972,7 +3024,10 @@ setup_zram_swap() {
     [ "$zram_bytes" -gt "$max_bytes" ] && zram_bytes="$max_bytes"
 
     modprobe zram || {
-        echo "zram kernel module is unavailable; virtual memory is required for this installer."
+        echo "zram kernel module is unavailable even after modloop setup."
+        echo "Kernel: $(uname -r)"
+        echo "/lib/modules:"
+        ls -la /lib/modules 2>/dev/null || true
         exit 1
     }
     [ -e /dev/zram0 ] || mdev -s 2>/dev/null || true
@@ -3111,6 +3166,9 @@ main() {
     echo "[stage] install_runtime_deps_online"
     install_runtime_deps_online
 
+    echo "[stage] ensure_modloop_ready"
+    ensure_modloop_ready
+
     echo "[stage] setup_zram_swap"
     setup_zram_swap
 
@@ -3159,6 +3217,9 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 
 echo "===== reinstall-init start $(date) ====="
+echo "[init] deferring Alpine modloop until full network download tools are installed"
+rm -f /etc/runlevels/sysinit/modloop 2>/dev/null || true
+
 echo "[init] bringing up Alpine sysinit services"
 
 if ! /sbin/openrc sysinit; then
@@ -3202,7 +3263,7 @@ install_grub_entry_for_alpine() {
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
     search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
+    linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} modules=loop,squashfs ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} modloop_verify=yes reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
     initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -3211,7 +3272,7 @@ EOF
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${ALPINE_ENTRY_TITLE}' {
-    linux /boot${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
+    linux /boot${ALPINE_VMLINUZ_REL} modules=loop,squashfs ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} modloop_verify=yes reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh${CURRENT_CONSOLE_ARGS}
     initrd /boot${ALPINE_INITRAMFS_REL}
 }
 EOF
@@ -3373,7 +3434,7 @@ build_freebsd_grub_efi() {
 set timeout=0
 set default=0
 search --no-floppy --fs-uuid --set=reinstall_efi ${PLAN_EFI_UUID}
-linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh ${FREEBSD_ALPINE_CONSOLE_ARGS}
+linux (\$reinstall_efi)${ALPINE_VMLINUZ_REL} modules=loop,squashfs ip=dhcp alpine_repo=${ALPINE_REPO_BASE}/main modloop=${ALPINE_MODLOOP_URL} modloop_verify=yes reinstall_alpine=1 init=/usr/local/sbin/reinstall-init.sh ${FREEBSD_ALPINE_CONSOLE_ARGS}
 initrd (\$reinstall_efi)${ALPINE_INITRAMFS_REL}
 boot
 EOF
